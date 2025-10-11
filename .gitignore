@@ -1,6 +1,10 @@
 data/training/*
 data/testing/*
+!data/testing/.gitkeep
 data/validation/*
+!data/validation/.gitkeep
+data/training/*
+!data/training/.gitkeep
 
 
 # Ignore backup files.
