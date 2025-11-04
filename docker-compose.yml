@@ -1,0 +1,72 @@
+services:
+  waymo-gnn:
+    build:
+      context: .
+      dockerfile: Dockerfile.waymo
+    container_name: ${COMPOSE_PROJECT_NAME:-waymo-gnn}-dev
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"  # JupyterLab
+    volumes:
+      # Mount the entire project directory
+      - .:/app
+      # Mount data directory (read-only for safety)
+      - ${DATA_DIR:-./data}:/app/data:ro
+      # Mount checkpoint and log directories
+      - ${MODEL_CHECKPOINT_DIR:-./checkpoints}:/app/checkpoints
+      - ${TENSORBOARD_LOG_DIR:-./logs/tensorboard}:/app/logs/tensorboard
+    environment:
+      # CUDA Configuration
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      
+      # Python Configuration
+      - PYTHONPATH=${PYTHONPATH:-/app/src}
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
+      
+      # W&B Configuration
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_PROJECT=${WANDB_PROJECT:-waymo-trajectory-prediction}
+      - WANDB_ENTITY=${WANDB_ENTITY}
+      - WANDB_MODE=${WANDB_MODE:-online}
+      
+      # Data Paths
+      - DATA_DIR=${DATA_DIR:-./data}
+      - SCENARIO_TRAINING_DIR=${SCENARIO_TRAINING_DIR:-./data/scenario/training}
+      - SCENARIO_VALIDATION_DIR=${SCENARIO_VALIDATION_DIR:-./data/scenario/validation}
+      - SCENARIO_TESTING_DIR=${SCENARIO_TESTING_DIR:-./data/scenario/testing}
+      
+      # Model Configuration
+      - MODEL_CHECKPOINT_DIR=${MODEL_CHECKPOINT_DIR:-./checkpoints}
+      - TENSORBOARD_LOG_DIR=${TENSORBOARD_LOG_DIR:-./logs/tensorboard}
+      
+      # Training Hyperparameters
+      - LEARNING_RATE=${LEARNING_RATE:-0.001}
+      - BATCH_SIZE=${BATCH_SIZE:-32}
+      - NUM_EPOCHS=${NUM_EPOCHS:-50}
+      - HIDDEN_CHANNELS=${HIDDEN_CHANNELS:-64}
+      
+      # Graph Parameters
+      - EDGE_RADIUS=${EDGE_RADIUS:-30.0}
+      - FUTURE_PREDICTION_STEPS=${FUTURE_PREDICTION_STEPS:-8}
+      - OBSERVATION_TIMESTEP=${OBSERVATION_TIMESTEP:-10}
+      
+      # Debug Flags
+      - DEBUG=${DEBUG:-false}
+      - VERBOSE_LOGGING=${VERBOSE_LOGGING:-false}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    command: >
+      jupyter lab 
+      --ip=0.0.0.0 
+      --port=8888 
+      --no-browser 
+      --allow-root 
+      --NotebookApp.token='${JUPYTER_TOKEN}' 
+      --NotebookApp.password='${JUPYTER_PASSWORD}'

@@ -1,0 +1,11 @@
+services:
+  waymo-gnn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-waymo-gnn-dev}
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+     
