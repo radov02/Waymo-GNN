@@ -7,7 +7,7 @@ import tensorflow as tf
 from config import batch_size, num_workers
 from torch_geometric.data import Data, Batch
 from dataset import HDF5TemporalDataset
-from torch_geometric.loader import DataLoader
+from torch.utils.data import DataLoader
 
 def initialize():
     print("Initializing...")
@@ -299,6 +299,24 @@ def test_hdf5_and_lazy_loading():
     print("TESTING COMPLETE")
     print("=" * 80)
 
+def collate_graph_sequences_to_batch(scenario_list):
+    """turns scenario list like [[scenario 1 T graphs], [scenario 2 T graphs], ...] into dict containing list 
+    [[timestep 1 - B batched graphs], [timestep 2 - B batched graphs], ...] of T Batch objects and batch size (number of graph sequences in the batch):
+    {
+        'batched_ts': [...],
+        'B': ...,
+    }"""
+    B = len(scenario_list)
+    T = len(scenario_list[0])
+    transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
+
+    batch = []
+    for timestep in range(T):
+        graphs_at_timestep = list(transposed[timestep])
+        batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
+        batch.append(batched_graphs_at_timestep)
+    
+    return {'batch': batch, 'B': B}
 
 
 

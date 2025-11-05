@@ -80,6 +80,9 @@ class EvolveGCNH(nn.Module):
         for param in self.summarize_params:
             nn.init.normal_(param)
         self.gru_h = None
+
+    def reset_gru_hidden_states(self):
+        self.gru_h = None
     
     def _get_params_vector(self, gcn_layer):
         """Extract all parameters from a GCN layer as a single flat vector."""

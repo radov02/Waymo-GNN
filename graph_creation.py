@@ -1,14 +1,12 @@
 import torch
 import h5py
-from config import device, batch_size, num_workers
+from config import device, batch_size, num_workers, radius, graph_creation_method
 from graph_creation_functions import initialize, get_data_files, create_scenario_dataset_dict, get_graphs_for_scenarios, save_scenarios_to_hdf5, test_hdf5_and_lazy_loading
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python graph_creation.py
 
 if __name__ == '__main__':
-    radius = 30.0
-    graph_creation_method = 'radius'
-
+    
     initialize()
 
     training_files = get_data_files(".\\data\\scenario\\training")

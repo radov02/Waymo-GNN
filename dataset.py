@@ -34,9 +34,6 @@ class LazyTemporalDataset(Dataset):
         for idx in range(len(self)):
             yield self[idx]     # self[idx] triggers __getitem__()
 
-
-
-
 class HDF5TemporalDataset(Dataset):
     def __init__(self, hdf5_path):
         """hdf5_path: path to single HDF5 file containing all snapshots.
@@ -113,3 +110,50 @@ class HDF5TemporalDataset(Dataset):
                     data.scenario_id = scenario_id
                     data.snapshot_id = int(snapshot_id)
                     yield data
+
+class HDF5ScenarioDataset(Dataset):
+    """stores dataset in one HDF5 file, containing dataset items; 
+    dataset item is a sequence of seq_len graphs/snapshots for one scenario"""
+    def __init__(self, hdf5_path, seq_len=11):
+        self.hdf5_path = hdf5_path
+        self.seq_len = seq_len
+        self._h5file = None
+
+        with h5py.File(hdf5_path, "r") as f:
+            self.scenario_ids = sorted(list(f["scenarios"].keys()), key=lambda x: int(x))
+
+    def __len__(self):
+        return len(self.scenario_ids)
+
+    def __getstate__(self):
+        # don't pickle file handle when DataLoader spawns workers
+        state = self.__dict__.copy()
+        state["_h5file"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def _open(self):
+        if self._h5file is None:
+            self._h5file = h5py.File(self.hdf5_path, "r")
+
+    def get_scenario(self, scenario_id):
+        self._open()
+        snaps = self._h5file["scenarios"][scenario_id]["snapshot_graphs"]
+        keys = sorted(snaps.keys(), key=lambda x: int(x))
+        data_list = []
+        for snapshot_id in keys[: self.seq_len]:
+            group = snaps[snapshot_id]
+            x = torch.from_numpy(group["x"][:])
+            edge_index = torch.from_numpy(group["edge_index"][:]).long()
+            edge_weight = torch.from_numpy(group["edge_weight"][:]) if "edge_weight" in group else None
+            y = torch.from_numpy(group["y"][:]) if "y" in group else None
+            d = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y)
+            d.snapshot_id = int(snapshot_id)
+            data_list.append(d)
+        return data_list    # list of graphs, each also having snapshot_id
+
+    def __getitem__(self, idx):
+        scenario_id = self.scenario_ids[idx]
+        return self.get_scenario(scenario_id)
