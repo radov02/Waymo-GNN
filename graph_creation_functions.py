@@ -359,7 +359,8 @@ def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=
 
 from tqdm import tqdm
 def save_scenarios_to_hdf5_streaming(files, h5_path, radius, graph_creation_method, compression="lzf"):
-    """Stream directly from TFRecord files to HDF5 without storing in memory"""
+    """Stream directly from TFRecord files to HDF5 without storing in memory, HDF5 file structure:
+    scenarios/{scenario_id}/snapshot_graphs/{timestep}/x|edge_index|edge_weight|y"""
     with h5py.File(h5_path, "w") as f:
         scenarios_group = f.create_group("scenarios")
 
@@ -535,10 +536,11 @@ def collate_graph_sequences_to_batch(scenario_list):
     [[timestep 1 - B batched graphs], [timestep 2 - B batched graphs], ...] of T Batch objects and batch size (number of graph sequences in the batch):
     {
         'batched_ts': [...],
-        'B': ...,
+        'B': num_of_sequences,
+        'T': sequence_length
     }"""
-    B = len(scenario_list)
-    T = len(scenario_list[0])
+    B = len(scenario_list)    # number of sequences
+    T = len(scenario_list[0])   # sequence length
     transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
 
     batch = []
@@ -547,4 +549,4 @@ def collate_graph_sequences_to_batch(scenario_list):
         batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
         batch.append(batched_graphs_at_timestep)
     
-    return {'batch': batch, 'B': B}
+    return {'batch': batch, 'B': B, 'T': T}

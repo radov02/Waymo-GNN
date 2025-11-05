@@ -34,8 +34,8 @@ if __name__ == '__main__':
             "dataset": config['dataset_name'],
             "dropout": config['dropout'],
             "hidden_channels": config['hidden_channels'],
-            "topk": config['topk'],
-            "num_layers": config['num_layers'],
+            "topk": topk,
+            "num_layers": num_layers,
             "epochs": config['epochs']
         },
         name=f"GCN_r{config['radius']}_h{config['hidden_channels']}"
@@ -44,10 +44,10 @@ if __name__ == '__main__':
     model = EvolveGCNH(
             input_dim=config['input_dim'],
             hidden_dim=config['hidden_channels'],
-            output_dim=output_dim,
-            num_layers=config['num_layers'],
+            output_dim=2,       # we are predicting the position displacements
+            num_layers=num_layers,
             dropout=config['dropout'],
-            topk=config['topk']
+            topk=topk
         ).to(device)
     wandb.watch(model, log='all', log_freq=10)
     
@@ -80,43 +80,51 @@ if __name__ == '__main__':
         model.train()
         total_loss_epoch = 0.0
         steps = 0
+
         for step, batch_dict in enumerate(dataloader):
-            batched_ts = batch_dict["batch"]  # list of length T of Batch objects
+            batched_graph_sequence = batch_dict["batch"]  # list of length T of Batch objects
             B = batch_dict["B"]
-            T = len(batched_ts)
+            T = batch_dict["T"]
 
             # reset GRU hidden states at the start of each new batch
             model.reset_gru_hidden_states()
 
             for t in range(T):  # move each batched graph to device
-                batched_ts[t] = batched_ts[t].to(device)
+                batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
             optimizer.zero_grad()
             loss_sum = 0.0
+            valid_timesteps = 0     # linked with skipping loss for when no ground truth is given
 
-            for t in range(T):
-                batch_t = batched_ts[t]
+            for t, batched_graph in enumerate(batched_graph_sequence):  # batched_graph contains B graphs at timestep t, merged into one batch
+                
+                out_predictions = model(batched_graph)      # out_predictions: [total_nodes_in_batch, output_dim]
 
-                out_predictions = model(batch_t)
+                if batched_graph.y is None:
+                    continue    # no ground truth stored -> skip loss (or handle differently)
 
-                # targets: batch_t.y expected to be node-level targets aligned with batch_t.x
-                if batch_t.y is None:
-                    # no ground truth stored -> skip loss (or handle differently)
-                    continue
+                # Shape validation (optional, remove after debugging)
+                if step == 0 and t == 0:
+                    print(f"out_predictions shape: {out_predictions.shape}")
+                    print(f"batched_graph.y shape: {batched_graph.y.shape}")
+                    assert out_predictions.shape == batched_graph.y.shape, \
+                        f"Shape mismatch! Predictions: {out_predictions.shape}, Targets: {batched_graph.y.shape}"
 
-                # ensure out_predictions shape matches batch_t.y
-                # out_predictions: node x out_dim ; batch_t.y: node x out_dim
-                loss_t = loss_fn(out_predictions, batch_t.y.to(out_predictions.dtype))
+
+                # use batched_graph.y (position displacements) for loss function
+                # loss should calculate the difference between actual displacement and model predicted ones
+                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))
                 loss_sum = loss_sum + loss_t
 
             # average loss across time (and across nodes by loss_fn semantics)
-            loss = loss_sum / T
-            loss.backward()
-            clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if valid_timesteps > 0:
+                loss = loss_sum / valid_timesteps
+                loss.backward()
+                clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-            total_loss_epoch += loss.item()
-            steps += 1
+                total_loss_epoch += loss.item()
+                steps += 1
 
         avg_loss_epoch = total_loss_epoch / max(1, steps)
         wandb.log({"epoch": epoch, "train_loss": avg_loss_epoch})
@@ -124,24 +132,15 @@ if __name__ == '__main__':
             print(f"Epoch {epoch+1:3d}/{config['epochs']} | Loss: {avg_loss_epoch:.6f}")
 
 
-
-
-
-
-
     # TODO:
+    # - try more num_workers
     # - define correct loss_fn and when to calculate it (at each timestep or only at the end)!
     # - add for validation (note more timesteps) and testing
     # - implement whole model training pipeline using wandb (see Colab 2)
-    # - use different graph creation method
-    # - try more num_workers
+    # - use different graph creation methods
     # - do initial_feature_vector() method
     # - review build_edge_index_using_...() functions
     # - visualization functions
-
-
-
-
 
     training_wandb_run.finish()
 

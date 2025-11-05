@@ -201,4 +201,4 @@ class EvolveGCNH(nn.Module):
                 h = torchFunctional.relu(h)
                 h = torchFunctional.dropout(h, p=self.dropout, training=self.training)
 
-        return h
+        return h  # Shape: [num_nodes, output_dim]

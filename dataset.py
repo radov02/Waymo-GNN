@@ -114,13 +114,13 @@ class HDF5TemporalDataset(Dataset):
 class HDF5ScenarioDataset(Dataset):
     """stores dataset in one HDF5 file, containing dataset items; 
     dataset item is a sequence of seq_len graphs/snapshots for one scenario"""
-    def __init__(self, hdf5_path, seq_len=11):
+    def __init__(self, hdf5_path, seq_len=10):
         self.hdf5_path = hdf5_path
         self.seq_len = seq_len
         self._h5file = None
 
         with h5py.File(hdf5_path, "r") as f:
-            self.scenario_ids = sorted(list(f["scenarios"].keys()), key=lambda x: int(x))
+            self.scenario_ids = list(f["scenarios"].keys())
 
     def __len__(self):
         return len(self.scenario_ids)
@@ -138,22 +138,37 @@ class HDF5ScenarioDataset(Dataset):
         if self._h5file is None:
             self._h5file = h5py.File(self.hdf5_path, "r")
 
-    def get_scenario(self, scenario_id):
+    def __getitem__(self, idx):
         self._open()
+        scenario_id = self.scenario_ids[idx]
         snaps = self._h5file["scenarios"][scenario_id]["snapshot_graphs"]
-        keys = sorted(snaps.keys(), key=lambda x: int(x))
+        
+        # Get sorted timestep keys
+        timesteps = sorted(snaps.keys(), key=lambda x: int(x))[:self.seq_len]
+        
         data_list = []
-        for snapshot_id in keys[: self.seq_len]:
-            group = snaps[snapshot_id]
+        for timestep in timesteps:
+            group = snaps[timestep]
+            
+            # Load tensors
             x = torch.from_numpy(group["x"][:])
             edge_index = torch.from_numpy(group["edge_index"][:]).long()
             edge_weight = torch.from_numpy(group["edge_weight"][:]) if "edge_weight" in group else None
             y = torch.from_numpy(group["y"][:]) if "y" in group else None
-            d = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y)
-            d.snapshot_id = int(snapshot_id)
-            data_list.append(d)
-        return data_list    # list of graphs, each also having snapshot_id
-
-    def __getitem__(self, idx):
-        scenario_id = self.scenario_ids[idx]
-        return self.get_scenario(scenario_id)
+            
+            # Create PyG Data object
+            data = Data(
+                x=x,
+                edge_index=edge_index,
+                edge_attr=edge_weight,
+                y=y
+            )
+            data.snapshot_id = int(timestep)
+            data_list.append(data)
+        
+        return data_list
+    
+    def __del__(self):
+        # Clean up file handle when object is destroyed
+        if self._h5file is not None:
+            self._h5file.close()
