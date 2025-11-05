@@ -21,9 +21,6 @@ if __name__ == '__main__':
         "input_dim": input_dim,
         "output_dim": output_dim,
         "sequence_length": sequence_length
-        #"future_steps": 8,  # predict 8 timesteps (0.8 seconds) into future
-        #"timestep": 10,  # use timestep 10 as current observation
-        #"num_scenarios": 10  # number of scenarios to load for this demo
     }
     
     import wandb
@@ -133,11 +130,14 @@ if __name__ == '__main__':
 
 
     # TODO:
-    # - define correct loss_fn
-    # - add for validation and testing
+    # - define correct loss_fn and when to calculate it (at each timestep or only at the end)!
+    # - add for validation (note more timesteps) and testing
     # - implement whole model training pipeline using wandb (see Colab 2)
     # - use different graph creation method
     # - try more num_workers
+    # - do initial_feature_vector() method
+    # - review build_edge_index_using_...() functions
+    # - visualization functions
 
 
 
@@ -200,7 +200,7 @@ def train():
         Prepare temporal graph sequence from a Waymo scenario, returns list of PyG Data objects one per timestep
         temporal_graphs = []
         for t in range(start_time, min(end_time, len(scenario.timestamps_seconds))):
-            graph_data = scenario_to_pyg_data(scenario, t, radius, future_states=1, use_valid_only=True)
+            graph_data = timestep_to_pyg_data(scenario, t, radius, future_states=1, use_valid_only=True)
             if graph_data is not None and graph_data.num_nodes > 0:
                 temporal_graphs.append(graph_data)
             else:

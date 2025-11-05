@@ -1,7 +1,7 @@
 import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-batch_size = 33     # divisible by 11
+batch_size = 30     # divisible by 10 so that batches contain full graph sequences
 num_workers = 1
 num_layers = 3
 input_dim = 5

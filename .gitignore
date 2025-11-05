@@ -20,6 +20,7 @@ dataset/
 data/Planetoid/*
 wandb/*
 data/graphs/*
+__pycache__/
 
 # Ignore backup files.
 *~

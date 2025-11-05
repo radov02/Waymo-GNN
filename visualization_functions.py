@@ -124,7 +124,7 @@ def visualize_scenario_with_graph(scenario, timestep, radius, figsize=(14, 12), 
         analyze_scenario(scenario)
         analyze_scenario_agents(scenario)
 
-    graph_data = scenario_to_pyg_data(scenario, timestep, radius, future_states=10, method='star')
+    graph_data = timestep_to_pyg_data(scenario, timestep, radius, future_states=10, method='star')
     if graph_data is None:
         print("No valid agents at this timestep!")
         return None, None, None

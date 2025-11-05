@@ -4,7 +4,7 @@ import os
 import h5py
 import numpy as np
 import tensorflow as tf
-from config import batch_size, num_workers
+from config import batch_size, num_workers, sequence_length
 from torch_geometric.data import Data, Batch
 from dataset import HDF5TemporalDataset
 from torch.utils.data import DataLoader
@@ -170,196 +170,6 @@ def create_scenario_dataset_dict(files, prinT=False):
     except Exception as e:
         print(f"Error processing files: {e}")
 
-# graph making functions here...
-
-def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=False):
-    """returns dict like {scenarioID: [graphs...], ...}"""
-    scenarios_and_their_graphs = {}     # {scenarioID: [graphs...]}
-    for file in dataset_dict:
-        for scenario in dataset_dict[file]:
-            scenario_graphs = []
-            for timestep in scenario.timestamps_seconds:
-                data = scenario_to_pyg_data(scenario, int(timestep), radius, future_states=1, method=graph_creation_method)
-                scenario_graphs.append(data)
-            scenarios_and_their_graphs[scenario.scenario_id] = scenario_graphs
-    if prinT:
-        #print(scenarios_and_their_graphs.values())
-        print(f"All the scenario IDs: {scenarios_and_their_graphs.keys()}")
-        print(f"Example of a graph from scenario with id {list(scenarios_and_their_graphs.keys())[0]}:\n\t{scenarios_and_their_graphs[list(scenarios_and_their_graphs.keys())[0]][0]}")
-    return scenarios_and_their_graphs
-
-def save_scenarios_to_hdf5(graphs_of_scenarios_dict, h5_path, compression="lzf"):
-    """layout: /scenarios/{scenario_id}/snapshot_graphs/{i}/(x, edge_index, edge_weight?, y?)"""
-    with h5py.File(h5_path, "w") as f:
-        scenarios_group = f.create_group("scenarios")
-
-        for scID, graphs in graphs_of_scenarios_dict.items():
-            scenario_group = scenarios_group.create_group(str(scID))
-            snapshots_group = scenario_group.create_group("snapshot_graphs")
-
-            for i, graph in enumerate(graphs):
-                snapshot_group = snapshots_group.create_group(str(i))
-
-                if hasattr(graph, "x"):
-                    x = graph.x.cpu().numpy()
-                    edge_index = graph.edge_index.cpu().numpy()
-                    edge_weight = getattr(graph, "edge_weight", None)
-                    y = getattr(graph, "y", None)
-                else:
-                    x = graph["x"].cpu().numpy()
-                    edge_index = graph["edge_index"].cpu().numpy()
-                    edge_weight = graph.get("edge_weight")
-                    y = graph.get("y")
-
-                snapshot_group.create_dataset("x", data=x, compression=compression, chunks=True)
-                snapshot_group.create_dataset("edge_index", data=edge_index, compression=compression, chunks=True)
-                if edge_weight is not None:
-                    snapshot_group.create_dataset("edge_weight", data=edge_weight.cpu().numpy(),
-                                            compression=compression, chunks=True)
-                if y is not None:
-                    snapshot_group.create_dataset("y", data=y.cpu().numpy(),
-                                            compression=compression, chunks=True)
-
-def test_hdf5_and_lazy_loading():
-    print("=" * 80)
-    print("TESTING HDF5 LAZY LOADING")
-    print("=" * 80)
-
-    # Initialize dataset
-    dataset = HDF5TemporalDataset("data/graphs/training.hdf5")
-    print(f"\n✓ Dataset loaded: {len(dataset)} total snapshots")
-
-    # Test 1: Check a few individual snapshots
-    print("\n" + "-" * 80)
-    print("TEST 1: Individual Snapshot Access (should be lazy)")
-    print("-" * 80)
-    for i in range(min(3, len(dataset))):
-        data = dataset[i]
-        print(f"Snapshot {i}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}, edges={data.edge_index.shape[1]}")
-        print(f"  - x shape: {data.x.shape}, dtype: {data.x.dtype}")
-        print(f"  - edge_index shape: {data.edge_index.shape}")
-        if data.edge_attr is not None:
-            print(f"  - edge_weight shape: {data.edge_attr.shape}")
-        if data.y is not None:
-            print(f"  - y shape: {data.y.shape}")
-
-    # Test 2: Iterate through all snapshots (no batching)
-    print("\n" + "-" * 80)
-    print("TEST 2: Full Dataset Iteration")
-    print("-" * 80)
-    scenario_counts = {}
-    for data in dataset.snapshots():
-        scenario_counts[data.scenario_id] = scenario_counts.get(data.scenario_id, 0) + 1
-
-    print(f"Total scenarios: {len(scenario_counts)}")
-    for sid, count in sorted(scenario_counts.items()):
-        print(f"  - Scenario {sid}: {count} snapshots")
-
-    # Test 3: DataLoader with batching
-    print("\n" + "-" * 80)
-    print("TEST 3: DataLoader Batching")
-    print("-" * 80)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
-    print(f"Expected batches: ~{len(dataset) // batch_size}")
-
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx < 3:  # Print first 3 batches
-            print(f"\nBatch {batch_idx}:")
-            print(f"  Type: {type(batch)}")
-            # DataLoader returns a Batch object (batched PyG Data)
-            print(f"  - x: {batch.x.shape}")
-            print(f"  - edge_index: {batch.edge_index.shape}")
-            print(f"  - edge_attr: {batch.edge_attr.shape if batch.edge_attr is not None else None}")
-            print(f"  - y: {batch.y.shape if batch.y is not None else None}")
-            print(f"  - batch size: {batch.num_graphs}")
-            if hasattr(batch, 'scenario_id'):
-                print(f"  - scenario_ids: {batch.scenario_id}")
-            if hasattr(batch, 'snapshot_id'):
-                print(f"  - snapshot_ids: {batch.snapshot_id}")
-        """elif batch_idx == 3:
-            print(f"\n... (showing first 3 batches only)")
-            break"""
-
-    print(f"\nTotal batches processed: {batch_idx + 1}")
-
-    # Test 4: Memory usage check (optional)
-    print("\n" + "-" * 80)
-    print("TEST 4: Verify Lazy Loading (memory check)")
-    print("-" * 80)
-    print("Accessing 5 random snapshots without loading all data...")
-    import random
-    indices = random.sample(range(len(dataset)), min(5, len(dataset)))
-    for idx in indices:
-        data = dataset[idx]
-        print(f"  Index {idx}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}")
-    print("✓ If this was fast, lazy loading is working correctly!")
-
-    print("\n" + "=" * 80)
-    print("TESTING COMPLETE")
-    print("=" * 80)
-
-def collate_graph_sequences_to_batch(scenario_list):
-    """turns scenario list like [[scenario 1 T graphs], [scenario 2 T graphs], ...] into dict containing list 
-    [[timestep 1 - B batched graphs], [timestep 2 - B batched graphs], ...] of T Batch objects and batch size (number of graph sequences in the batch):
-    {
-        'batched_ts': [...],
-        'B': ...,
-    }"""
-    B = len(scenario_list)
-    T = len(scenario_list[0])
-    transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
-
-    batch = []
-    for timestep in range(T):
-        graphs_at_timestep = list(transposed[timestep])
-        batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
-        batch.append(batched_graphs_at_timestep)
-    
-    return {'batch': batch, 'B': B}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def initial_feature_vector(agent, stateIndex):
-
-    # IMPLEMENT TECHNIQUES FROM FEATURE AUGMENTATION LECTURE (lec 7)
-
-    object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    properties = [agent.states[stateIndex].center_x, agent.states[stateIndex].center_y, agent.states[stateIndex].velocity_x, agent.states[stateIndex].velocity_y, agent.states[stateIndex].valid]
-    type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
-                   1 if object_types[agent.object_type] == 'Pedestrian' else 0,
-                   1 if object_types[agent.object_type] == 'Cyclist' else 0,
-                   1 if object_types[agent.object_type] == 'Other' else 0 ]
-    return torch.tensor(properties + type_onehot, dtype=torch.float32)
-
 def build_edge_index_using_radius(position_tensor, radius, self_loops=False, valid_mask=None, min_distance=0.0):
     """Convert position tensor that holds (x,y) positions of agents into edge tensor (edge_index) OF SHAPE (2, E) for graph using radius."""
     pairwise_norm2_distances = torch.cdist(position_tensor, position_tensor)
@@ -436,8 +246,24 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
     
     return edge_index
 
+def initial_feature_vector(agent, timestep):
+    """returns **list** of features for agent at given timestep"""
+    # TODO: IMPLEMENT TECHNIQUES FROM FEATURE AUGMENTATION LECTURE (lec 7)
+    # consider adding: Speed: sqrt(vx² + vy²) Heading: atan2(vy, vx) Acceleration: If you have velocity from previous timestep Normalized coordinates: Relative to ego vehicle or scene center Temporal encoding: Timestep information
+
+    if timestep >= len(agent.states):
+        timestep = len(agent.states) - 1
+
+    object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
+    properties = [agent.states[timestep].center_x, agent.states[timestep].center_y, agent.states[timestep].velocity_x, agent.states[timestep].velocity_y, agent.states[timestep].valid]
+    type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
+                   1 if object_types[agent.object_type] == 'Pedestrian' else 0,
+                   1 if object_types[agent.object_type] == 'Cyclist' else 0,
+                   1 if object_types[agent.object_type] == 'Other' else 0 ]
+    return properties + type_onehot
 
 def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_mask, timestep, use_valid_only):
+    """returns lists node_features [N, d], positions_2D [N, 2] and agent_ids and valid_mask"""
     for agent in agents:
         if timestep >= len(agent.states):
             state = agent.states[-1]
@@ -453,32 +279,44 @@ def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_m
         agent_ids.append(agent.id)
         valid_mask.append(1 if valid else 0)
 
-def get_future_2D_trajectory_labels(scenario, agent_ids, initial_time, future_states):
-    list_y = []
+def get_future_2D_trajectory_labels(scenario, agent_ids, timestep):
+    """outputs tensor of shape [N, 2], for each agent we have displacements stored"""
     id_to_agent = {t.id: t for t in scenario.tracks}
+    future_2d_position_displacements = []
+
+    # get node positions for next timestep
+    # calculate displacements
+    # put displacements into list which is used as y of the graph
+    
     for agent_id in agent_ids:
-        agent = id_to_agent.get(agent_id)
+        agent = id_to_agent.get(agent_id)   # agent data has its position at current timestep
         if agent is None:
-            raise ValueError(f"Agent id {agent_id} not found in provided scenario.tracks")
-        future_2d_positions = []
-        for timestep in range(1, future_states+1):
-            time = initial_time + timestep
-            if time < len(agent.states) and agent.states[time].valid:
-                future_2d_positions.append([agent.states[time].center_x, agent.states[time].center_y])
-            else:
-                # Pad with last known position
-                last = agent.states[min(time, len(agent.states) - 1)]
-                future_2d_positions.append([last.center_x, last.center_y])
+            future_2d_position_displacements.append([0, 0])
+            continue
         
-        current_2d_position_t = torch.tensor([agent.states[initial_time].center_x, agent.states[initial_time].center_y], dtype=torch.float32)
-        future_2d_positions_t = torch.tensor(future_2d_positions, dtype=torch.float32)
+        try:
+            current_timestep_positions = agent.states[timestep]
+            next_timestep_positions = agent.states[timestep+1]
 
-        future_2d_positions_in_offsets = future_2d_positions_t - current_2d_position_t
-        list_y.append(future_2d_positions_in_offsets.flatten())
-    return list_y
+            if next_timestep_positions.valid:
+                displacement = [next_timestep_positions.center_x - current_timestep_positions.center_x, 
+                                next_timestep_positions.center_y - current_timestep_positions.center_y]
+                future_2d_position_displacements.append(displacement)
+            else:
+                future_2d_position_displacements.append([0, 0])     # use current position (agent did not move)
+        except (IndexError, KeyError) as e:
+            print(f"ERROR AT TIMESTEPS IN get_future_2D_trajectory_labels FUNCTION!\nTimestep {timestep} or {timestep+1} out of bounds for agent {agent_id}: {e}")
+            future_2d_position_displacements.append([0, 0])
+    return torch.tensor(future_2d_position_displacements, dtype=torch.float32)
 
-def scenario_to_pyg_data(scenario, timestep, radius, future_states=1, use_valid_only=True, method='radius'):
-    """Converts scenarion into PyG data - graph."""
+def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method='radius'):
+    """Converts timestep snapshot into PyG data - graph, which has these properties:
+    - tensor x [N, d] of node features
+    - tensor edge_index [2, E] of edges
+    - tensor pos [N, 2] of node/agent positions
+    - tensor y [N, 2] of position displacements in next graph in the sequence
+    - tensor agent_ids [N]
+    - tensor valid_mask [N]"""
     node_features = []
     positions_2D = []
     agent_ids = []
@@ -488,7 +326,7 @@ def scenario_to_pyg_data(scenario, timestep, radius, future_states=1, use_valid_
     if len(node_features) == 0:
         return None
 
-    x = torch.stack(node_features)
+    x = torch.tensor(node_features, dtype=torch.float32)
     positions_2D_tensor = torch.tensor(positions_2D, dtype=torch.float32)
 
     if method == 'radius':
@@ -496,9 +334,217 @@ def scenario_to_pyg_data(scenario, timestep, radius, future_states=1, use_valid_
     elif method == 'star':
         edge_index = build_edge_index_using_star_graph(positions_2D_tensor, scenario, agent_ids=agent_ids, valid_mask=valid_mask)
 
-    y = torch.stack(get_future_2D_trajectory_labels(scenario, agent_ids, timestep, future_states))
+    y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
     data = Data(x=x, edge_index=edge_index, pos=positions_2D_tensor, y=y)
-    data.agent_ids = agent_ids
+    data.agent_ids = torch.tensor(agent_ids, dtype=torch.int)
     data.valid_mask = torch.tensor(valid_mask, dtype=torch.bool)
     return data
+
+def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=False):
+    """returns dict like {scenarioID: [graphs...], ...}"""
+    scenarios_and_their_graphs = {}     # {scenarioID: [graphs...]}
+    for file in dataset_dict:
+        for scenario in dataset_dict[file]:
+            scenario_graphs = []
+            for timestep in range(sequence_length-1):   # make 10 out of all 11 (sequence_length) graphs that have (x, y)
+                data = timestep_to_pyg_data(scenario, int(timestep), radius, method=graph_creation_method)
+                scenario_graphs.append(data)
+            scenarios_and_their_graphs[scenario.scenario_id] = scenario_graphs
+    if prinT:
+        #print(scenarios_and_their_graphs.values())
+        print(f"All the scenario IDs: {scenarios_and_their_graphs.keys()}")
+        print(f"Example of a graph from scenario with id {list(scenarios_and_their_graphs.keys())[0]}:\n\t{scenarios_and_their_graphs[list(scenarios_and_their_graphs.keys())[0]][0]}")
+    return scenarios_and_their_graphs
+
+from tqdm import tqdm
+def save_scenarios_to_hdf5_streaming(files, h5_path, radius, graph_creation_method, compression="lzf"):
+    """Stream directly from TFRecord files to HDF5 without storing in memory"""
+    with h5py.File(h5_path, "w") as f:
+        scenarios_group = f.create_group("scenarios")
+
+        total_scenarios = 0
+        for file_idx, file_path in enumerate(tqdm(files, desc="Processing files")):
+            print(f"\nProcessing file {file_idx + 1}/{len(files)}: {file_path}")
+
+            scenarios = parse_scenario_file(file_path)      # Parse scenarios from this file only
+
+            for scenario in scenarios:
+                scenario_group = scenarios_group.create_group(str(scenario.scenario_id))
+                snapshots_group = scenario_group.create_group("snapshot_graphs")
+                
+                # Create and save graphs for this scenario
+                for timestep in range(sequence_length - 1):
+                    graph = timestep_to_pyg_data(scenario, timestep, radius, method=graph_creation_method)
+                    snapshot_group = snapshots_group.create_group(str(timestep))
+                    
+                    # Extract data
+                    if hasattr(graph, "x"):
+                        x = graph.x.cpu().numpy()
+                        edge_index = graph.edge_index.cpu().numpy()
+                        edge_weight = getattr(graph, "edge_weight", None)
+                        y = getattr(graph, "y", None)
+                    else:
+                        x = graph["x"].cpu().numpy()
+                        edge_index = graph["edge_index"].cpu().numpy()
+                        edge_weight = graph.get("edge_weight")
+                        y = graph.get("y")
+                    
+                    # Save datasets
+                    snapshot_group.create_dataset("x", data=x, compression=compression, chunks=True)
+                    snapshot_group.create_dataset("edge_index", data=edge_index, compression=compression, chunks=True)
+                    
+                    if edge_weight is not None:
+                        snapshot_group.create_dataset("edge_weight", data=edge_weight.cpu().numpy(), 
+                                                     compression=compression, chunks=True)
+                    if y is not None:
+                        snapshot_group.create_dataset("y", data=y.cpu().numpy(), 
+                                                     compression=compression, chunks=True)
+                
+                total_scenarios += 1
+            
+            print(f"  Processed {len(scenarios)} scenarios from this file (total: {total_scenarios})")
+            # Free memory after processing each file
+            del scenarios
+            
+    print(f"\nCompleted! Total scenarios saved: {total_scenarios}")
+
+def test_hdf5_and_lazy_loading():
+    print("=" * 80)
+    print("TESTING HDF5 LAZY LOADING")
+    print("=" * 80)
+
+    # Initialize dataset
+    dataset = HDF5TemporalDataset("data/graphs/training.hdf5")
+    print(f"\n✓ Dataset loaded: {len(dataset)} total snapshots")
+
+    # Test 1: Check a few individual snapshots
+    print("\n" + "-" * 80)
+    print("TEST 1: Individual Snapshot Access (should be lazy)")
+    print("-" * 80)
+    for i in range(min(3, len(dataset))):
+        data = dataset[i]
+        print(f"Snapshot {i}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}, edges={data.edge_index.shape[1]}")
+        print(f"  - x shape: {data.x.shape}, dtype: {data.x.dtype}")
+        print(f"  - edge_index shape: {data.edge_index.shape}")
+        if data.edge_attr is not None:
+            print(f"  - edge_weight shape: {data.edge_attr.shape}")
+        if data.y is not None:
+            print(f"  - y shape: {data.y.shape}")
+
+    # Test 2: Iterate through all snapshots (no batching)
+    print("\n" + "-" * 80)
+    print("TEST 2: Full Dataset Iteration")
+    print("-" * 80)
+    scenario_counts = {}
+    for data in dataset.snapshots():
+        scenario_counts[data.scenario_id] = scenario_counts.get(data.scenario_id, 0) + 1
+
+    print(f"Total scenarios: {len(scenario_counts)}")
+    for sid, count in sorted(scenario_counts.items()):
+        print(f"  - Scenario {sid}: {count} snapshots")
+
+    # Test 3: DataLoader with standard batching (PyG style)
+    print("\n" + "-" * 80)
+    print("TEST 3: DataLoader Standard Batching")
+    print("-" * 80)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        collate_fn=Batch.from_data_list  # Use PyG's collate function
+    )
+    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
+    print(f"Expected batches: ~{len(dataset) // batch_size}")
+
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx < 3:  # Print first 3 batches
+            print(f"\nBatch {batch_idx}:")
+            print(f"  Type: {type(batch)}")
+            # DataLoader returns a Batch object (batched PyG Data)
+            print(f"  - x: {batch.x.shape}")
+            print(f"  - edge_index: {batch.edge_index.shape}")
+            print(f"  - edge_attr: {batch.edge_attr.shape if batch.edge_attr is not None else None}")
+            print(f"  - y: {batch.y.shape if batch.y is not None else None}")
+            print(f"  - batch size: {batch.num_graphs}")
+            if hasattr(batch, 'scenario_id'):
+                print(f"  - scenario_ids: {batch.scenario_id}")
+            if hasattr(batch, 'snapshot_id'):
+                print(f"  - snapshot_ids: {batch.snapshot_id}")
+
+    print(f"\nTotal batches processed: {batch_idx + 1}")
+
+    # Test 4: DataLoader with custom collate function (sequence batching)
+    print("\n" + "-" * 80)
+    print("TEST 4: DataLoader with Custom Collate (Sequence Batching)")
+    print("-" * 80)
+    
+    # Create a dataset wrapper that returns sequences
+    # Assuming dataset has a method to get sequences by scenario
+    if hasattr(dataset, 'scenarios'):
+        sequence_dataloader = DataLoader(
+            dataset.scenarios(), 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=0,  # Custom collate with complex objects often needs num_workers=0
+            collate_fn=collate_graph_sequences_to_batch
+        )
+        print(f"Sequence DataLoader config: batch_size={batch_size}, num_workers=0, collate_fn=custom")
+        
+        for batch_idx, batch_dict in enumerate(sequence_dataloader):
+            if batch_idx < 3:  # Print first 3 batches
+                print(f"\nSequence Batch {batch_idx}:")
+                print(f"  Type: {type(batch_dict)}")
+                print(f"  Batch size (B): {batch_dict['B']}")
+                print(f"  Num timesteps (T): {len(batch_dict['batch'])}")
+                
+                # Show details of first timestep
+                first_timestep = batch_dict['batch'][0]
+                print(f"  First timestep batch:")
+                print(f"    - x: {first_timestep.x.shape}")
+                print(f"    - edge_index: {first_timestep.edge_index.shape}")
+                print(f"    - edge_attr: {first_timestep.edge_attr.shape if first_timestep.edge_attr is not None else None}")
+                print(f"    - num_graphs: {first_timestep.num_graphs}")
+            
+            if batch_idx >= 2:
+                break
+        
+        print(f"\nTotal sequence batches shown: {min(batch_idx + 1, 3)}")
+    else:
+        print("⚠ Dataset doesn't support sequence access - skipping sequence batching test")
+
+    # Test 5: Memory usage check (optional)
+    print("\n" + "-" * 80)
+    print("TEST 5: Verify Lazy Loading (memory check)")
+    print("-" * 80)
+    print("Accessing 5 random snapshots without loading all data...")
+    import random
+    indices = random.sample(range(len(dataset)), min(5, len(dataset)))
+    for idx in indices:
+        data = dataset[idx]
+        print(f"  Index {idx}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}")
+    print("✓ If this was fast, lazy loading is working correctly!")
+
+    print("\n" + "=" * 80)
+    print("TESTING COMPLETE")
+    print("=" * 80)
+
+def collate_graph_sequences_to_batch(scenario_list):
+    """turns scenario list like [[scenario 1 T graphs], [scenario 2 T graphs], ...] into dict containing list 
+    [[timestep 1 - B batched graphs], [timestep 2 - B batched graphs], ...] of T Batch objects and batch size (number of graph sequences in the batch):
+    {
+        'batched_ts': [...],
+        'B': ...,
+    }"""
+    B = len(scenario_list)
+    T = len(scenario_list[0])
+    transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
+
+    batch = []
+    for timestep in range(T):
+        graphs_at_timestep = list(transposed[timestep])
+        batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
+        batch.append(batched_graphs_at_timestep)
+    
+    return {'batch': batch, 'B': B}
