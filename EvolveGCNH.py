@@ -156,12 +156,23 @@ class EvolveGCNH(nn.Module):
         
         return new_hidden.squeeze(0)"""
     
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index=None):
         """
-        x: Node features [num_nodes, input_dim]
-        edge_index: Graph connectivity [2, num_edges]
-        return node embeddings [num_nodes, output_dim]
+        Args:
+            x: Either node features [num_nodes, input_dim] OR a PyG Data/Batch object
+            edge_index: Graph connectivity [2, num_edges] (optional if x is Data/Batch)
+        
+        Returns:
+            Node embeddings [num_nodes, output_dim]
         """
+        # Handle PyG Data/Batch objects
+        if edge_index is None:
+            if hasattr(x, 'x') and hasattr(x, 'edge_index'):
+                edge_index = x.edge_index
+                x = x.x
+            else:
+                raise ValueError("If edge_index is not provided, x must be a PyG Data/Batch object")
+        
         device = x.device
         
         # Initialize GRU hidden states from current GCN parameters if needed:

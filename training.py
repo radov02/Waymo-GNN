@@ -62,7 +62,7 @@ if __name__ == '__main__':
                             num_workers=num_workers,    # number of working threads that are used for data loading
                             collate_fn=collate_graph_sequences_to_batch, 
                             drop_last=True,    # discard last minibatch if it does not have enough snapshots
-                            persistent_workers=True if num_workers > 0 else False)
+                            persistent_workers=True if num_workers > 0 else False) 
     # do not shuffle for valid/test?...
 
     """
@@ -98,7 +98,7 @@ if __name__ == '__main__':
 
             for t, batched_graph in enumerate(batched_graph_sequence):  # batched_graph contains B graphs at timestep t, merged into one batch
                 
-                out_predictions = model(batched_graph)      # out_predictions: [total_nodes_in_batch, output_dim]
+                out_predictions = model(batched_graph.x, batched_graph.edge_index)      # out_predictions: [total_nodes_in_batch, output_dim]
 
                 if batched_graph.y is None:
                     continue    # no ground truth stored -> skip loss (or handle differently)
@@ -111,10 +111,10 @@ if __name__ == '__main__':
                         f"Shape mismatch! Predictions: {out_predictions.shape}, Targets: {batched_graph.y.shape}"
 
 
-                # use batched_graph.y (position displacements) for loss function
-                # loss should calculate the difference between actual displacement and model predicted ones
+                # use batched_graph.y (absolute next positions) for loss function
                 loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))
                 loss_sum = loss_sum + loss_t
+                valid_timesteps += 1  # increment counter
 
             # average loss across time (and across nodes by loss_fn semantics)
             if valid_timesteps > 0:
