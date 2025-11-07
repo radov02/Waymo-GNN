@@ -4,7 +4,7 @@ import os
 import h5py
 import numpy as np
 import tensorflow as tf
-from config import batch_size, num_workers, sequence_length
+from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
 from torch_geometric.data import Data, Batch
 from dataset import HDF5TemporalDataset
 from torch.utils.data import DataLoader
@@ -317,16 +317,15 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     - tensor y [N, 2] of position displacements in next graph in the sequence
     - tensor agent_ids [N]
     - tensor valid_mask [N]"""
-    node_features = []
+    x = []
     positions_2D = []
     agent_ids = []
     valid_mask = []
-    get_data_from_agents(scenario.tracks, node_features, positions_2D, agent_ids, valid_mask, timestep, use_valid_only)
+    get_data_from_agents(scenario.tracks, x, positions_2D, agent_ids, valid_mask, timestep, use_valid_only)
 
-    if len(node_features) == 0:
+    if len(x) == 0:
         return None
-
-    x = torch.tensor(node_features, dtype=torch.float32)
+    
     positions_2D_tensor = torch.tensor(positions_2D, dtype=torch.float32)
 
     if method == 'radius':
@@ -336,9 +335,15 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
 
     y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
-    data = Data(x=x, edge_index=edge_index, pos=positions_2D_tensor, y=y)
-    data.agent_ids = torch.tensor(agent_ids, dtype=torch.int)
+    data = Data(x=torch.tensor(x, dtype=torch.float32), 
+                edge_index=edge_index, 
+                pos=positions_2D_tensor, 
+                y=y)
+    
+    # Store agent_ids for visualization and debugging
+    data.agent_ids = agent_ids
     data.valid_mask = torch.tensor(valid_mask, dtype=torch.bool)
+    
     return data
 
 def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=False):
@@ -358,9 +363,10 @@ def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=
     return scenarios_and_their_graphs
 
 from tqdm import tqdm
-def save_scenarios_to_hdf5_streaming(files, h5_path, radius, graph_creation_method, compression="lzf"):
+def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf"):
     """Stream directly from TFRecord files to HDF5 without storing in memory, HDF5 file structure:
     scenarios/{scenario_id}/snapshot_graphs/{timestep}/x|edge_index|edge_weight|y"""
+    print("Saving scenarios to HDF5 file...")
     with h5py.File(h5_path, "w") as f:
         scenarios_group = f.create_group("scenarios")
 
@@ -410,13 +416,13 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, radius, graph_creation_meth
             
     print(f"\nCompleted! Total scenarios saved: {total_scenarios}")
 
-def test_hdf5_and_lazy_loading():
+def test_hdf5_and_lazy_loading(path):
     print("=" * 80)
     print("TESTING HDF5 LAZY LOADING")
     print("=" * 80)
 
     # Initialize dataset
-    dataset = HDF5TemporalDataset("data/graphs/training.hdf5")
+    dataset = HDF5TemporalDataset(path)
     print(f"\n✓ Dataset loaded: {len(dataset)} total snapshots")
 
     # Test 1: Check a few individual snapshots
@@ -447,14 +453,64 @@ def test_hdf5_and_lazy_loading():
 
     # Test 3: DataLoader with standard batching (PyG style)
     print("\n" + "-" * 80)
-    print("TEST 3: DataLoader Standard Batching")
+    print("TEST 3: DataLoader with Sequence Batching (TRAINING-STYLE)")
+    print("-" * 80)
+    
+    # Use the same dataset as training
+    from dataset import HDF5ScenarioDataset
+    scenario_dataset = HDF5ScenarioDataset(path, seq_len=sequence_length)
+    
+    dataloader = DataLoader(
+        scenario_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        collate_fn=collate_graph_sequences_to_batch,
+        drop_last=True
+    )
+    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
+    print(f"Expected batches: ~{len(scenario_dataset) // batch_size}")
+    print(f"Each batch contains {batch_size} different scenarios, each with {sequence_length} timesteps\n")
+
+    for batch_idx, batch_dict in enumerate(dataloader):
+        if batch_idx >= 3:  # Only show first 3 batches
+            break
+        
+        batched_graph_sequence = batch_dict["batch"]
+        B = batch_dict["B"]
+        T = batch_dict["T"]
+        
+        print(f"Batch {batch_idx}:")
+        print(f"  - B (# scenarios): {B}")
+        print(f"  - T (# timesteps): {T}")
+        print(f"  - Batched graphs: {len(batched_graph_sequence)}")
+        
+        # Show first timestep details
+        first_timestep = batched_graph_sequence[0]
+        print(f"  - First timestep graph:")
+        print(f"    - x: {first_timestep.x.shape}")
+        print(f"    - edge_index: {first_timestep.edge_index.shape}")
+        print(f"    - y: {first_timestep.y.shape}")
+        print(f"    - batch: {first_timestep.batch.shape} (node→graph mapping)")
+        if hasattr(first_timestep, 'scenario_id'):
+            unique_scenarios = len(set([first_timestep.scenario_id]))
+            print(f"    - Unique scenarios in batch: {unique_scenarios}")
+        print()
+
+    print(f"Total batches processed: {batch_idx + 1}")
+    print("\n✓ This matches training: Each batch has B={batch_size} different scenarios,")
+    print(f"  and you iterate through T={sequence_length} timesteps sequentially in training loop")
+
+    # Test 4: OLD-STYLE flat snapshot batching (for comparison)
+    print("\n" + "-" * 80)
+    print("TEST 4: DataLoader Flat Snapshot Batching (OLD STYLE - NOT USED IN TRAINING)")
     print("-" * 80)
     dataloader = DataLoader(
         dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        collate_fn=Batch.from_data_list  # Use PyG's collate function
+        collate_fn=Batch.from_data_list  # PyG default batching
     )
     print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
     print(f"Expected batches: ~{len(dataset) // batch_size}")
@@ -475,49 +531,18 @@ def test_hdf5_and_lazy_loading():
                 print(f"  - snapshot_ids: {batch.snapshot_id}")
 
     print(f"\nTotal batches processed: {batch_idx + 1}")
+    print("\n⚠ This batching treats snapshots independently (NOT used in training!)")
 
-    # Test 4: DataLoader with custom collate function (sequence batching)
+    # Test 5: OLD custom sequence batching test
     print("\n" + "-" * 80)
-    print("TEST 4: DataLoader with Custom Collate (Sequence Batching)")
+    print("TEST 5: DataLoader with Custom Collate (OLD - SKIPPED)")
     print("-" * 80)
-    
-    # Create a dataset wrapper that returns sequences
-    # Assuming dataset has a method to get sequences by scenario
-    if hasattr(dataset, 'scenarios'):
-        sequence_dataloader = DataLoader(
-            dataset.scenarios(), 
-            batch_size=batch_size, 
-            shuffle=False, 
-            num_workers=0,  # Custom collate with complex objects often needs num_workers=0
-            collate_fn=collate_graph_sequences_to_batch
-        )
-        print(f"Sequence DataLoader config: batch_size={batch_size}, num_workers=0, collate_fn=custom")
-        
-        for batch_idx, batch_dict in enumerate(sequence_dataloader):
-            if batch_idx < 3:  # Print first 3 batches
-                print(f"\nSequence Batch {batch_idx}:")
-                print(f"  Type: {type(batch_dict)}")
-                print(f"  Batch size (B): {batch_dict['B']}")
-                print(f"  Num timesteps (T): {len(batch_dict['batch'])}")
-                
-                # Show details of first timestep
-                first_timestep = batch_dict['batch'][0]
-                print(f"  First timestep batch:")
-                print(f"    - x: {first_timestep.x.shape}")
-                print(f"    - edge_index: {first_timestep.edge_index.shape}")
-                print(f"    - edge_attr: {first_timestep.edge_attr.shape if first_timestep.edge_attr is not None else None}")
-                print(f"    - num_graphs: {first_timestep.num_graphs}")
-            
-            if batch_idx >= 2:
-                break
-        
-        print(f"\nTotal sequence batches shown: {min(batch_idx + 1, 3)}")
-    else:
-        print("⚠ Dataset doesn't support sequence access - skipping sequence batching test")
+    print("⚠ Skipping - not compatible with HDF5TemporalDataset")
+    print("  (Use HDF5ScenarioDataset for sequence batching as shown in Test 3)")
 
-    # Test 5: Memory usage check (optional)
+    # Test 6: Verify Lazy Loading (memory check)
     print("\n" + "-" * 80)
-    print("TEST 5: Verify Lazy Loading (memory check)")
+    print("TEST 6: Verify Lazy Loading (memory check)")
     print("-" * 80)
     print("Accessing 5 random snapshots without loading all data...")
     import random
