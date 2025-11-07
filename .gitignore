@@ -4,6 +4,8 @@ data/scenario/training/*
 data/graphs/testing/*
 data/graphs/validation/*
 data/graphs/training/*
+!data/graphs/*/.gitkeep
+!data/scenario/*/.gitkeep
 
 .env
 wandb/*
