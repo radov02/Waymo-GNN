@@ -50,11 +50,19 @@ def download_scenario_file(bucket, dataset, i):
         return
     
     try:
+        import time
+        start_time = time.perf_counter()
         print(f"Downloading {gs_filename} by executing: blob.download_to_filename(filename=str({local_filename}))")
         blob.download_to_filename(filename=str(local_filename))
-        print("\tDownloaded:", local_filename)
-    except Exception as e:
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"\tDownloaded blob {local_filename} in {elapsed_time:.1f} seconds.")
+    except (Exception, KeyboardInterrupt) as e:
         print("Failed to write", local_filename, ":", repr(e))
+        if local_filename.exists():
+            local_filename.unlink()
+            print(f"\tDeleted incomplete file: {local_filename}")
+        raise
 
 def ensure_shards(num_shards: int) -> None:
     """Download the first ``num_shards`` TFRecords per split and build indices."""
@@ -62,8 +70,15 @@ def ensure_shards(num_shards: int) -> None:
     bucket = get_waymo_bucket()
 
     for split in ("training", "validation", "testing"):
+        import time
+        start_time = time.perf_counter()
+        
         for shard_idx in range(num_shards):
             download_scenario_file(bucket, split, shard_idx)
+        
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Downloaded {split} files in {elapsed_time:.1f} seconds.\n")
 
 
 
