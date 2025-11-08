@@ -130,9 +130,11 @@ def initialize():
     print(f"...INITIALIZATION COMPLETE!\n")
 
 def get_data_files(filepath):
+    print("getdatafiles")
     files = []
     try:
         for filename in os.listdir(filepath):
+            print(filename)
             if filename != '.gitkeep':
                 filepath = os.path.join(filepath, filename)
                 if os.path.isfile(filepath):

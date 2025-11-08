@@ -169,6 +169,8 @@ if __name__ == '__main__':
 
 
     # TODO:
+    # - more timesteps?
+    # - GRU reset
     # - define the Data/HeteroData object:
     #   - x ... node feature matrix
     #   - edge_index ... edges, shape [2, num_edges]

@@ -3,6 +3,11 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_workers = 4
 
+# data download:
+number_of_training_tfrecord_files = 10
+number_of_validation_tfrecord_files = 10
+number_of_testing_tfrecord_files = 10
+
 # graph creation:
 radius = 30.0  # 30m is more reasonable for local interactions
 graph_creation_method = 'radius'  # 'radius' or 'star'
