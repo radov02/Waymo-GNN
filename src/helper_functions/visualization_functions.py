@@ -5,485 +5,10 @@ import torch
 import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
-from config import sequence_length, radius, graph_creation_method
-
-
-def load_scenario_for_visualization(scenario_id=None):
-    """
-    Load a Waymo scenario for visualization purposes.
-    
-    Args:
-        scenario_id: Optional scenario ID. If None, loads first available scenario.
-    
-    Returns:
-        scenario object or None
-    """
-    try:
-        from helper_functions.graph_creation_functions import get_data_files, parse_scenario_file
-        
-        # Try to load from training data
-        training_files = get_data_files(".\\data\\scenario\\training")
-        if not training_files:
-            print("Warning: No training scenario files found")
-            return None
-        
-        # Load first file
-        scenarios = parse_scenario_file(training_files[0])
-        if scenarios:
-            if scenario_id is not None:
-                # Find specific scenario
-                for scenario in scenarios:
-                    if scenario.scenario_id == scenario_id:
-                        return scenario
-            # Return first scenario
-            return scenarios[0]
-        return None
-    except Exception as e:
-        print(f"Warning: Could not load scenario for visualization: {e}")
-        return None
-
-
-def plot_lane_polylines(scenario, figsize=(14, 12), show_lane_ids=False, show_lane_types=True):
-    """
-    Plot only lane polylines from a Waymo scenario.
-    
-    Args:
-        scenario: Waymo scenario object
-        figsize: Figure size tuple (width, height)
-        show_lane_ids: Whether to show lane IDs on the plot
-        show_lane_types: Whether to color-code lanes by type
-    
-    Returns:
-        fig, ax: Matplotlib figure and axes objects
-    """
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-    
-    # Lane type names and colors
-    lane_type_names = {
-        0: 'UNDEFINED',
-        1: 'FREEWAY',
-        2: 'SURFACE_STREET',
-        3: 'BIKE_LANE'
-    }
-    
-    lane_type_colors = {
-        0: '#95a5a6',  # Gray for undefined
-        1: '#e74c3c',  # Red for freeway
-        2: '#3498db',  # Blue for surface street
-        3: '#2ecc71'   # Green for bike lane
-    }
-    
-    lane_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-    
-    print(f"Plotting lane polylines for scenario: {scenario.scenario_id}")
-    
-    # Plot lane polylines
-    for feature in scenario.map_features:
-        feature_type = feature.WhichOneof('feature_data')
-        
-        if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
-            lane_type = feature.lane.type
-            lane_counts[lane_type] += 1
-            
-            # Extract coordinates
-            x_coords = [point.x for point in feature.lane.polyline]
-            y_coords = [point.y for point in feature.lane.polyline]
-            
-            # Choose color
-            if show_lane_types:
-                color = lane_type_colors.get(lane_type, '#95a5a6')
-            else:
-                color = '#3498db'  # Default blue
-            
-            # Plot the lane
-            ax.plot(x_coords, y_coords, color=color, linewidth=2, alpha=0.7)
-            
-            # Optionally show lane ID at the midpoint
-            if show_lane_ids and len(x_coords) > 0:
-                mid_idx = len(x_coords) // 2
-                ax.annotate(
-                    str(feature.id),
-                    xy=(x_coords[mid_idx], y_coords[mid_idx]),
-                    fontsize=8,
-                    ha='center',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7)
-                )
-    
-    # Configure plot
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
-    ax.set_title(f'Lane Polylines - Scenario: {scenario.scenario_id}', 
-                 fontsize=14, fontweight='bold')
-    
-    # Create legend if showing lane types
-    if show_lane_types:
-        for lane_type, count in lane_counts.items():
-            if count > 0:
-                type_name = lane_type_names.get(lane_type, f'Type_{lane_type}')
-                color = lane_type_colors.get(lane_type, '#95a5a6')
-                ax.plot([], [], color=color, linewidth=2, alpha=0.7, 
-                       label=f'{type_name} ({count})')
-        ax.legend(loc='upper right')
-    
-    plt.tight_layout()
-    
-    # Print summary
-    total_lanes = sum(lane_counts.values())
-    print(f"Total lanes plotted: {total_lanes}")
-    for lane_type, count in lane_counts.items():
-        if count > 0:
-            type_name = lane_type_names.get(lane_type, f'Type_{lane_type}')
-            print(f"  - {type_name}: {count}")
-    
-    return fig, ax
-
-
-# Example usage (commented out - uncomment when you have training_dataset loaded):
-# fig, ax = plot_lane_polylines(
-#     training_dataset[0][0],
-#     figsize=(14, 12),
-#     show_lane_ids=False,
-#     show_lane_types=True
-# )
-
-
-
-
-# VISUALIZE SCENARIO WITH GRAPH EDGES
+from config import sequence_length, radius, graph_creation_method, viz_scenario_dir, viz_training_dir
 import matplotlib.pyplot as plt
 
-def show_distances(pos, src_idx, dst_idx, x_coords, y_coords, ax):
-    dist = np.sqrt((pos[src_idx, 0] - pos[dst_idx, 0])**2 + (pos[src_idx, 1] - pos[dst_idx, 1])**2)
-    mid_x = (x_coords[0] + x_coords[1]) / 2
-    mid_y = (y_coords[0] + y_coords[1]) / 2
-    ax.annotate(f'{dist:.1f}m', xy=(mid_x, mid_y), fontsize=6, color='blue', ha='center', alpha=0.6)
-
-def visualize_scenario_with_graph(scenario, timestep, radius, figsize=(14, 12), show_future=True, show_edge_distances=False, show_scenario_analysis=False):
-
-    if show_scenario_analysis:
-        analyze_scenario(scenario)
-        analyze_scenario_agents(scenario)
-
-    graph_data = timestep_to_pyg_data(scenario, timestep, radius, future_states=10, method='star')
-    if graph_data is None:
-        print("No valid agents at this timestep!")
-        return None, None, None
-
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
-    colors = {1: '#e74c3c', 2: '#3498db', 3: '#f39c12', 4: '#9b59b6'}
-    type_names = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    print(f"VISUALIZING SCENARIO WITH GRAPH: {scenario.scenario_id}")
-    print(f" Time: {scenario.timestamps_seconds[timestep]:.1f}s")
-    print(f" Graph: {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
-
-    render_map_features(scenario, ax)
-
-    print(f" Rendering {graph_data.num_edges} graph edges...")
-    edge_index = graph_data.edge_index
-    pos = graph_data.pos.numpy()
-    for i in range(edge_index.shape[1]):
-        src_idx = edge_index[0, i].item()
-        dst_idx = edge_index[1, i].item()
-        x_coords = [pos[src_idx, 0], pos[dst_idx, 0]]
-        y_coords = [pos[src_idx, 1], pos[dst_idx, 1]]
-        ax.plot(x_coords, y_coords, 'blue', linewidth=1.2, alpha=0.4, zorder=5)
-        if show_edge_distances:
-            show_distances(pos, src_idx, dst_idx, x_coords, y_coords, ax)
-
-    render_agents(scenario, timestep, colors, ax, show_future=show_future)
-
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
-    ax.set_title(f'Waymo Scenario with Graph Edges (radius={radius}m)\n'
-                f'Scenario: {scenario.scenario_id}, Time: {scenario.timestamps_seconds[timestep]:.1f}s\n'
-                f'{graph_data.num_nodes} nodes, {graph_data.num_edges} edges', 
-                fontsize=14, fontweight='bold')
-    all_x = [state.center_x for track in scenario.tracks for state in track.states if state.valid]
-    all_y = [state.center_y for track in scenario.tracks for state in track.states if state.valid]
-    if all_x and all_y:
-        margin = 20
-        ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
-        ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
-    for obj_type, color in colors.items():
-        if obj_type in [t.object_type for t in scenario.tracks]:
-            ax.scatter([], [], c=color, s=50, label=type_names[obj_type])
-    ax.plot([], [], 'blue', linewidth=2, alpha=0.4, label=f'Graph edges (≤{radius}m)')
-    ax.legend()
-    plt.tight_layout()
-
-    agent_counts = {}
-    for track in scenario.tracks:
-        if timestep < len(track.states) and track.states[timestep].valid:
-            agent_type = type_names.get(track.object_type, 'Other')
-            agent_counts[agent_type] = agent_counts.get(agent_type, 0) + 1
-    print(" Agents in graph:")
-    for agent_type, count in agent_counts.items():
-        print(f"   - {count} {agent_type}{'s' if count != 1 else ''}")
-    if graph_data.num_edges > 0:
-        avg_degree = graph_data.num_edges / graph_data.num_nodes
-        print(f" Average degree: {avg_degree:.2f} edges per node")
-    
-    return fig, ax, graph_data
-
-
-# TEST: Visualize scenario with graph edges at different radii
-# time = 0
-# fig1, ax1, graph1 = visualize_scenario_with_graph(training_dataset[0][0], timestep=time, radius=30.0, show_future=True)
-
-
-def visualize_predictions_vs_actual(model, batch_dict, epoch, save_dir='training_visualizations', 
-                                     device='cpu', max_nodes_to_plot=50, num_timesteps_to_show=None):
-    """
-    Visualize model predictions vs actual positions across a temporal sequence.
-    Creates a .png file showing trajectories at different timesteps.
-    
-    Args:
-        model: The trained EvolveGCN model
-        batch_dict: Dictionary with 'batch' (list of Batch objects), 'B', 'T'
-        epoch: Current epoch number (for filename)
-        save_dir: Directory to save visualization files
-        device: Device to run inference on
-        max_nodes_to_plot: Maximum number of nodes to visualize (to avoid clutter)
-        num_timesteps_to_show: Number of timesteps to visualize (None = all)
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    
-    model.eval()
-    batched_graph_sequence = batch_dict["batch"]
-    T = batch_dict["T"]
-    
-    if num_timesteps_to_show is None:
-        num_timesteps_to_show = T
-    else:
-        num_timesteps_to_show = min(num_timesteps_to_show, T)
-    
-    # Reset model hidden states
-    model.reset_gru_hidden_states()
-    
-    # Move graphs to device
-    for t in range(T):
-        batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
-    
-    # Collect actual and predicted positions
-    actual_positions = []  # List of [num_nodes, 2] tensors
-    predicted_positions = []  # List of [num_nodes, 2] tensors
-    
-    with torch.no_grad():
-        for t in range(T):
-            batched_graph = batched_graph_sequence[t]
-            
-            # Get current positions (from node features or pos attribute)
-            if hasattr(batched_graph, 'pos') and batched_graph.pos is not None:
-                current_pos = batched_graph.pos.cpu()
-            else:
-                # Extract x, y from features (assuming first 2 features are positions)
-                current_pos = batched_graph.x[:, :2].cpu()
-            
-            actual_positions.append(current_pos)
-            
-            # Get predictions
-            predictions = model(batched_graph.x, batched_graph.edge_index)
-            predicted_positions.append(predictions.cpu())
-    
-    # Select subset of nodes to visualize
-    num_nodes = actual_positions[0].shape[0]
-    if num_nodes > max_nodes_to_plot:
-        # Sample nodes evenly
-        indices = np.linspace(0, num_nodes - 1, max_nodes_to_plot, dtype=int)
-    else:
-        indices = np.arange(num_nodes)
-    
-    # Create visualization
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-    
-    # Left plot: Actual trajectories
-    ax_actual = axes[0]
-    # Right plot: Predicted trajectories
-    ax_pred = axes[1]
-    
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(indices)))
-    
-    for idx, node_idx in enumerate(indices):
-        color = colors[idx]
-        
-        # Extract trajectory for this node across timesteps
-        actual_traj = np.array([actual_positions[t][node_idx].numpy() for t in range(num_timesteps_to_show)])
-        pred_traj = np.array([predicted_positions[t][node_idx].numpy() for t in range(num_timesteps_to_show)])
-        
-        # Plot actual trajectory
-        ax_actual.plot(actual_traj[:, 0], actual_traj[:, 1], 'o-', color=color, 
-                      alpha=0.6, linewidth=1.5, markersize=4, label=f'Node {node_idx}' if idx < 10 else None)
-        ax_actual.scatter(actual_traj[0, 0], actual_traj[0, 1], color=color, s=100, 
-                         marker='s', edgecolors='black', linewidths=2, zorder=10)
-        
-        # Plot predicted trajectory
-        ax_pred.plot(pred_traj[:, 0], pred_traj[:, 1], 'o-', color=color, 
-                    alpha=0.6, linewidth=1.5, markersize=4, label=f'Node {node_idx}' if idx < 10 else None)
-        ax_pred.scatter(pred_traj[0, 0], pred_traj[0, 1], color=color, s=100, 
-                       marker='s', edgecolors='black', linewidths=2, zorder=10)
-    
-    # Configure actual positions plot
-    ax_actual.set_aspect('equal', adjustable='box')
-    ax_actual.grid(True, alpha=0.3)
-    ax_actual.set_xlabel('X Position (m)', fontsize=12)
-    ax_actual.set_ylabel('Y Position (m)', fontsize=12)
-    ax_actual.set_title(f'Actual Trajectories\n(First {num_timesteps_to_show} timesteps)', 
-                       fontsize=14, fontweight='bold')
-    if len(indices) <= 10:
-        ax_actual.legend(loc='best', fontsize=8)
-    
-    # Configure predicted positions plot
-    ax_pred.set_aspect('equal', adjustable='box')
-    ax_pred.grid(True, alpha=0.3)
-    ax_pred.set_xlabel('X Position (m)', fontsize=12)
-    ax_pred.set_ylabel('Y Position (m)', fontsize=12)
-    ax_pred.set_title(f'Predicted Trajectories\n(First {num_timesteps_to_show} timesteps)', 
-                     fontsize=14, fontweight='bold')
-    if len(indices) <= 10:
-        ax_pred.legend(loc='best', fontsize=8)
-    
-    # Add epoch info
-    fig.suptitle(f'Epoch {epoch} - Trajectory Comparison\n'
-                f'{len(indices)} nodes shown out of {num_nodes} total', 
-                fontsize=16, fontweight='bold', y=0.98)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    
-    # Save figure
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'epoch_{epoch:03d}_{timestamp}.png'
-    filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    
-    print(f"  Saved visualization: {filepath}")
-    
-    model.train()
-    return filepath
-
-
-def visualize_predictions_overlay(model, batch_dict, epoch, save_dir='training_visualizations', 
-                                   device='cpu', max_nodes_to_plot=30, num_timesteps_to_show=None):
-    """
-    Visualize model predictions overlaid with actual positions to show discrepancy.
-    Creates a .png file with actual (solid line) and predicted (dashed line) trajectories.
-    
-    Args:
-        model: The trained EvolveGCN model
-        batch_dict: Dictionary with 'batch' (list of Batch objects), 'B', 'T'
-        epoch: Current epoch number (for filename)
-        save_dir: Directory to save visualization files
-        device: Device to run inference on
-        max_nodes_to_plot: Maximum number of nodes to visualize
-        num_timesteps_to_show: Number of timesteps to visualize (None = all)
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    
-    model.eval()
-    batched_graph_sequence = batch_dict["batch"]
-    T = batch_dict["T"]
-    
-    if num_timesteps_to_show is None:
-        num_timesteps_to_show = T
-    else:
-        num_timesteps_to_show = min(num_timesteps_to_show, T)
-    
-    # Reset model hidden states
-    model.reset_gru_hidden_states()
-    
-    # Move graphs to device
-    for t in range(T):
-        batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
-    
-    # Collect actual and predicted positions
-    actual_positions = []
-    predicted_positions = []
-    
-    with torch.no_grad():
-        for t in range(T):
-            batched_graph = batched_graph_sequence[t]
-            
-            # Get current positions
-            if hasattr(batched_graph, 'pos') and batched_graph.pos is not None:
-                current_pos = batched_graph.pos.cpu()
-            else:
-                current_pos = batched_graph.x[:, :2].cpu()
-            
-            actual_positions.append(current_pos)
-            
-            # Get predictions
-            predictions = model(batched_graph.x, batched_graph.edge_index)
-            predicted_positions.append(predictions.cpu())
-    
-    # Select subset of nodes
-    num_nodes = actual_positions[0].shape[0]
-    if num_nodes > max_nodes_to_plot:
-        indices = np.linspace(0, num_nodes - 1, max_nodes_to_plot, dtype=int)
-    else:
-        indices = np.arange(num_nodes)
-    
-    # Create single overlay plot
-    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
-    
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(indices)))
-    
-    for idx, node_idx in enumerate(indices):
-        color = colors[idx]
-        
-        # Extract trajectories
-        actual_traj = np.array([actual_positions[t][node_idx].numpy() for t in range(num_timesteps_to_show)])
-        pred_traj = np.array([predicted_positions[t][node_idx].numpy() for t in range(num_timesteps_to_show)])
-        
-        # Plot actual trajectory (solid line)
-        ax.plot(actual_traj[:, 0], actual_traj[:, 1], '-', color=color, 
-               alpha=0.7, linewidth=2, label=f'Actual {node_idx}' if idx < 5 else None)
-        
-        # Plot predicted trajectory (dashed line)
-        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, 
-               alpha=0.7, linewidth=2, label=f'Pred {node_idx}' if idx < 5 else None)
-        
-        # Mark starting position
-        ax.scatter(actual_traj[0, 0], actual_traj[0, 1], color=color, s=120, 
-                  marker='s', edgecolors='black', linewidths=2, zorder=10)
-        
-        # Show error arrows at each timestep
-        for t in range(0, num_timesteps_to_show, max(1, num_timesteps_to_show // 5)):
-            ax.annotate('', xy=pred_traj[t], xytext=actual_traj[t],
-                       arrowprops=dict(arrowstyle='->', color='red', lw=1, alpha=0.3))
-    
-    # Configure plot
-    ax.set_aspect('equal', adjustable='box')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
-    ax.set_title(f'Epoch {epoch} - Actual vs Predicted Trajectories\n'
-                f'Solid = Actual, Dashed = Predicted, Red arrows = Error\n'
-                f'{len(indices)} nodes, {num_timesteps_to_show} timesteps', 
-                fontsize=14, fontweight='bold')
-    
-    if len(indices) <= 5:
-        ax.legend(loc='best', fontsize=9)
-    
-    plt.tight_layout()
-    
-    # Save figure
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'epoch_{epoch:03d}_overlay_{timestamp}.png'
-    filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    
-    print(f"  Saved overlay visualization: {filepath}")
-    
-    model.train()
-    return filepath
-
-
-def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_dir='training_visualizations',
+def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_dir=viz_training_dir,
                                 device='cpu', max_nodes_per_graph=10, show_timesteps=8):
     """
     Visualization showing actual vs predicted trajectories with map features.
@@ -732,33 +257,15 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
     model.train()
     return filepath, avg_error
 
-
-def visualize_graph_sequence_creation(scenario, graph_sequence, save_dir='graph_visualizations', figsize=(16, 10)):
-    """
-    Visualize a temporal sequence of graphs created from a scenario.
-    Shows how the graph structure evolves over time.
-    
-    Args:
-        scenario: Waymo scenario object
-        graph_sequence: List of PyG Data objects (temporal sequence)
-        radius: Radius used for graph creation
-        graph_creation_method: Graph creation method ('radius' or 'star')
-        save_dir: Directory to save visualization
-        figsize: Figure size
-    
-    Returns:
-        filepath: Path to saved visualization
-    """
+def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir=viz_scenario_dir, figsize=(16, 10)):
+    """Visualize a temporal sequence of graphs created from a scenario. Shows how the graph structure evolves over time."""
     os.makedirs(save_dir, exist_ok=True)
-    
     T = len(graph_sequence)
-    
-    # Get SDC track ID
+
     sdc_track = scenario.tracks[scenario.sdc_track_index]
     sdc_id = sdc_track.id
     
-    # Create grid: show subset of timesteps (e.g., every 2nd or 3rd)
-    max_timesteps_to_show = 8
+    max_timesteps_to_show = max_timesteps_to_show   # Create grid: show subset of timesteps (e.g., every 2nd or 3rd)
     if T > max_timesteps_to_show:
         timestep_indices = np.linspace(0, T-1, max_timesteps_to_show, dtype=int)
     else:
@@ -773,11 +280,9 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, save_dir='graph_
         axes = axes.reshape(1, -1)
     axes = axes.flatten()
     
-    # Agent type colors
     type_colors = {1: '#e74c3c', 2: '#3498db', 3: '#f39c12', 4: '#9b59b6'}
     type_names = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
     
-    # Lane colors for map
     lane_type_colors = {
         0: '#95a5a6', 1: '#e74c3c', 2: '#3498db', 3: '#2ecc71'
     }
@@ -786,8 +291,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, save_dir='graph_
         ax = axes[plot_idx]
         graph = graph_sequence[t]
         
-        # Render map features (lightweight)
-        for feature in scenario.map_features:
+        for feature in scenario.map_features:       # Render map features (lightweight)
             feature_type = feature.WhichOneof('feature_data')
             
             if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
@@ -905,7 +409,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, save_dir='graph_
     
     return filepath
 
-def create_graph_sequence_visualization(scenario, save_dir='../../visualizations/'):
+def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num_timesteps=15):
     """Creates .png showing graphs for given scenario sequence"""
     from config import radius, graph_creation_method, sequence_length
     from helper_functions.graph_creation_functions import timestep_to_pyg_data
@@ -913,17 +417,18 @@ def create_graph_sequence_visualization(scenario, save_dir='../../visualizations
     print(f"Creating graph sequence visualization (from scenario {scenario.scenario_id}) into {save_dir} directory...")
     try:
         graph_sequence = []
-        for t in range(min(sequence_length, len(scenario.timestamps_seconds))):
+        print(f"sequence length: {sequence_length}, scenario.timestamps_seconds length: {len(scenario.timestamps_seconds)}")
+        for t in range(min(sequence_length-1, len(scenario.timestamps_seconds))):
             graph = timestep_to_pyg_data(scenario, t, radius, use_valid_only=True, method=graph_creation_method)
             if graph is not None:
                 graph_sequence.append(graph)
             
         if graph_sequence:
-            visualize_graph_sequence_creation(scenario, graph_sequence, save_dir=save_dir)
+            visualize_graph_sequence_creation(scenario, graph_sequence, num_timesteps, save_dir=save_dir)
         else:
             print("No valid graphs created for visualization")
     except Exception as e:
         print(f"Visualization failed: {e}")
         import traceback
         traceback.print_exc()
-    print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png")
+    print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")

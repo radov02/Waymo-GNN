@@ -6,11 +6,11 @@ from config import (device, batch_size, num_workers, num_layers, topk, epochs,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, visualize_first_batch_only,
-                    max_nodes_per_graph_viz, show_timesteps_viz)
+                    max_nodes_per_graph_viz, show_timesteps_viz, viz_training_dir)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from torch.nn.utils import clip_grad_norm_
-from helper_functions.visualization_functions import visualize_training_progress, load_scenario_for_visualization
+from helper_functions.visualization_functions import visualize_training_progress
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/training.py
 
@@ -30,7 +30,7 @@ if __name__ == '__main__':
             "epochs": epochs
         },
         name=f"GCN_r{radius}_h{hidden_channels}",
-        dir="../wandb"  # Save wandb runs to project root, not src/wandb
+        dir="../wandb"
     )
 
     model = EvolveGCNH(
@@ -46,7 +46,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_fn = torch.nn.MSELoss()
 
-    dataset = HDF5ScenarioDataset("../data/graphs/training/training.hdf5", seq_len=sequence_length)
+    dataset = HDF5ScenarioDataset("./data/graphs/training/training.hdf5", seq_len=sequence_length)
 
     dataloader = DataLoader(dataset, 
                             batch_size=batch_size, 
@@ -77,63 +77,60 @@ if __name__ == '__main__':
             batched_graph_sequence = batch_dict["batch"]  # list of length T of Batch objects
             B = batch_dict["B"]
             T = batch_dict["T"]
+            print(f"Batch {step}: B={B} scenarios, T={T} timesteps")
 
-            # Save first batch for visualization (only once)
-            if viz_batch is None and (not visualize_first_batch_only or not viz_batch_saved):
-                viz_batch = {
-                    'batch': [b.cpu() for b in batch_dict['batch']],
-                    'B': batch_dict['B'],
-                    'T': batch_dict['T']
-                }
+            if viz_batch is None and (not visualize_first_batch_only or not viz_batch_saved):   # Save first batch for visualization (only once)
+                viz_batch = {'batch': [b.cpu() for b in batch_dict['batch']],'B': batch_dict['B'],'T': batch_dict['T']}
                 viz_batch_saved = True
 
-            # reset GRU hidden states at the start of each new batch
-            model.reset_gru_hidden_states()
+            # Move data to device
+            for t in range(T): batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
-            for t in range(T):  # move each batched graph to device
-                batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+            # CRITICAL: Reset GRU hidden states at the start of each new scenario sequence
+            # This ensures the model starts fresh for each independent scenario
+            model.reset_gru_hidden_states()
 
             optimizer.zero_grad()
             accumulated_loss = 0.0
             valid_timesteps = 0     # linked with skipping loss for when no ground truth is given
 
             for t, batched_graph in enumerate(batched_graph_sequence):  # batched_graph contains B graphs at timestep t, merged into one batch
-                
+                #print(f"currently at t = {t}")
                 out_predictions = model(batched_graph.x, batched_graph.edge_index)      # out_predictions: [total_nodes_in_batch, output_dim]
 
-                # Skip if no ground truth (e.g., last timestep has no future to predict)
-                if batched_graph.y is None:
-                    continue
                 
-                # Skip if labels are all zeros (invalid future state)
-                if torch.all(batched_graph.y == 0):
+                if batched_graph.y is None:     # Skip if no ground truth (e.g., last timestep has no future to predict)
+                    continue
+                if torch.all(batched_graph.y == 0):     # Skip if labels are all zeros (invalid future state)
                     continue
 
-                # Shape validation (optional, remove after debugging)
-                if step == 0 and t == 0 and epoch == 0:
-                    print(f"out_predictions shape: {out_predictions.shape}")
-                    print(f"batched_graph.y shape: {batched_graph.y.shape}")
-                    assert out_predictions.shape == batched_graph.y.shape, \
-                        f"Shape mismatch! Predictions: {out_predictions.shape}, Targets: {batched_graph.y.shape}"
+                
+                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))    # Use batched_graph.y (position displacements/deltas) for loss function
+                accumulated_loss += loss_t.item()   # Accumulate as scalar, not tensor (prevents computational graph buildup)
+                valid_timesteps += 1
 
-                # Use batched_graph.y (position displacements/deltas) for loss function
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))
-                
-                # Accumulate as scalar, not tensor (prevents computational graph buildup)
-                accumulated_loss += loss_t.item()
-                
-                # Backprop immediately for this timestep
-                loss_t.backward(retain_graph=True)
-                
-                valid_timesteps += 1  # increment counter
-
-            # Only step optimizer after all timesteps
+            # CRITICAL FIX: Compute loss for entire sequence, then backprop once
+            # This prevents gradient accumulation issues with retain_graph=True
             if valid_timesteps > 0:
-                avg_loss_batch = accumulated_loss / valid_timesteps
+                # Re-run forward pass to compute loss properly
+                model.reset_gru_hidden_states()  # Reset for clean forward pass
+                total_loss = 0.0
+                
+                for t, batched_graph in enumerate(batched_graph_sequence):
+                    if batched_graph.y is None or torch.all(batched_graph.y == 0):
+                        continue
+                    
+                    out_predictions = model(batched_graph.x, batched_graph.edge_index)
+                    loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))
+                    total_loss += loss_t  # Accumulate as tensor to build computation graph
+                
+                # Single backward pass for entire sequence
+                avg_loss_batch = total_loss / valid_timesteps
+                avg_loss_batch.backward()
                 clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-                total_loss_epoch += avg_loss_batch
+                total_loss_epoch += avg_loss_batch.item()
                 steps += 1
 
         avg_loss_epoch = total_loss_epoch / max(1, steps)
@@ -146,12 +143,12 @@ if __name__ == '__main__':
         should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0
         
         if should_visualize and viz_batch is not None:
-            print(f"  Generating visualization for epoch {epoch+1}...")
+            print(f"  Generating visualization of first batch for epoch {epoch+1}...")
             try:
                 filepath, avg_error = visualize_training_progress(
                     model, viz_batch, epoch=epoch+1,
                     scenario=viz_scenario,  # Pass scenario for map features
-                    save_dir='../visualizations/training',
+                    save_dir=viz_training_dir,
                     device=device,
                     max_nodes_per_graph=max_nodes_per_graph_viz,
                     show_timesteps=show_timesteps_viz
@@ -169,8 +166,13 @@ if __name__ == '__main__':
 
 
     # TODO:
-    # - more timesteps?
     # - GRU reset
+    # - add for validation (note more timesteps) and testing
+    # - implement whole model training pipeline using wandb (see Colab 2), in evaluation make visualizations
+    # - use different graph creation methods
+    # - do initial_feature_vector() method
+    # - review build_edge_index_using_...() functions
+    # - implement GAT/transformer model (see Colab 4) using HeteroData PyG object
     # - define the Data/HeteroData object:
     #   - x ... node feature matrix
     #   - edge_index ... edges, shape [2, num_edges]
@@ -178,13 +180,6 @@ if __name__ == '__main__':
     #   - y ... truth labels
     #   - pos ... node position matrix, shape [num_nodes, num_dimensions]
     #   - time ... timestamps for each event, shape [num_edges] or [num_nodes]
-    # - define correct loss_fn and when to calculate it (at each timestep or only at the end)!
-    # - add for validation (note more timesteps) and testing
-    # - implement whole model training pipeline using wandb (see Colab 2), in evaluation make visualizations
-    # - use different graph creation methods
-    # - do initial_feature_vector() method
-    # - review build_edge_index_using_...() functions
-    # - implement GAT/transformer model (see Colab 4) using HeteroData PyG object
     
 
     training_wandb_run.finish()

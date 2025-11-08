@@ -1,7 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from pathlib import Path
 from google.cloud import storage
 import json
 from google.oauth2.credentials import Credentials as UserCredentials
+from config import number_of_training_tfrecord_files, number_of_validation_tfrecord_files, number_of_testing_tfrecord_files
 
 gs_template = "uncompressed/scenario/{dataset}/{dataset}.tfrecord-{i}-of-{length}"    # gs://waymo_open_dataset_motion_v_1_3_0/uncompressed/scenario/training/testing.tfrecord-00000-of-01000
 dataset_name = "scenario"
@@ -64,13 +67,12 @@ def download_scenario_file(bucket, dataset, i):
             print(f"\tDeleted incomplete file: {local_filename}")
         raise
 
-def ensure_shards(num_shards: int) -> None:
+def ensure_shards(num_shards: int, datasets=["training"]) -> None:
     """Download the first ``num_shards`` TFRecords per split and build indices."""
 
     bucket = get_waymo_bucket()
 
-    for split in ("training", "validation", "testing"):
-        import time
+    for split in datasets:
         start_time = time.perf_counter()
         
         for shard_idx in range(num_shards):
@@ -80,13 +82,10 @@ def ensure_shards(num_shards: int) -> None:
         elapsed_time = end_time - start_time
         print(f"Downloaded {split} files in {elapsed_time:.1f} seconds.\n")
 
-
-
-"""
-def download_tfrecord_files(num_files=None, datasets=["training"], max_workers=8):
+"""def download_tfrecord_files(num_files=None, datasets=["training"], max_workers=1):
     #Download TFRecord files for specified datasets using multithreading. If num_files is None, uses values from config.py.
     bucket = get_waymo_bucket()
-    
+
     dataset_configs = []
     if "training" in datasets:
         count = num_files if num_files is not None else number_of_training_tfrecord_files
@@ -99,9 +98,12 @@ def download_tfrecord_files(num_files=None, datasets=["training"], max_workers=8
     if "testing" in datasets:
         count = num_files if num_files is not None else number_of_testing_tfrecord_files
         dataset_configs.append(("testing", count))
-    
+
+    start = time.perf_counter()
+
     for dataset_type, file_count in dataset_configs:
         print(f"\nDownloading {file_count} files for {dataset_type} dataset with {max_workers} threads...")
+        start_time = time.perf_counter()
         
         tasks = [(bucket, dataset_type, shard_idx) for shard_idx in range(file_count)]
         
@@ -121,8 +123,20 @@ def download_tfrecord_files(num_files=None, datasets=["training"], max_workers=8
                     completed += 1
                     if completed % 10 == 0 or completed == file_count:
                         print(f"Progress: {completed}/{file_count} files processed")
-                except Exception as e:
+                except (Exception, KeyboardInterrupt) as e:
                     print(f"Error downloading shard {shard_idx}: {repr(e)}")
+                    if local_filename.exists():
+                        local_filename.unlink()
+                        print(f"\tDeleted incomplete file: {local_filename}")
+                    raise
+                    
+
+
+                    
         
-        print(f"Completed downloading {dataset_type} dataset")
-"""
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        print(f"Completed downloading {dataset_type} dataset in {elapsed_time:.1f} seconds.")
+    end = time.perf_counter()
+    elapsed = end - start
+    print(f"Completed download in {elapsed:.1f} seconds.")"""

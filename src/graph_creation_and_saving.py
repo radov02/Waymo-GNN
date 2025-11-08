@@ -1,6 +1,4 @@
-import torch
-import h5py
-from config import viz_scenario_dir
+from config import viz_scenario_dir, number_of_training_tfrecord_files, max_num_scenarios_per_tfrecord_file
 from helper_functions.cloud_tfrecord_downloader import ensure_shards
 from helper_functions.graph_creation_functions import (initialize, get_data_files, save_scenarios_to_hdf5_streaming, 
                                        test_hdf5_and_lazy_loading, parse_scenario_file)
@@ -12,20 +10,14 @@ if __name__ == '__main__':
 
     initialize()
 
-    #download_tfrecord_files(datasets=["validation"])  #["training", "validation", "testing"])
-
-    ensure_shards(10)
+    ensure_shards(number_of_training_tfrecord_files, datasets=["training"])    # downloads tfrecord files
 
     training_files_filepaths = get_data_files("./data/scenario/training")
 
-    print("="*20)
-    print(training_files_filepaths)
-    print("="*20)
+    #create_graph_sequence_visualization(parse_scenario_file(training_files_filepaths[0])[0], save_dir='./' + viz_scenario_dir, num_timesteps=15)
 
-    #create_graph_sequence_visualization(parse_scenario_file(training_files_filepaths[0])[0], save_dir='../' + viz_scenario_dir)
+    save_scenarios_to_hdf5_streaming(training_files_filepaths, './data/graphs/training/training.hdf5', max_num_scenarios_per_tfrecord_file=max_num_scenarios_per_tfrecord_file)
 
-    #save_scenarios_to_hdf5_streaming(training_files_filepaths, '../data/graphs/training/training.hdf5')
-
-    #test_hdf5_and_lazy_loading('../data/graphs/training/training.hdf5')
+    #test_hdf5_and_lazy_loading('./data/graphs/training/training.hdf5')
 
 

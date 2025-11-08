@@ -69,7 +69,9 @@ class EvolveGCNH(nn.Module):
         for i in range(num_layers):
             self.p.append(nn.Parameter(torch.randn(hidden_dim if i > 0 else input_dim)))
         
-        self.gru_h = None   # holds GRU hidden states: [W_t^(l) for different t]
+        # GRU hidden states: shape will be [B, num_layers, num_params_per_layer]
+        # where B is batch size (number of independent sequences)
+        self.gru_h = None   # holds GRU hidden states for each sequence in batch
     
     def reset_parameters(self):
         """Reset all learnable parameters including GCN layers and GRU cells."""
@@ -156,11 +158,13 @@ class EvolveGCNH(nn.Module):
         
         return new_hidden.squeeze(0)"""
     
-    def forward(self, x, edge_index=None):
+    def forward(self, x, edge_index=None, batch=None):
         """
         Args:
             x: Either node features [num_nodes, input_dim] OR a PyG Data/Batch object
             edge_index: Graph connectivity [2, num_edges] (optional if x is Data/Batch)
+            batch: Batch assignment vector [num_nodes] indicating which graph each node belongs to
+                   (optional if x is Data/Batch object)
         
         Returns:
             Node embeddings [num_nodes, output_dim]
@@ -169,18 +173,37 @@ class EvolveGCNH(nn.Module):
         if edge_index is None:
             if hasattr(x, 'x') and hasattr(x, 'edge_index'):
                 edge_index = x.edge_index
+                batch = x.batch if hasattr(x, 'batch') else None
                 x = x.x
             else:
                 raise ValueError("If edge_index is not provided, x must be a PyG Data/Batch object")
         
         device = x.device
         
+        # Determine batch size
+        if batch is None:
+            B = 1  # Single graph
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+        else:
+            B = int(batch.max().item()) + 1
+        
         # Initialize GRU hidden states from current GCN parameters if needed:
+        # Shape: [B, num_layers, num_params_per_layer]
         if self.gru_h is None:
             self.gru_h = []
-            for gcn in self.gcn_layers:
+            for layer_idx, gcn in enumerate(self.gcn_layers):
                 params_vector = self._get_params_vector(gcn)
-                self.gru_h.append(params_vector.detach().to(device))
+                # Replicate initial weights for each sequence in batch
+                layer_hidden = params_vector.detach().unsqueeze(0).repeat(B, 1)  # [B, num_params]
+                self.gru_h.append(layer_hidden.to(device))
+        else:
+            # If batch size changed, reinitialize
+            if self.gru_h[0].size(0) != B:
+                self.gru_h = []
+                for layer_idx, gcn in enumerate(self.gcn_layers):
+                    params_vector = self._get_params_vector(gcn)
+                    layer_hidden = params_vector.detach().unsqueeze(0).repeat(B, 1)
+                    self.gru_h.append(layer_hidden.to(device))
         
         # Move hidden states to correct device if needed:
         if self.gru_h[0].device != device:
@@ -190,24 +213,54 @@ class EvolveGCNH(nn.Module):
         
         # Process each GCN layer
         for layer_index, (GCN, GRU, p) in enumerate(zip(self.gcn_layers, self.gru_cells, self.p)):
-
-            # compute and flatten summary nodes that will be used to evolve weights:
-            Z_t = self._summarize_node_embeddings(h, self.topk, p)  # # selects top k highest attention score (according to learned p) node representations, shape is: [topk, feature_dim]
-            Z_t_flat = Z_t.T.flatten()  # [feature_dim * topk]
             
-            # evolve the weights of GCN:
-            # W^(l)_t = GRU(summarized(H^(l)_t), W^(l)_{t-1})
-            new_weights = GRU(Z_t_flat.unsqueeze(0), self.gru_h[layer_index].unsqueeze(0))
-            self.gru_h[layer_index] = new_weights.squeeze(0)
+            # For each graph in the batch, compute summarized embeddings and evolve weights
+            new_weights_batch = []
+            
+            for b in range(B):
+                # Get nodes belonging to this graph
+                node_mask = (batch == b)
+                h_b = h[node_mask]  # Nodes for graph b
+                
+                # Compute and flatten summary nodes for this graph
+                Z_t = self._summarize_node_embeddings(h_b, self.topk, p)  # [topk, feature_dim]
+                Z_t_flat = Z_t.T.flatten()  # [feature_dim * topk]
+                
+                # Evolve the weights for this specific sequence:
+                # W^(l)_t[b] = GRU(summarized(H^(l)_t[b]), W^(l)_{t-1}[b])
+                new_weights_b = GRU(Z_t_flat.unsqueeze(0), self.gru_h[layer_index][b].unsqueeze(0))
+                new_weights_batch.append(new_weights_b.squeeze(0))
+            
+            # Stack weights for all sequences: [B, num_params]
+            self.gru_h[layer_index] = torch.stack(new_weights_batch, dim=0)
+            
+            # Apply GCN with evolved weights for each graph separately
+            h_outputs = []
+            for b in range(B):
+                node_mask = (batch == b)
+                h_b = h[node_mask]
+                
+                # Get edge indices for this graph
+                edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
+                edge_index_b = edge_index[:, edge_mask]
+                
+                # Remap node indices to local graph indices
+                node_mapping = torch.zeros(x.size(0), dtype=torch.long, device=device)
+                node_mapping[node_mask] = torch.arange(h_b.size(0), device=device)
+                edge_index_b_local = node_mapping[edge_index_b]
+                
+                # Set GCN weights for this graph
+                self._set_params_from_vector(GCN, self.gru_h[layer_index][b])
+                
+                # Apply graph convolution: H^(l+1)_t = σ(Â_t H^(l)_t W^(l)_t)
+                h_b = GCN(h_b, edge_index_b_local)
+                
+                h_outputs.append(h_b)
+            
+            # Concatenate outputs from all graphs
+            h = torch.cat(h_outputs, dim=0)
 
-            # use the evolved weights for GCN layer:
-            self._set_params_from_vector(GCN, self.gru_h[layer_index])
-
-            # apply graph convolution:
-            # H^(l+1)_t = σ(Â_t H^(l)_t W^(l)_t)
-            h = GCN(h, edge_index)
-
-            # apply activation and dropout:
+            # Apply activation and dropout:
             if layer_index < len(self.gcn_layers)-1:
                 h = torchFunctional.relu(h)
                 h = torchFunctional.dropout(h, p=self.dropout, training=self.training)

@@ -2,6 +2,7 @@ import torch
 import sys
 import os
 import h5py
+import time
 import numpy as np
 import tensorflow as tf
 from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
@@ -130,15 +131,18 @@ def initialize():
     print(f"...INITIALIZATION COMPLETE!\n")
 
 def get_data_files(filepath):
-    print("getdatafiles")
+    print("Files to get", end=": ")
     files = []
     try:
         for filename in os.listdir(filepath):
-            print(filename)
             if filename != '.gitkeep':
-                filepath = os.path.join(filepath, filename)
-                if os.path.isfile(filepath):
-                    files.append(filepath)
+                print(filename, end=", ")
+                full_path = os.path.join(filepath, filename)  # Use a different variable name!
+                if os.path.isfile(full_path):
+                    files.append(full_path)
+                else:
+                    print(f"{full_path} is not file")
+        print(files, "\n")
         return files
     except Exception as e:
         print(e)
@@ -308,6 +312,7 @@ def get_future_2D_trajectory_labels(scenario, agent_ids, timestep):
                 future_2d_position_displacements.append([0, 0])     # use current position (agent did not move)
         except (IndexError, KeyError) as e:
             print(f"ERROR AT TIMESTEPS IN get_future_2D_trajectory_labels FUNCTION!\nTimestep {timestep} or {timestep+1} out of bounds for agent {agent_id}: {e}")
+            print(f"\tAgent only has: {len(agent.states)} states!")
             future_2d_position_displacements.append([0, 0])
     return torch.tensor(future_2d_position_displacements, dtype=torch.float32)
 
@@ -354,7 +359,7 @@ def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=
     for file in dataset_dict:
         for scenario in dataset_dict[file]:
             scenario_graphs = []
-            for timestep in range(sequence_length-1):   # make 10 out of all 11 (sequence_length) graphs that have (x, y)
+            for timestep in range(sequence_length-1):
                 data = timestep_to_pyg_data(scenario, int(timestep), radius, method=graph_creation_method)
                 scenario_graphs.append(data)
             scenarios_and_their_graphs[scenario.scenario_id] = scenario_graphs
@@ -365,18 +370,23 @@ def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=
     return scenarios_and_their_graphs
 
 from tqdm import tqdm
-def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf"):
+def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_scenarios_per_tfrecord_file=None):
     """Stream directly from TFRecord files to HDF5 without storing in memory, HDF5 file structure:
     scenarios/{scenario_id}/snapshot_graphs/{timestep}/x|edge_index|edge_weight|y"""
-    print("Saving scenarios to HDF5 file...")
+    print("Saving scenarios to HDF5 file:")
     with h5py.File(h5_path, "w") as f:
         scenarios_group = f.create_group("scenarios")
 
         total_scenarios = 0
-        for file_idx, file_path in enumerate(tqdm(files, desc="Processing files")):
-            print(f"\nProcessing file {file_idx + 1}/{len(files)}: {file_path}")
+        start_time = time.perf_counter()
+        for file_idx, file_path in enumerate(files):
+            print(f"\tProcessing file {file_idx + 1}/{len(files)}: {file_path}...")
+            start = time.perf_counter()
 
             scenarios = parse_scenario_file(file_path)      # Parse scenarios from this file only
+
+            if max_num_scenarios_per_tfrecord_file is not None:
+                scenarios = scenarios[:max_num_scenarios_per_tfrecord_file]
 
             for scenario in scenarios:
                 scenario_group = scenarios_group.create_group(str(scenario.scenario_id))
@@ -411,12 +421,15 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf"):
                                                      compression=compression, chunks=True)
                 
                 total_scenarios += 1
+            end = time.perf_counter()
+            elapsed = end - start
             
-            print(f"  Processed {len(scenarios)} scenarios from this file (total: {total_scenarios})")
-            # Free memory after processing each file
-            del scenarios
+            print(f"\tProcessed {len(scenarios)} scenarios from this file in {elapsed:.1f} seconds. (total: {total_scenarios})")
+            del scenarios   #  Free memory after processing each file
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
             
-    print(f"\nCompleted! Total scenarios saved: {total_scenarios}")
+    print(f"Completed in {elapsed_time:.1f} seconds! Total scenarios saved into HDF5 file ({h5_path}): {total_scenarios}.\n")
 
 def test_hdf5_and_lazy_loading(path):
     print("=" * 80)
