@@ -3,7 +3,7 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_workers = 0
 
-debug_mode = True
+debug_mode = False
 
 # data download:
 number_of_training_tfrecord_files = 2
@@ -26,8 +26,9 @@ dropout = 0.3
 
 # training:
 batch_size = 1
-learning_rate = 0.001
+learning_rate = 0.01  # Higher LR now that data is normalized
 epochs = 20
+gradient_clip_value = 5.0  # Less aggressive clipping
 
 # wandb:
 project_name = "waymo-project"
@@ -37,7 +38,7 @@ dataset_name = "waymo open motion dataset v 1_3_0"
 visualize_every_n_epochs = 1
 visualize_first_batch_only = False
 max_nodes_per_graph_viz = 10  # Max nodes to show per graph in visualization
-show_timesteps_viz = sequence_length-1
+show_timesteps_viz = 9  # Show 9 evenly-spaced timesteps instead of all 90
 viz_base_dir = 'visualizations'
 viz_training_dir = 'visualizations/training'
 viz_scenario_dir = 'visualizations/scenario_sequence'

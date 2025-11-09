@@ -5,7 +5,8 @@ from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, num_workers, num_layers, topk, epochs, 
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
-                    visualize_every_n_epochs, visualize_first_batch_only, debug_mode)
+                    visualize_every_n_epochs, visualize_first_batch_only, debug_mode, 
+                    gradient_clip_value)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from torch.nn.utils import clip_grad_norm_
@@ -69,6 +70,9 @@ if __name__ == '__main__':
         model.train()
         total_loss_epoch = 0.0
         steps = 0
+        
+        # Reset GRU hidden states once per epoch, not per batch!
+        model.reset_gru_hidden_states(batch_size=batch_size)
 
         for batch, batch_dict in enumerate(dataloader):
             batched_graph_sequence = batch_dict["batch"]  # list of length T of Batch objects (each is a disconnected graph of B components)
@@ -82,7 +86,7 @@ if __name__ == '__main__':
 
             for t in range(T): batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
-            model.reset_gru_hidden_states(batch_size=B)  # Reset hidden states (GCN weights evolved for one batch) for this NEW batch of B scenarios
+            #model.reset_gru_hidden_states(batch_size=B)  # Reset hidden states (GCN weights evolved for one batch) for this NEW batch of B scenarios
 
             optimizer.zero_grad()
             accumulated_loss = 0.0
@@ -95,15 +99,16 @@ if __name__ == '__main__':
 
                 # Forward: hidden GRU states W evolve for each of B scenarios
                 out_predictions = model(batched_graph.x, batched_graph.edge_index, batched_graph.batch, batch_size=B, batch_num=batch, timestep=t)      # out_predictions: [total_nodes_in_batch, output_dim]
+                # out_predictions holds predicted positional displacements for all nodes in the batched graph, shape [num_nodes_total, 2]
 
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))    # Use batched_graph.y (position displacements/deltas) for loss function
+                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype))    # NOTE: batched_graph.y holds stacked tensors y from all graphs in the batch (in y there are position displacements/deltas)
                 accumulated_loss += loss_t
                 valid_timesteps += 1
 
             if valid_timesteps > 0:     # Compute loss for entire sequence, then backprop once (This prevents gradient accumulation issues with retain_graph=True)
                 avg_loss_batch = accumulated_loss / valid_timesteps
                 avg_loss_batch.backward()
-                clip_grad_norm_(model.parameters(), 1.0)
+                clip_grad_norm_(model.parameters(), gradient_clip_value)    # to mitigate gradient vanishing/exploding risk that comes with long sequences
                 optimizer.step()
 
                 total_loss_epoch += avg_loss_batch.item()  # Convert to scalar only for logging
@@ -126,6 +131,7 @@ if __name__ == '__main__':
     # - implement whole model training pipeline using wandb (see Colab 2), in evaluation make visualizations:
     #       - add for validation (note more timesteps) and testing
     #       - implement and use training.train
+    # - update README.md
 
     # - use different graph creation methods
     # - do initial_feature_vector() method

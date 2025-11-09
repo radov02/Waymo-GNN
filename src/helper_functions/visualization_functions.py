@@ -29,40 +29,74 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
     model.eval()
     batched_graph_sequence = batch_dict["batch"]
     B = batch_dict["B"]  # Number of graphs in batch
-    T = min(show_timesteps, batch_dict["T"])
+    total_T = batch_dict["T"]
     
-    # Reset hidden states
-    model.reset_gru_hidden_states()
+    # Sample timesteps evenly across the sequence
+    if show_timesteps < total_T:
+        timestep_indices = np.linspace(0, total_T - 1, show_timesteps, dtype=int)
+        T = len(timestep_indices)
+    else:
+        timestep_indices = np.arange(total_T)
+        T = total_T
+    
+    # Reset hidden states with correct batch size
+    model.reset_gru_hidden_states(batch_size=B)
     
     # Move to device
     for t in range(len(batch_dict["batch"])):
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
     
+    # Denormalization factor (we normalized by dividing by 100)
+    POSITION_SCALE = 100.0
+    
     # Collect data for each timestep
-    all_actual_pos = []
-    all_pred_pos = []
+    all_curr_pos = []
+    all_actual_next_pos = []
+    all_pred_next_pos = []
     all_batch_indices = []
     
     with torch.no_grad():
-        for t in range(T):
+        # IMPORTANT: Process ALL timesteps to maintain GRU hidden state evolution
+        # but only save data for the sampled timesteps
+        for t in range(total_T):
             graph = batched_graph_sequence[t]
             
-            # Current positions
+            # Current positions (normalized, need to denormalize for visualization)
             if hasattr(graph, 'pos') and graph.pos is not None:
-                curr = graph.pos.cpu()
+                curr_pos_norm = graph.pos.cpu()
             else:
-                curr = graph.x[:, :2].cpu()
-            all_actual_pos.append(curr)
+                curr_pos_norm = graph.x[:, :2].cpu()  # First 2 features are x, y
             
-            # Predictions
-            pred = model(graph.x, graph.edge_index).cpu()
-            all_pred_pos.append(pred)
+            # Denormalize current positions for visualization
+            curr_pos = curr_pos_norm * POSITION_SCALE
             
-            # Batch indices (which graph each node belongs to)
-            all_batch_indices.append(graph.batch.cpu())
+            # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
+            pred_displacement_norm = model(graph.x, graph.edge_index, graph.batch, batch_size=B).cpu()
+            
+            # Denormalize displacement and add to current position to get predicted next position
+            pred_displacement = pred_displacement_norm * POSITION_SCALE
+            pred_next_pos = curr_pos + pred_displacement
+            
+            # Get actual next position from ground truth labels
+            # graph.y contains the normalized displacement to next position
+            if graph.y is not None:
+                actual_displacement_norm = graph.y.cpu()
+                actual_displacement = actual_displacement_norm * POSITION_SCALE
+                actual_next_pos = curr_pos + actual_displacement
+            else:
+                # If no ground truth, use current position as fallback
+                actual_next_pos = curr_pos
+            
+            # Only save data for sampled timesteps
+            if t in timestep_indices:
+                all_curr_pos.append(curr_pos)
+                all_pred_next_pos.append(pred_next_pos)
+                all_actual_next_pos.append(actual_next_pos)
+                all_batch_indices.append(graph.batch.cpu())
     
     # Create figure with B × T grid (rows = graphs, columns = timesteps)
-    fig, axes = plt.subplots(B, T, figsize=(2.5*T, 2.5*B))
+    # Larger figure size for better visibility
+    fig, axes = plt.subplots(B, T, figsize=(5*T, 5*B))
     
     # Make axes always 2D array
     if B == 1 and T == 1:
@@ -92,12 +126,14 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
         for t in range(T):
             batch_mask = all_batch_indices[t] == graph_idx
             if batch_mask.sum() > 0:
-                actual_pos = all_actual_pos[t][batch_mask]
-                pred_pos = all_pred_pos[t][batch_mask]
+                actual_next_pos = all_actual_next_pos[t][batch_mask]
+                pred_next_pos = all_pred_next_pos[t][batch_mask]
+                curr_pos = all_curr_pos[t][batch_mask]
                 graph_data_per_timestep.append({
-                    'actual': actual_pos,
-                    'pred': pred_pos,
-                    'num_nodes': actual_pos.shape[0]
+                    'actual_next': actual_next_pos,
+                    'pred_next': pred_next_pos,
+                    'curr': curr_pos,
+                    'num_nodes': actual_next_pos.shape[0]
                 })
             else:
                 graph_data_per_timestep.append(None)
@@ -124,19 +160,29 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
         all_y_coords = []
         for data in graph_data_per_timestep:
             if data is not None and data['num_nodes'] >= num_nodes:
-                actual_pos = data['actual'][:num_nodes]
-                pred_pos = data['pred'][:num_nodes]
-                all_x_coords.extend(actual_pos[:, 0].tolist())
-                all_y_coords.extend(actual_pos[:, 1].tolist())
-                all_x_coords.extend(pred_pos[:, 0].tolist())
-                all_y_coords.extend(pred_pos[:, 1].tolist())
+                curr_pos = data['curr'][:num_nodes]
+                actual_next_pos = data['actual_next'][:num_nodes]
+                pred_next_pos = data['pred_next'][:num_nodes]
+                all_x_coords.extend(curr_pos[:, 0].tolist())
+                all_y_coords.extend(curr_pos[:, 1].tolist())
+                all_x_coords.extend(actual_next_pos[:, 0].tolist())
+                all_y_coords.extend(actual_next_pos[:, 1].tolist())
+                all_x_coords.extend(pred_next_pos[:, 0].tolist())
+                all_y_coords.extend(pred_next_pos[:, 1].tolist())
         
-        # Standardized axis limits with padding
+        # Standardized axis limits with padding - zoom in tighter
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
-            x_padding = (x_max - x_min) * 0.1 or 10  # 10% padding or 10m minimum
-            y_padding = (y_max - y_min) * 0.1 or 10
+            
+            # Calculate range and use smaller padding for tighter zoom
+            x_range = x_max - x_min
+            y_range = y_max - y_min
+            
+            # Use 20% padding or 5m minimum (tighter than before)
+            x_padding = max(x_range * 0.2, 5.0)
+            y_padding = max(y_range * 0.2, 5.0)
+            
             x_lim = (x_min - x_padding, x_max + x_padding)
             y_lim = (y_min - y_padding, y_max + y_padding)
         else:
@@ -147,6 +193,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
             ax = axes[graph_idx, t]
             
             # Plot map features (only once per subplot)
+            # Map features are in raw world coordinates (meters), not normalized
             if scenario is not None:
                 for feature in scenario.map_features:
                     feature_type = feature.WhichOneof('feature_data')
@@ -156,19 +203,26 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                         x_coords = [point.x for point in feature.lane.polyline]
                         y_coords = [point.y for point in feature.lane.polyline]
                         color = lane_type_colors.get(lane_type, '#95a5a6')
-                        ax.plot(x_coords, y_coords, color=color, linewidth=0.5, alpha=0.2, zorder=1)
+                        ax.plot(x_coords, y_coords, color=color, linewidth=1.0, alpha=0.3, zorder=1)
                     
                     elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                         x_coords = [point.x for point in feature.road_edge.polyline]
                         y_coords = [point.y for point in feature.road_edge.polyline]
-                        ax.plot(x_coords, y_coords, color='black', linewidth=0.5, alpha=0.2, zorder=1)
+                        ax.plot(x_coords, y_coords, color='#2c3e50', linewidth=1.5, alpha=0.4, zorder=1)
+                    
+                    elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
+                        x_coords = [point.x for point in feature.road_line.polyline]
+                        y_coords = [point.y for point in feature.road_line.polyline]
+                        # Use dashed line for road markings
+                        ax.plot(x_coords, y_coords, color='white', linewidth=0.8, 
+                               linestyle='--', alpha=0.5, zorder=1)
                     
                     elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
                         x_coords = [point.x for point in feature.crosswalk.polygon]
                         y_coords = [point.y for point in feature.crosswalk.polygon]
                         x_coords.append(x_coords[0])
                         y_coords.append(y_coords[0])
-                        ax.fill(x_coords, y_coords, color='yellow', alpha=0.15, zorder=1)
+                        ax.fill(x_coords, y_coords, color='yellow', alpha=0.3, zorder=1)
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]
@@ -178,41 +232,74 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                 continue
             
             # Truncate to consistent node count
-            actual_pos = data['actual'][:num_nodes]
-            pred_pos = data['pred'][:num_nodes]
+            curr_pos = data['curr'][:num_nodes]
+            actual_next_pos = data['actual_next'][:num_nodes]
+            pred_next_pos = data['pred_next'][:num_nodes]
+            
+            # Draw trajectories first (so they're behind the points)
+            if t > 0:
+                prev_data = graph_data_per_timestep[t-1]
+                if prev_data is not None and prev_data['num_nodes'] >= num_nodes:
+                    prev_actual = prev_data['actual_next'][:num_nodes]
+                    prev_pred = prev_data['pred_next'][:num_nodes]
+                    
+                    # Draw trajectory lines connecting previous to current
+                    for idx, node_idx in enumerate(node_indices):
+                        color = node_colors[idx]
+                        
+                        # Actual trajectory (solid line)
+                        ax.plot([prev_actual[node_idx, 0], curr_pos[node_idx, 0]], 
+                               [prev_actual[node_idx, 1], curr_pos[node_idx, 1]], 
+                               color=color, linewidth=1.5, alpha=0.4, linestyle='-', zorder=1,
+                               label='Actual Trajectory' if idx == 0 and t == 1 else None)
+                        
+                        # Predicted trajectory (dashed line)
+                        ax.plot([prev_pred[node_idx, 0], curr_pos[node_idx, 0]], 
+                               [prev_pred[node_idx, 1], curr_pos[node_idx, 1]], 
+                               color=color, linewidth=1.5, alpha=0.4, linestyle=':', zorder=1,
+                               label='Predicted Trajectory' if idx == 0 and t == 1 else None)
             
             # Plot each selected node
             for idx, node_idx in enumerate(node_indices):
                 color = node_colors[idx]
                 
-                actual_xy = actual_pos[node_idx].numpy()
-                pred_xy = pred_pos[node_idx].numpy()
+                curr_xy = curr_pos[node_idx].numpy()
+                actual_next_xy = actual_next_pos[node_idx].numpy()
+                pred_next_xy = pred_next_pos[node_idx].numpy()
                 
-                # Plot actual position (filled circle)
-                ax.scatter(actual_xy[0], actual_xy[1], color=color, s=30, 
-                          marker='o', edgecolors='black', linewidths=0.8, 
-                          alpha=0.9, zorder=5, label='Actual' if idx == 0 else None)
+                # Plot current position (medium gray dot)
+                ax.scatter(curr_xy[0], curr_xy[1], color='gray', s=80, 
+                          marker='o', alpha=0.6, zorder=3, label='Current' if idx == 0 else None)
                 
-                # Plot predicted position (hollow circle)
-                ax.scatter(pred_xy[0], pred_xy[1], facecolors='none', edgecolors=color, s=30, 
-                          marker='o', linewidths=1.5, alpha=0.8, zorder=4,
-                          label='Predicted' if idx == 0 else None)
+                # Plot actual next position (large filled circle)
+                ax.scatter(actual_next_xy[0], actual_next_xy[1], color=color, s=120, 
+                          marker='o', edgecolors='black', linewidths=1.5, 
+                          alpha=0.9, zorder=5, label='Actual Next' if idx == 0 else None)
                 
-                # Draw error line
-                ax.plot([actual_xy[0], pred_xy[0]], [actual_xy[1], pred_xy[1]], 
-                       color='red', linewidth=0.8, alpha=0.4, zorder=3)
+                # Plot predicted next position (large hollow circle)
+                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, s=120, 
+                          marker='o', linewidths=2.0, alpha=0.9, zorder=4,
+                          label='Predicted Next' if idx == 0 else None)
                 
-                # Calculate error
-                error = np.linalg.norm(actual_xy - pred_xy)
+                # Draw thicker arrow from current to actual next (ground truth trajectory)
+                ax.annotate('', xy=actual_next_xy, xytext=curr_xy,
+                           arrowprops=dict(arrowstyle='->', color=color, lw=1.5, alpha=0.6), zorder=2)
+                
+                # Draw thicker error line between actual and predicted next positions
+                ax.plot([actual_next_xy[0], pred_next_xy[0]], [actual_next_xy[1], pred_next_xy[1]], 
+                       color='red', linewidth=2.0, alpha=0.7, zorder=3)
+                
+                # Calculate error (distance between actual and predicted NEXT positions)
+                error = np.linalg.norm(actual_next_xy - pred_next_xy)
                 total_error += error
                 error_counts += 1
             
             # Calculate average error for this cell
             cell_errors = []
             for idx in node_indices:
-                actual_xy = actual_pos[idx].numpy()
-                pred_xy = pred_pos[idx].numpy()
-                cell_errors.append(np.linalg.norm(actual_xy - pred_xy))
+                actual_next_xy = actual_next_pos[idx].numpy()
+                pred_next_xy = pred_next_pos[idx].numpy()
+                cell_errors.append(np.linalg.norm(actual_next_xy - pred_next_xy))
             cell_avg_error = np.mean(cell_errors)
             
             # Formatting
@@ -220,35 +307,43 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
             if x_lim and y_lim:
                 ax.set_xlim(x_lim)
                 ax.set_ylim(y_lim)
-            ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            ax.tick_params(labelsize=10)
             
-            # Add title with timestep and error
-            ax.set_title(f't={t} | Err:{cell_avg_error:.1f}m', fontsize=8, fontweight='bold')
+            # Add axis labels
+            ax.set_xlabel('X position (m)', fontsize=10)
+            ax.set_ylabel('Y position (m)', fontsize=10)
+            
+            # Add title with actual timestep number and error (larger font)
+            actual_t = timestep_indices[t]
+            ax.set_title(f't={actual_t} | Err:{cell_avg_error:.1f}m', fontsize=11, fontweight='bold')
             
             # Add row and column labels
             if t == 0:
-                ax.set_ylabel(f'Graph {graph_idx+1}', fontsize=9, fontweight='bold')
+                ax.set_ylabel(f'Graph {graph_idx+1}\n\nY position (m)', fontsize=12, fontweight='bold')
             if graph_idx == 0:
-                ax.text(0.5, 1.25, f'Timestep {t}', transform=ax.transAxes,
-                       ha='center', fontsize=9, fontweight='bold')
+                ax.text(0.5, 1.12, f'Timestep {actual_t}', transform=ax.transAxes,
+                       ha='center', fontsize=12, fontweight='bold')
     
     # Overall average error
     avg_error = total_error / max(1, error_counts)
     
-    # Add overall title
+    # Add overall title with more spacing
     map_note = ' (with map)' if scenario is not None else ''
-    fig.suptitle(f'Epoch {epoch} - Training Progress{map_note}\n'
-                f'Rows = Graphs (1-{B}) | Columns = Timesteps (0-{T-1})\n'
-                f'● = Actual | ○ = Predicted | Red line = Error | Overall Avg Error: {avg_error:.2f}m', 
-                fontsize=11, fontweight='bold', y=0.98)
+    title_text = (f'Epoch {epoch} - Training Progress{map_note}\n'
+                  f'Showing {T} of {total_T} timesteps (evenly sampled)\n'
+                  f'Gray ● = Current | Colored ● = Actual Next | Colored ○ = Predicted Next | Red line = Error\n'
+                  f'Overall Avg Prediction Error: {avg_error:.2f}m')
     
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.suptitle(title_text, fontsize=12, fontweight='bold', y=0.99)
+    
+    # Adjust layout to prevent title overlap
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
     
     # Save
     filename = f'epoch_{epoch:03d}_progress.png'
     filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=120, bbox_inches='tight')
+    plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     
     print(f"  Saved training progress visualization: {filepath}")

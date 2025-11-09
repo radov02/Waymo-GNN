@@ -252,16 +252,41 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
     
     return edge_index
 
-def initial_feature_vector(agent, timestep):
-    """returns **list** of features for agent at given timestep"""
+def initial_feature_vector(agent, timestep, normalize=True):
+    """returns **list** of features for agent at given timestep
+    
+    Args:
+        agent: Agent track from scenario
+        timestep: Current timestep index
+        normalize: If True, normalize position and velocity to reasonable scales
+        
+    Returns:
+        List of 9 features: [x, y, vx, vy, valid, vehicle, pedestrian, cyclist, other]
+    """
     # TODO: IMPLEMENT TECHNIQUES FROM FEATURE AUGMENTATION LECTURE (lec 7)
     # consider adding: Speed: sqrt(vx² + vy²) Heading: atan2(vy, vx) Acceleration: If you have velocity from previous timestep Normalized coordinates: Relative to ego vehicle or scene center Temporal encoding: Timestep information
 
     if timestep >= len(agent.states):
         timestep = len(agent.states) - 1
 
+    state = agent.states[timestep]
+    
+    # Normalize positions and velocities to reasonable scales
+    # Waymo positions are in meters (can be thousands), velocities in m/s
+    if normalize:
+        # Divide by typical scene size (100m) and velocity scale (10 m/s ~ 36 km/h)
+        x_norm = state.center_x / 100.0
+        y_norm = state.center_y / 100.0
+        vx_norm = state.velocity_x / 10.0
+        vy_norm = state.velocity_y / 10.0
+    else:
+        x_norm = state.center_x
+        y_norm = state.center_y
+        vx_norm = state.velocity_x
+        vy_norm = state.velocity_y
+    
     object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    properties = [agent.states[timestep].center_x, agent.states[timestep].center_y, agent.states[timestep].velocity_x, agent.states[timestep].velocity_y, agent.states[timestep].valid]
+    properties = [x_norm, y_norm, vx_norm, vy_norm, float(state.valid)]
     type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
                    1 if object_types[agent.object_type] == 'Pedestrian' else 0,
                    1 if object_types[agent.object_type] == 'Cyclist' else 0,
@@ -285,8 +310,18 @@ def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_m
         agent_ids.append(agent.id)
         valid_mask.append(1 if valid else 0)
 
-def get_future_2D_trajectory_labels(scenario, agent_ids, timestep):
-    """outputs tensor of shape [N, 2], for each agent we have displacements stored"""
+def get_future_2D_trajectory_labels(scenario, agent_ids, timestep, normalize=True):
+    """outputs tensor of shape [N, 2], for each agent we have displacements stored
+    
+    Args:
+        scenario: Waymo scenario
+        agent_ids: List of agent IDs
+        timestep: Current timestep
+        normalize: If True, normalize displacements by dividing by 100.0 (typical scene scale)
+        
+    Returns:
+        Tensor of shape [N, 2] with position displacements
+    """
     id_to_agent = {t.id: t for t in scenario.tracks}
     future_2d_position_displacements = []
 
@@ -305,8 +340,15 @@ def get_future_2D_trajectory_labels(scenario, agent_ids, timestep):
             next_timestep_positions = agent.states[timestep+1]
 
             if next_timestep_positions.valid:
-                displacement = [next_timestep_positions.center_x - current_timestep_positions.center_x, 
-                                next_timestep_positions.center_y - current_timestep_positions.center_y]
+                dx = next_timestep_positions.center_x - current_timestep_positions.center_x
+                dy = next_timestep_positions.center_y - current_timestep_positions.center_y
+                
+                # Normalize displacements to match input feature scale
+                if normalize:
+                    dx /= 100.0
+                    dy /= 100.0
+                
+                displacement = [dx, dy]
                 future_2d_position_displacements.append(displacement)
             else:
                 future_2d_position_displacements.append([0, 0])     # use current position (agent did not move)

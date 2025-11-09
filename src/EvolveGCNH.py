@@ -38,10 +38,18 @@ class EvolveGCNH(nn.Module):
         # ATTENTION parameter for summarization:
         self.p = nn.ParameterList()     # Learnable parameter vector p (attention) for node summarization (one per layer): which nodes are currently important in the graph
         for i in range(num_layers):
-            self.p.append(nn.Parameter(torch.randn(hidden_dim if i > 0 else input_dim)))
+            param = nn.Parameter(torch.randn(hidden_dim if i > 0 else input_dim))
+            # Better initialization for attention parameters
+            nn.init.normal_(param, mean=0, std=0.1)
+            self.p.append(param)
+        
+        # Layer normalization for stabilization
+        self.layer_norms = nn.ModuleList()
+        for i in range(num_layers - 1):  # Don't normalize final output
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
         
         # GRU hidden states:
-        self.W = None   # holds GRU hidden states for each sequence in batch, shape: [num_layers, B, num_params_per_layer]
+        self.gru_h = None   # holds GRU hidden states for each sequence in batch, shape: list of [B, num_params_per_layer] per layer
     
     def reset_parameters(self):
         """Reset all learnable parameters."""
@@ -55,12 +63,12 @@ class EvolveGCNH(nn.Module):
         if batch_size is None:
             self.gru_h = None
         else:
-            # Initialize hidden states for B scenarios
+            # Initialize hidden states for B scenarios with actual GCN weights (more stable training, faster convergence)
             self.gru_h = []
             for gcn in self.gcn_layers:
                 params_vector = self._get_params_vector(gcn)
                 # Shape: [B, num_params] - one hidden state per scenario
-                layer_hidden = params_vector.detach().unsqueeze(0).repeat(batch_size, 1)
+                layer_hidden = params_vector.detach().unsqueeze(0).repeat(batch_size, 1)    # .detach() is important to avoid backpropagating through the initial parameters
                 self.gru_h.append(layer_hidden)
     
     def _get_params_vector(self, gcn_layer):
@@ -73,9 +81,9 @@ class EvolveGCNH(nn.Module):
     def _set_GCN_params_from_vector(self, gcn_layer, new_parameters_vector):
         """Set GCN layer parameters from a flattened vector."""
         offset = 0
-        for p in gcn_layer.parameters():
-            numel = p.numel()
-            p.data = new_parameters_vector[offset:offset + numel].view(p.shape)
+        for param in gcn_layer.parameters():
+            numel = param.numel()
+            param.data = new_parameters_vector[offset:offset + numel].view(param.shape)
             offset += numel
     
     def _summarize_node_embeddings(self, node_embeddings, topk, p):
@@ -140,8 +148,8 @@ class EvolveGCNH(nn.Module):
         return torch.stack(summaries)  # [B, topk * feature_dim]
 
     def forward(self, x, edge_index, batch=None, batch_size=None, batch_num=-1, timestep=-1):
-        """Takes node feature matrix x [num_nodes, input_dim/feature_dim], edge_index [2, num_edges] and batch assignment vector [num_nodes] indicating which graph each node belongs to. 
-        Returns node embeddings [num_nodes, output_dim], in our case [num_nodes, 2], predicted position displacements (in x and y directions) for each node."""
+        """Takes node feature matrix x [num_nodes_total, input_dim/feature_dim], edge_index [2, num_edges_total] and batch assignment vector [num_nodes_total] indicating which graph each node belongs to. 
+        Returns node embeddings [num_nodes_total, output_dim], in our case [num_nodes_total, 2], predicted position displacements (in x and y directions) for each node."""
 
         device = x.device
 
@@ -151,7 +159,8 @@ class EvolveGCNH(nn.Module):
         if batch_size is None:
             batch_size = batch.max().item() + 1 if batch.numel() > 0 else 1
 
-        if self.gru_h is None:
+        # Check if we need to reinitialize hidden states due to batch size change
+        if self.gru_h is None or self.gru_h[0].size(0) != batch_size:
             self.reset_gru_hidden_states(batch_size)
         
         if self.gru_h[0].device != device:
@@ -172,16 +181,18 @@ class EvolveGCNH(nn.Module):
             
             # get parameters that were evolved by GRU (across scenarios for this timestep) and average them (or use another aggregation strategy)
             # set these parameters of GRU as GCN parameters
-            evolved_params = self.gru_h[layer_idx].mean(dim=0)
+            evolved_params = self.gru_h[layer_idx].mean(dim=0)  # take mean across all batches for each trainable parameter
             self._set_GCN_params_from_vector(gcn, evolved_params)
 
             h = gcn(h, edge_index)     # put node embeddings and edge_index into GCNConv layer to perform GCN convolutions
 
             if layer_idx < self.num_layers - 1:
+                # Apply layer normalization before activation for stability
+                h = self.layer_norms[layer_idx](h)
                 h = torchFunctional.relu(h)
                 h = torchFunctional.dropout(h, p=self.dropout, training=self.training)
         
-        return h  # Shape: [num_nodes, output_dim]
+        return h  # Shape: [num_nodes_total, output_dim]
 
 
 
