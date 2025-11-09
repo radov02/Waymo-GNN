@@ -1,6 +1,6 @@
 # Prediction of agent trajectories on Waymo autonomous driving dataset using GNNs
 
-Project for Stanford CS224W 2025 class on FRI.
+Project for Stanford CS224W 2025 class at FRI.
 
 ### Description:
 
