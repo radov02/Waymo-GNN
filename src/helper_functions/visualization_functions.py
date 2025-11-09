@@ -5,7 +5,7 @@ import torch
 import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
-from config import sequence_length, radius, graph_creation_method, viz_scenario_dir, viz_training_dir
+from config import sequence_length, radius, graph_creation_method, viz_scenario_dir, viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, show_timesteps_viz
 import matplotlib.pyplot as plt
 
 def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_dir=viz_training_dir,
@@ -230,7 +230,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
             if t == 0:
                 ax.set_ylabel(f'Graph {graph_idx+1}', fontsize=9, fontweight='bold')
             if graph_idx == 0:
-                ax.text(0.5, 1.15, f'Timestep {t}', transform=ax.transAxes,
+                ax.text(0.5, 1.25, f'Timestep {t}', transform=ax.transAxes,
                        ha='center', fontsize=9, fontweight='bold')
     
     # Overall average error
@@ -432,3 +432,25 @@ def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num
         import traceback
         traceback.print_exc()
     print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")
+
+def visualize_epoch(epoch, viz_batch, model, viz_scenario, device, wandb):
+    should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0
+        
+    if should_visualize and viz_batch is not None:
+        print(f"  Generating visualization of first batch for epoch {epoch+1}...")
+        try:
+            filepath, avg_error = visualize_training_progress(
+                model, viz_batch, epoch=epoch+1,
+                scenario=viz_scenario,  # Pass scenario for map features
+                save_dir=viz_training_dir,
+                device=device,
+                max_nodes_per_graph=max_nodes_per_graph_viz,
+                show_timesteps=show_timesteps_viz
+            )
+            # Log visualization error to wandb
+            wandb.log({"epoch": epoch, "viz_avg_error": avg_error})
+        except Exception as e:
+            print(f"  Warning: Visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+        print("="*30)

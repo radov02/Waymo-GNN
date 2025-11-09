@@ -3,6 +3,8 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_workers = 0
 
+debug_mode = True
+
 # data download:
 number_of_training_tfrecord_files = 2
 number_of_validation_tfrecord_files = 10
