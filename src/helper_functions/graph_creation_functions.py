@@ -258,35 +258,43 @@ def initial_feature_vector(agent, timestep, normalize=True):
     Args:
         agent: Agent track from scenario
         timestep: Current timestep index
-        normalize: If True, normalize position and velocity to reasonable scales
+        normalize: If True, normalize velocity to reasonable scales
         
     Returns:
-        List of 9 features: [x, y, vx, vy, valid, vehicle, pedestrian, cyclist, other]
+        List of 7 features: [vx, vy, speed, heading, valid, vehicle, pedestrian, cyclist, other]
+        Note: Position (x, y) is NOT included here as it's stored separately in data.pos
     """
     # TODO: IMPLEMENT TECHNIQUES FROM FEATURE AUGMENTATION LECTURE (lec 7)
-    # consider adding: Speed: sqrt(vx² + vy²) Heading: atan2(vy, vx) Acceleration: If you have velocity from previous timestep Normalized coordinates: Relative to ego vehicle or scene center Temporal encoding: Timestep information
+    # consider adding: Acceleration: If you have velocity from previous timestep Normalized coordinates: Relative to ego vehicle or scene center Temporal encoding: Timestep information
 
     if timestep >= len(agent.states):
         timestep = len(agent.states) - 1
 
     state = agent.states[timestep]
     
-    # Normalize positions and velocities to reasonable scales
-    # Waymo positions are in meters (can be thousands), velocities in m/s
+    # Get velocity components
+    vx = state.velocity_x
+    vy = state.velocity_y
+    
+    # Normalize velocities to reasonable scales
     if normalize:
-        # Divide by typical scene size (100m) and velocity scale (10 m/s ~ 36 km/h)
-        x_norm = state.center_x / 100.0
-        y_norm = state.center_y / 100.0
-        vx_norm = state.velocity_x / 10.0
-        vy_norm = state.velocity_y / 10.0
+        # Divide by velocity scale (10 m/s ~ 36 km/h)
+        vx_norm = vx / 10.0
+        vy_norm = vy / 10.0
     else:
-        x_norm = state.center_x
-        y_norm = state.center_y
-        vx_norm = state.velocity_x
-        vy_norm = state.velocity_y
+        vx_norm = vx
+        vy_norm = vy
+    
+    # Calculate speed (magnitude of velocity)
+    import math
+    speed = math.sqrt(vx**2 + vy**2)
+    speed_norm = speed / 10.0 if normalize else speed
+    
+    # Calculate heading (direction of movement)
+    heading = math.atan2(vy, vx)  # Already in radians, in range [-pi, pi]
     
     object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    properties = [x_norm, y_norm, vx_norm, vy_norm, float(state.valid)]
+    properties = [vx_norm, vy_norm, speed_norm, heading, float(state.valid)]
     type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
                    1 if object_types[agent.object_type] == 'Pedestrian' else 0,
                    1 if object_types[agent.object_type] == 'Cyclist' else 0,
@@ -384,14 +392,16 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
 
     y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
-    data = Data(x=torch.tensor(x, dtype=torch.float32), 
-                edge_index=edge_index, 
-                pos=positions_2D_tensor, 
-                y=y)
-    
-    # Store agent_ids for visualization and debugging
-    data.agent_ids = agent_ids
-    data.valid_mask = torch.tensor(valid_mask, dtype=torch.bool)
+    # Create Data object with all attributes
+    data = Data(
+        x=torch.tensor(x, dtype=torch.float32), 
+        edge_index=edge_index, 
+        pos=positions_2D_tensor, 
+        y=y,
+        scenario_id=scenario.scenario_id,
+        agent_ids=agent_ids,
+        valid_mask=torch.tensor(valid_mask, dtype=torch.bool)
+    )
     
     return data
 
@@ -445,11 +455,15 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                         edge_index = graph.edge_index.cpu().numpy()
                         edge_weight = getattr(graph, "edge_weight", None)
                         y = getattr(graph, "y", None)
+                        pos = getattr(graph, "pos", None)
+                        scenario_id = graph.scenario_id
                     else:
                         x = graph["x"].cpu().numpy()
                         edge_index = graph["edge_index"].cpu().numpy()
                         edge_weight = graph.get("edge_weight")
                         y = graph.get("y")
+                        pos = graph.get("pos")
+                        scenario_id = graph.get("scenario_id")
                     
                     # Save datasets
                     snapshot_group.create_dataset("x", data=x, compression=compression, chunks=True)
@@ -461,6 +475,18 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                     if y is not None:
                         snapshot_group.create_dataset("y", data=y.cpu().numpy(), 
                                                      compression=compression, chunks=True)
+                    
+                    # Save positions (normalized, will be denormalized in visualization)
+                    if pos is not None:
+                        snapshot_group.create_dataset("pos", data=pos.cpu().numpy(),
+                                                     compression=compression, chunks=True)
+                    else:
+                        if timestep == 0 and total_scenarios == 0:
+                            print("  Warning: pos is None for first graph - this will cause visualization issues!")
+                    
+                    # Save scenario_id as string (no compression for scalar strings)
+                    if scenario_id is not None:
+                        snapshot_group.create_dataset("scenario_id", data=np.string_(scenario_id))
                 
                 total_scenarios += 1
             end = time.perf_counter()
@@ -617,7 +643,7 @@ def collate_graph_sequences_to_batch(scenario_list):
     """turns scenario list like [[scenario 1 T graphs], [scenario 2 T graphs], ...] into dict containing list 
     [[timestep 1 - B batched graphs], [timestep 2 - B batched graphs], ...] of T Batch objects and batch size (number of graph sequences in the batch):
     {
-        'batched_ts': [...],
+        'batch': [...],
         'B': num_of_sequences,
         'T': sequence_length
     }"""
@@ -625,10 +651,32 @@ def collate_graph_sequences_to_batch(scenario_list):
     T = len(scenario_list[0])   # sequence length
     transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
 
+    # Extract scenario_ids from the first timestep (all timesteps have the same scenario_id per sequence)
+    scenario_ids = []
+    for sequence in scenario_list:
+        if sequence and len(sequence) > 0 and hasattr(sequence[0], 'scenario_id'):
+            sid = sequence[0].scenario_id
+            scenario_ids.append(sid)
+        else:
+            scenario_ids.append(None)
+
     batch = []
     for timestep in range(T):
         graphs_at_timestep = list(transposed[timestep])
+        
+        # Debug: Check if pos exists in the first graph
+        #if timestep == 0 and len(graphs_at_timestep) > 0:
+            #first_graph = graphs_at_timestep[0]
+            #print(f"  DEBUG collate: First graph has pos: {hasattr(first_graph, 'pos')}, pos is None: {first_graph.pos is None if hasattr(first_graph, 'pos') else 'no attr'}")
+            #if hasattr(first_graph, 'pos') and first_graph.pos is not None:
+                #print(f"  DEBUG collate: pos shape: {first_graph.pos.shape}, pos dtype: {first_graph.pos.dtype}")
+        
         batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
+        
+        # Debug: Check if pos exists after batching
+        #if timestep == 0:
+            #print(f"  DEBUG collate: After batching - hasattr pos: {hasattr(batched_graphs_at_timestep, 'pos')}, pos is None: {batched_graphs_at_timestep.pos is None if hasattr(batched_graphs_at_timestep, 'pos') else 'no attr'}")
+        
         batch.append(batched_graphs_at_timestep)
     
-    return {'batch': batch, 'B': B, 'T': T}
+    return {'batch': batch, 'B': B, 'T': T, 'scenario_ids': scenario_ids}

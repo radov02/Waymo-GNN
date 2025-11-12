@@ -8,7 +8,52 @@ from helper_functions.graph_creation_functions import timestep_to_pyg_data
 from config import sequence_length, radius, graph_creation_method, viz_scenario_dir, viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, show_timesteps_viz
 import matplotlib.pyplot as plt
 
-def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_dir=viz_training_dir,
+# Cache for loaded scenarios to avoid reloading the same scenario multiple times
+_scenario_cache = {}
+
+def load_scenario_by_id(scenario_id, scenario_dir="./data/scenario/training"):
+    """
+    Load a Waymo scenario from tfrecord files by scenario_id.
+    Uses caching to avoid reloading the same scenario multiple times.
+    
+    Args:
+        scenario_id: The scenario ID to load
+        scenario_dir: Directory containing tfrecord files
+        
+    Returns:
+        Scenario object or None if not found
+    """
+    # Check cache first
+    if scenario_id in _scenario_cache:
+        return _scenario_cache[scenario_id]
+    
+    try:
+        import tensorflow as tf
+        from waymo_open_dataset.protos import scenario_pb2
+        from pathlib import Path
+        
+        scenario_path = Path(scenario_dir)
+        tfrecord_files = sorted(scenario_path.glob("*.tfrecord"))
+        
+        for tfrecord_file in tfrecord_files:
+            scenario_dataset = tf.data.TFRecordDataset(str(tfrecord_file), compression_type='')
+            
+            for raw_record in scenario_dataset:
+                scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
+                if scenario.scenario_id == scenario_id:
+                    # Cache and return
+                    _scenario_cache[scenario_id] = scenario
+                    print(f"  Loaded scenario {scenario_id} with {len(scenario.map_features)} map features")
+                    return scenario
+        
+        print(f"  Warning: Scenario {scenario_id} not found in {scenario_dir}")
+        return None
+        
+    except Exception as e:
+        print(f"  Warning: Could not load scenario {scenario_id}: {e}")
+        return None
+
+def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save_dir=viz_training_dir,
                                 device='cpu', max_nodes_per_graph=10, show_timesteps=8):
     """
     Visualization showing actual vs predicted trajectories with map features.
@@ -18,13 +63,30 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
         model: The trained model
         batch_dict: Batch dictionary with temporal graph sequence
         epoch: Current epoch number
-        scenario: Optional Waymo scenario object for map features
+        scenario_id: Scenario ID to load map features from (if None, will try to get from batch data)
         save_dir: Directory to save visualizations
         device: Device for inference
         max_nodes_per_graph: Maximum nodes to show per individual graph
         show_timesteps: Number of timesteps to visualize
     """
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Load scenario for map features if scenario_id provided or available in batch
+    scenario = None
+    if scenario_id is None:
+        # Get scenario_id from batch_dict (added by collate function)
+        if 'scenario_ids' in batch_dict and batch_dict['scenario_ids']:
+            scenario_ids_list = batch_dict['scenario_ids']
+            # Get first valid scenario_id
+            scenario_id = next((sid for sid in scenario_ids_list if sid is not None), None)
+            if scenario_id:
+                print(f"  Found scenario_id from batch_dict: {scenario_id}")
+    
+    if scenario_id is not None:
+        print(f"  Loading scenario {scenario_id} for map visualization...")
+        scenario = load_scenario_by_id(scenario_id)
+    else:
+        print(f"  Warning: No scenario_id found, visualization will not include map features")
     
     model.eval()
     batched_graph_sequence = batch_dict["batch"]
@@ -61,14 +123,20 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
         for t in range(total_T):
             graph = batched_graph_sequence[t]
             
-            # Current positions (normalized, need to denormalize for visualization)
-            if hasattr(graph, 'pos') and graph.pos is not None:
-                curr_pos_norm = graph.pos.cpu()
-            else:
-                curr_pos_norm = graph.x[:, :2].cpu()  # First 2 features are x, y
+            # Debug: Check if pos exists in the batched graph
+            if t == 0:
+                print(f"  DEBUG: First graph - hasattr(graph, 'pos'): {hasattr(graph, 'pos')}, graph.pos is not None: {hasattr(graph, 'pos') and graph.pos is not None}")
+                if hasattr(graph, 'pos') and graph.pos is not None:
+                    print(f"  DEBUG: graph.pos.shape: {graph.pos.shape}")
             
-            # Denormalize current positions for visualization
-            curr_pos = curr_pos_norm * POSITION_SCALE
+            # Current positions
+            # Note: graph.pos contains RAW world coordinates (meters), not normalized
+            if hasattr(graph, 'pos') and graph.pos is not None:
+                curr_pos = graph.pos.cpu()  # Already in meters, no need to denormalize
+            else:
+                # Fallback: if pos not available, positions are not in the feature vector anymore
+                # This shouldn't happen with properly saved HDF5 files
+                raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
             # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
             pred_displacement_norm = model(graph.x, graph.edge_index, graph.batch, batch_size=B).cpu()
@@ -110,13 +178,8 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
     total_error = 0
     error_counts = 0
     
-    # Lane type colors for map features
-    lane_type_colors = {
-        0: '#95a5a6',  # Gray for undefined
-        1: '#e74c3c',  # Red for freeway
-        2: '#3498db',  # Blue for surface street
-        3: '#2ecc71'   # Green for bike lane
-    }
+    # Gray colors for all map features
+    map_feature_gray = '#808080'  # Medium gray for all map features
     
     # Process each graph (row) and timestep (column)
     for graph_idx in range(B):
@@ -146,18 +209,57 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
         # Use minimum node count across all timesteps
         num_nodes = min(valid_counts)
         
-        # Select subset of nodes to visualize
+        # Find SDC index by checking agent_ids in the first valid timestep
+        sdc_idx = None
+        first_valid_graph = batched_graph_sequence[0]
+        if hasattr(first_valid_graph, 'agent_ids'):
+            # Get SDC id from scenario
+            if scenario is not None:
+                sdc_track = scenario.tracks[scenario.sdc_track_index]
+                sdc_id = sdc_track.id
+                
+                # Find which nodes belong to current graph
+                batch_mask = first_valid_graph.batch == graph_idx
+                graph_agent_ids = [first_valid_graph.agent_ids[i] for i in range(len(first_valid_graph.agent_ids)) if batch_mask[i]]
+                
+                if sdc_id in graph_agent_ids:
+                    sdc_idx = graph_agent_ids.index(sdc_id)
+        
+        # Select subset of nodes to visualize, ensuring SDC is included
         if num_nodes > max_nodes_per_graph:
-            node_indices = np.linspace(0, num_nodes - 1, max_nodes_per_graph, dtype=int)
+            if sdc_idx is not None and sdc_idx < num_nodes:
+                # Include SDC first, then evenly sample others
+                other_indices = [i for i in range(num_nodes) if i != sdc_idx]
+                num_others = max_nodes_per_graph - 1
+                if len(other_indices) > num_others:
+                    other_selected = np.linspace(0, len(other_indices) - 1, num_others, dtype=int)
+                    other_indices = [other_indices[i] for i in other_selected]
+                node_indices = np.array([sdc_idx] + other_indices)
+            else:
+                node_indices = np.linspace(0, num_nodes - 1, max_nodes_per_graph, dtype=int)
         else:
             node_indices = np.arange(num_nodes)
+            # Ensure SDC is in the list
+            if sdc_idx is not None and sdc_idx not in node_indices and sdc_idx < num_nodes:
+                node_indices = np.append([sdc_idx], node_indices[:-1])
         
-        # Assign consistent colors to each node
-        node_colors = plt.cm.tab20(np.linspace(0, 1, len(node_indices)))
+        # Assign consistent colors to each node, with green for SDC
+        node_colors = []
+        for idx, node_idx in enumerate(node_indices):
+            if node_idx == sdc_idx:
+                node_colors.append('#27ae60')  # Green for SDC
+            else:
+                # Use tab20 colormap for other agents
+                color_idx = idx / max(len(node_indices) - 1, 1)
+                node_colors.append(plt.cm.tab20(color_idx))
+        node_colors = np.array(node_colors)
         
         # Calculate axis limits for this graph sequence (entire row)
+        # Include map features if available for proper zoom
         all_x_coords = []
         all_y_coords = []
+        
+        # Add agent positions
         for data in graph_data_per_timestep:
             if data is not None and data['num_nodes'] >= num_nodes:
                 curr_pos = data['curr'][:num_nodes]
@@ -170,18 +272,31 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                 all_x_coords.extend(pred_next_pos[:, 0].tolist())
                 all_y_coords.extend(pred_next_pos[:, 1].tolist())
         
-        # Standardized axis limits with padding - zoom in tighter
+        # Add map feature bounds if scenario available
+        if scenario is not None:
+            for feature in scenario.map_features:
+                feature_type = feature.WhichOneof('feature_data')
+                
+                if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
+                    all_x_coords.extend([point.x for point in feature.lane.polyline])
+                    all_y_coords.extend([point.y for point in feature.lane.polyline])
+                
+                elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
+                    all_x_coords.extend([point.x for point in feature.road_edge.polyline])
+                    all_y_coords.extend([point.y for point in feature.road_edge.polyline])
+        
+        # Standardized axis limits with minimal padding to fit map features
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
             
-            # Calculate range and use smaller padding for tighter zoom
+            # Calculate range and use minimal padding
             x_range = x_max - x_min
             y_range = y_max - y_min
             
-            # Use 20% padding or 5m minimum (tighter than before)
-            x_padding = max(x_range * 0.2, 5.0)
-            y_padding = max(y_range * 0.2, 5.0)
+            # Use 5% padding or 2m minimum (tight fit for map features)
+            x_padding = max(x_range * 0.05, 2.0)
+            y_padding = max(y_range * 0.05, 2.0)
             
             x_lim = (x_min - x_padding, x_max + x_padding)
             y_lim = (y_min - y_padding, y_max + y_padding)
@@ -195,34 +310,40 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
             # Plot map features (only once per subplot)
             # Map features are in raw world coordinates (meters), not normalized
             if scenario is not None:
+                map_features_drawn = 0
                 for feature in scenario.map_features:
                     feature_type = feature.WhichOneof('feature_data')
                     
                     if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
-                        lane_type = feature.lane.type
                         x_coords = [point.x for point in feature.lane.polyline]
                         y_coords = [point.y for point in feature.lane.polyline]
-                        color = lane_type_colors.get(lane_type, '#95a5a6')
-                        ax.plot(x_coords, y_coords, color=color, linewidth=2.0, alpha=0.6, zorder=1)
+                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.5, alpha=0.4, zorder=1)
+                        map_features_drawn += 1
                     
                     elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                         x_coords = [point.x for point in feature.road_edge.polyline]
                         y_coords = [point.y for point in feature.road_edge.polyline]
-                        ax.plot(x_coords, y_coords, color='#2c3e50', linewidth=2.5, alpha=0.7, zorder=1)
+                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=2.0, alpha=0.5, zorder=1)
+                        map_features_drawn += 1
                     
                     elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
                         x_coords = [point.x for point in feature.road_line.polyline]
                         y_coords = [point.y for point in feature.road_line.polyline]
                         # Use dashed line for road markings
-                        ax.plot(x_coords, y_coords, color='white', linewidth=1.5, 
-                               linestyle='--', alpha=0.8, zorder=1)
+                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.0, 
+                               linestyle='--', alpha=0.4, zorder=1)
+                        map_features_drawn += 1
                     
                     elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
                         x_coords = [point.x for point in feature.crosswalk.polygon]
                         y_coords = [point.y for point in feature.crosswalk.polygon]
                         x_coords.append(x_coords[0])
                         y_coords.append(y_coords[0])
-                        ax.fill(x_coords, y_coords, color='yellow', alpha=0.5, zorder=1)
+                        ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.3, zorder=1)
+                        map_features_drawn += 1
+                
+                if t == 0 and graph_idx == 0:
+                    print(f"  Drew {map_features_drawn} map features on first subplot")
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]
@@ -240,54 +361,61 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
             if t > 0:
                 prev_data = graph_data_per_timestep[t-1]
                 if prev_data is not None and prev_data['num_nodes'] >= num_nodes:
-                    prev_actual = prev_data['actual_next'][:num_nodes]
-                    prev_pred = prev_data['pred_next'][:num_nodes]
+                    prev_curr_pos = prev_data['curr'][:num_nodes]
                     
-                    # Draw trajectory lines connecting previous to current
+                    # Draw trajectory lines connecting previous timestep to current position
                     for idx, node_idx in enumerate(node_indices):
                         color = node_colors[idx]
                         
-                        # Actual trajectory (solid line, more visible)
-                        ax.plot([prev_actual[node_idx, 0], curr_pos[node_idx, 0]], 
-                               [prev_actual[node_idx, 1], curr_pos[node_idx, 1]], 
-                               color=color, linewidth=2.5, alpha=0.7, linestyle='-', zorder=2,
+                        # Actual trajectory (solid line) - from previous current position to current position
+                        ax.plot([prev_curr_pos[node_idx, 0], curr_pos[node_idx, 0]], 
+                               [prev_curr_pos[node_idx, 1], curr_pos[node_idx, 1]], 
+                               color=color, linewidth=2.5, alpha=0.9, linestyle='-', zorder=2,
                                label='Actual Trajectory' if idx == 0 and t == 1 else None)
-                        
-                        # Predicted trajectory (dashed line, more visible)
-                        ax.plot([prev_pred[node_idx, 0], curr_pos[node_idx, 0]], 
-                               [prev_pred[node_idx, 1], curr_pos[node_idx, 1]], 
-                               color=color, linewidth=2.5, alpha=0.7, linestyle=':', zorder=2,
-                               label='Predicted Trajectory' if idx == 0 and t == 1 else None)
+            
+            # Draw predicted trajectories from current position to predicted next
+            for idx, node_idx in enumerate(node_indices):
+                color = node_colors[idx]
+                
+                curr_xy = curr_pos[node_idx].numpy()
+                pred_next_xy = pred_next_pos[node_idx].numpy()
+                
+                # Predicted trajectory (dotted line) - from current position to predicted next
+                ax.plot([curr_xy[0], pred_next_xy[0]], 
+                       [curr_xy[1], pred_next_xy[1]], 
+                       color=color, linewidth=2.5, alpha=0.9, linestyle=':', zorder=2,
+                       label='Predicted Trajectory' if idx == 0 and t == 0 else None)
             
             # Plot each selected node
             for idx, node_idx in enumerate(node_indices):
                 color = node_colors[idx]
+                is_sdc = (node_idx == sdc_idx)
                 
                 curr_xy = curr_pos[node_idx].numpy()
                 actual_next_xy = actual_next_pos[node_idx].numpy()
                 pred_next_xy = pred_next_pos[node_idx].numpy()
                 
-                # Plot current position (small gray dot)
-                ax.scatter(curr_xy[0], curr_xy[1], color='gray', s=30, 
-                          marker='o', alpha=0.6, zorder=3, label='Current' if idx == 0 else None)
+                # Plot current position (star for SDC, circle for others)
+                if is_sdc:
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=100, 
+                              marker='*', alpha=1.0, zorder=3, 
+                              edgecolors='darkgreen', linewidths=2,
+                              label='SDC Current' if idx == 0 else None)
+                else:
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=30, 
+                              marker='o', alpha=0.6, zorder=3, 
+                              label='Current' if idx == 1 else None)
                 
-                # Plot actual next position (medium filled circle)
-                ax.scatter(actual_next_xy[0], actual_next_xy[1], color=color, s=50, 
-                          marker='o', edgecolors='black', linewidths=1.0, 
-                          alpha=0.9, zorder=5, label='Actual Next' if idx == 0 else None)
-                
-                # Plot predicted next position (medium hollow circle)
-                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, s=50, 
-                          marker='o', linewidths=1.5, alpha=0.9, zorder=4,
+                # Plot predicted next position (hollow circle)
+                marker_size = 25 if is_sdc else 20
+                linewidth = 2.0 if is_sdc else 1.5
+                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, 
+                          s=marker_size, marker='o', linewidths=linewidth, alpha=0.9, zorder=4,
                           label='Predicted Next' if idx == 0 else None)
                 
-                # Draw thicker arrow from current to actual next (ground truth trajectory)
-                ax.annotate('', xy=actual_next_xy, xytext=curr_xy,
-                           arrowprops=dict(arrowstyle='->', color=color, lw=1.5, alpha=0.6), zorder=2)
-                
                 # Draw thicker error line between actual and predicted next positions
-                ax.plot([actual_next_xy[0], pred_next_xy[0]], [actual_next_xy[1], pred_next_xy[1]], 
-                       color='red', linewidth=2.0, alpha=0.7, zorder=3)
+                #ax.plot([actual_next_xy[0], pred_next_xy[0]], [actual_next_xy[1], pred_next_xy[1]], 
+                #       color='red', linewidth=2.0, alpha=0.7, zorder=3)
                 
                 # Calculate error (distance between actual and predicted NEXT positions)
                 error = np.linalg.norm(actual_next_xy - pred_next_xy)
@@ -328,17 +456,48 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
     # Overall average error
     avg_error = total_error / max(1, error_counts)
     
+    # Create custom legend with all visualization elements
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    
+    legend_elements = [
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='#27ae60', markersize=12, 
+               label='SDC (Self-Driving Car)', markeredgecolor='darkgreen', markeredgewidth=2),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=6, 
+               label='Current Position', markeredgewidth=0),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='none', markersize=8,
+               markeredgecolor='tab:blue', markeredgewidth=1.5, label='Predicted Next Position'),
+        Line2D([0], [0], color='tab:blue', linewidth=2, linestyle='-', 
+               label='Actual Trajectory (solid)', alpha=0.7),
+        Line2D([0], [0], color='tab:blue', linewidth=2, linestyle=':', 
+               label='Predicted Trajectory (dotted)', alpha=0.7),
+        Line2D([0], [0], color='red', linewidth=2, label='Prediction Error', alpha=0.7),
+    ]
+    
+    # Add map feature legend items if scenario is present
+    if scenario is not None:
+        legend_elements.extend([
+            Line2D([0], [0], color=map_feature_gray, linewidth=1.5, alpha=0.4, label='Lane'),
+            Line2D([0], [0], color=map_feature_gray, linewidth=2.0, alpha=0.5, label='Road Edge'),
+            Line2D([0], [0], color=map_feature_gray, linewidth=1.0, linestyle='--', alpha=0.4, label='Road Marking'),
+            Patch(facecolor=map_feature_gray, alpha=0.3, label='Crosswalk'),
+        ])
+    
+    # Add legend to the figure (outside the subplots)
+    fig.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(0.01, 0.98),
+               ncol=3 if scenario is not None else 2, fontsize=9, framealpha=0.95,
+               title='Legend', title_fontsize=10)
+    
     # Add overall title with more spacing
-    map_note = ' (with map)' if scenario is not None else ''
+    map_note = ' with Map Features' if scenario is not None else ''
     title_text = (f'Epoch {epoch} - Training Progress{map_note}\n'
-                  f'Showing {T} of {total_T} timesteps (evenly sampled)\n'
-                  f'Gray ● = Current | Colored ● = Actual Next | Colored ○ = Predicted Next | Red line = Error\n'
+                  f'Showing {T} of {total_T} timesteps (evenly sampled) | '
                   f'Overall Avg Prediction Error: {avg_error:.2f}m')
     
-    fig.suptitle(title_text, fontsize=12, fontweight='bold', y=0.99)
+    fig.suptitle(title_text, fontsize=13, fontweight='bold', y=0.99)
     
-    # Adjust layout to prevent title overlap
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    # Adjust layout to prevent title and legend overlap
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     
     # Save
     filename = f'epoch_{epoch:03d}_progress.png'
@@ -378,9 +537,8 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
     type_colors = {1: '#e74c3c', 2: '#3498db', 3: '#f39c12', 4: '#9b59b6'}
     type_names = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
     
-    lane_type_colors = {
-        0: '#95a5a6', 1: '#e74c3c', 2: '#3498db', 3: '#2ecc71'
-    }
+    # Gray color for all map features
+    map_feature_gray = '#808080'
     
     for plot_idx, t in enumerate(timestep_indices):
         ax = axes[plot_idx]
@@ -390,16 +548,14 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
             feature_type = feature.WhichOneof('feature_data')
             
             if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
-                lane_type = feature.lane.type
                 x_coords = [point.x for point in feature.lane.polyline]
                 y_coords = [point.y for point in feature.lane.polyline]
-                color = lane_type_colors.get(lane_type, '#95a5a6')
-                ax.plot(x_coords, y_coords, color=color, linewidth=0.5, alpha=0.15, zorder=1)
+                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.3, zorder=1)
             
             elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                 x_coords = [point.x for point in feature.road_edge.polyline]
                 y_coords = [point.y for point in feature.road_edge.polyline]
-                ax.plot(x_coords, y_coords, color='black', linewidth=0.5, alpha=0.15, zorder=1)
+                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.4, zorder=1)
         
         # Render graph edges
         edge_index = graph.edge_index
@@ -528,7 +684,7 @@ def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num
         traceback.print_exc()
     print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")
 
-def visualize_epoch(epoch, viz_batch, model, viz_scenario, device, wandb):
+def visualize_epoch(epoch, viz_batch, model, device, wandb):
     should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0
         
     if should_visualize and viz_batch is not None:
@@ -536,7 +692,7 @@ def visualize_epoch(epoch, viz_batch, model, viz_scenario, device, wandb):
         try:
             filepath, avg_error = visualize_training_progress(
                 model, viz_batch, epoch=epoch+1,
-                scenario=viz_scenario,  # Pass scenario for map features
+                scenario_id=None,  # Will auto-detect from batch data
                 save_dir=viz_training_dir,
                 device=device,
                 max_nodes_per_graph=max_nodes_per_graph_viz,

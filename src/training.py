@@ -55,38 +55,13 @@ if __name__ == '__main__':
                             collate_fn=collate_graph_sequences_to_batch, 
                             drop_last=True,    # discard last minibatch if it does not have enough snapshots
                             persistent_workers=True if num_workers > 0 else False) 
-    
-    # TODO: do not shuffle for validation/test?...
 
     print(f"Training on {device}")
     print(f"Dataset size: {len(dataset)} scenarios")
     print(f"Batch size: {batch_size}, num workers: {num_workers}")
     print(f"Sequence length: {sequence_length}\n")
     viz_batch = None
-    viz_scenario = None
     viz_batch_saved = False
-    
-    # Load first scenario for map visualization
-    try:
-        import tensorflow as tf
-        from waymo_open_dataset.protos import scenario_pb2
-        from pathlib import Path
-        
-        # Find first tfrecord file
-        scenario_dir = Path("./data/scenario/training")
-        tfrecord_files = sorted(scenario_dir.glob("*.tfrecord"))
-        
-        if tfrecord_files:
-            print(f"Loading first scenario from {tfrecord_files[0]} for visualization...")
-            scenario_dataset = tf.data.TFRecordDataset(str(tfrecord_files[0]), compression_type='')
-            
-            for raw_record in scenario_dataset:
-                viz_scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
-                print(f"  Loaded scenario {viz_scenario.scenario_id} with {len(viz_scenario.map_features)} map features")
-                break  # Just load the first one
-    except Exception as e:
-        print(f"Warning: Could not load scenario for visualization: {e}")
-        print("  Visualization will not include map features")
 
     for epoch in range(training_wandb_run.config['epochs']):
         model.train()
@@ -103,7 +78,12 @@ if __name__ == '__main__':
             print(f"Batch {batch}: B={B} scenarios, T={T} timesteps")
 
             if viz_batch is None and (not visualize_first_batch_only or not viz_batch_saved):   # Save first batch for visualization (only once)
-                viz_batch = {'batch': [b.cpu() for b in batch_dict['batch']],'B': batch_dict['B'],'T': batch_dict['T']}
+                viz_batch = {
+                    'batch': [b.cpu() for b in batch_dict['batch']],
+                    'B': batch_dict['B'],
+                    'T': batch_dict['T'],
+                    'scenario_ids': batch_dict.get('scenario_ids', [])  # Include scenario_ids if available
+                }
                 viz_batch_saved = True
 
             for t in range(T): batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
@@ -139,7 +119,7 @@ if __name__ == '__main__':
         avg_loss_epoch = total_loss_epoch / max(1, steps)
         wandb.log({"epoch": epoch, "train_avg_loss_per_batch": avg_loss_epoch})
         print(f"Epoch {epoch+1:3d}/{epochs} | Avg Loss per batch: {avg_loss_epoch:.6f}")
-        visualize_epoch(epoch, viz_batch, model, viz_scenario, device, wandb)
+        visualize_epoch(epoch, viz_batch, model, device, wandb)
 
 
         
@@ -149,10 +129,11 @@ if __name__ == '__main__':
 
 
     # TODO:
-    # - GRU reset
+    # - num_workers not working for batches
     # - implement whole model training pipeline using wandb (see Colab 2), in evaluation make visualizations:
     #       - add for validation (note more timesteps) and testing
     #       - implement and use training.train
+    #       - do not shuffle for validation/test?...
     # - update README.md
 
     # - use different graph creation methods

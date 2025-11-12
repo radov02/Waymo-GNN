@@ -78,8 +78,13 @@ class HDF5TemporalDataset(Dataset):
         edge_index = torch.from_numpy(group["edge_index"][:]).long()
         edge_weight = torch.from_numpy(group["edge_weight"][:]) if "edge_weight" in group else None
         y = torch.from_numpy(group["y"][:]) if "y" in group else None
+        pos = torch.from_numpy(group["pos"][:]) if "pos" in group else None
+        
+        # Debug: Check if pos is being loaded
+        if idx == 0:  # Only print for first sample
+            print(f"  DEBUG: Loading first sample - 'pos' in group: {'pos' in group}, pos shape: {pos.shape if pos is not None else 'None'}")
 
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y, pos=pos)
         data.scenario_id = scenario_id      # attach metadata
         data.snapshot_id = int(snapshot_id)
         return data
@@ -155,14 +160,17 @@ class HDF5ScenarioDataset(Dataset):
             edge_index = torch.from_numpy(group["edge_index"][:]).long()
             edge_weight = torch.from_numpy(group["edge_weight"][:]) if "edge_weight" in group else None
             y = torch.from_numpy(group["y"][:]) if "y" in group else None
+            pos = torch.from_numpy(group["pos"][:]) if "pos" in group else None
             
             # Create PyG Data object
             data = Data(
                 x=x,
                 edge_index=edge_index,
                 edge_attr=edge_weight,
-                y=y
+                y=y,
+                pos=pos
             )
+            data.scenario_id = scenario_id  # Add scenario_id to each graph
             data.snapshot_id = int(timestep)
             data_list.append(data)
         
