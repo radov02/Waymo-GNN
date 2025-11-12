@@ -26,10 +26,10 @@ dropout = 0.3
 
 # training:
 batch_size = 1
-learning_rate = 0.02  # Higher LR now that data is normalized
-epochs = 20
+learning_rate = 0.005  # Lower LR to avoid mode collapse with directional loss
+epochs = 30  # Extended for better convergence with stronger directional loss
 gradient_clip_value = 5.0  # Less aggressive clipping
-loss_alpha = 0.7  # Directional loss weight: 0.7=70% MSE + 30% angular, tune between 0.5-0.8
+loss_alpha = 0.4  # Directional loss weight: 0.4=40% MSE + 60% directional (angle+cosine)
 
 # wandb:
 project_name = "waymo-project"
