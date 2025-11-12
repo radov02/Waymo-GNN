@@ -7,7 +7,6 @@ import numpy as np
 import tensorflow as tf
 from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
 from torch_geometric.data import Data, Batch
-from dataset import HDF5TemporalDataset
 from torch.utils.data import DataLoader
 
 def initialize():
@@ -421,7 +420,6 @@ def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=
         print(f"Example of a graph from scenario with id {list(scenarios_and_their_graphs.keys())[0]}:\n\t{scenarios_and_their_graphs[list(scenarios_and_their_graphs.keys())[0]][0]}")
     return scenarios_and_their_graphs
 
-from tqdm import tqdm
 def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_scenarios_per_tfrecord_file=None):
     """Stream directly from TFRecord files to HDF5 without storing in memory, HDF5 file structure:
     scenarios/{scenario_id}/snapshot_graphs/{timestep}/x|edge_index|edge_weight|y"""
@@ -484,6 +482,11 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                         if timestep == 0 and total_scenarios == 0:
                             print("  Warning: pos is None for first graph - this will cause visualization issues!")
                     
+                    # Save agent_ids as numpy array of integers
+                    agent_ids = getattr(graph, "agent_ids", None) if hasattr(graph, "agent_ids") else graph.get("agent_ids")
+                    if agent_ids is not None:
+                        snapshot_group.create_dataset("agent_ids", data=np.array(agent_ids, dtype=np.int64))
+                    
                     # Save scenario_id as string (no compression for scalar strings)
                     if scenario_id is not None:
                         snapshot_group.create_dataset("scenario_id", data=np.string_(scenario_id))
@@ -505,46 +508,38 @@ def test_hdf5_and_lazy_loading(path):
     print("=" * 80)
 
     # Initialize dataset
-    dataset = HDF5TemporalDataset(path)
-    print(f"\n✓ Dataset loaded: {len(dataset)} total snapshots")
+    from dataset import HDF5ScenarioDataset
+    dataset = HDF5ScenarioDataset(path, seq_len=sequence_length)
+    print(f"\n✓ Dataset loaded: {len(dataset)} total scenarios")
 
-    # Test 1: Check a few individual snapshots
+    # Test 1: Check a few individual scenario sequences
     print("\n" + "-" * 80)
-    print("TEST 1: Individual Snapshot Access (should be lazy)")
+    print("TEST 1: Individual Scenario Sequence Access (should be lazy)")
     print("-" * 80)
     for i in range(min(3, len(dataset))):
-        data = dataset[i]
-        print(f"Snapshot {i}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}, edges={data.edge_index.shape[1]}")
-        print(f"  - x shape: {data.x.shape}, dtype: {data.x.dtype}")
-        print(f"  - edge_index shape: {data.edge_index.shape}")
-        if data.edge_attr is not None:
-            print(f"  - edge_weight shape: {data.edge_attr.shape}")
-        if data.y is not None:
-            print(f"  - y shape: {data.y.shape}")
+        data_list = dataset[i]
+        print(f"Scenario {i}: {len(data_list)} timesteps")
+        first_graph = data_list[0]
+        print(f"  - scenario_id: {first_graph.scenario_id}")
+        print(f"  - First timestep: nodes={first_graph.x.shape[0]}, edges={first_graph.edge_index.shape[1]}")
+        print(f"  - x shape: {first_graph.x.shape}, dtype: {first_graph.x.dtype}")
+        print(f"  - edge_index shape: {first_graph.edge_index.shape}")
+        if first_graph.edge_attr is not None:
+            print(f"  - edge_weight shape: {first_graph.edge_attr.shape}")
+        if first_graph.y is not None:
+            print(f"  - y shape: {first_graph.y.shape}")
+        if first_graph.pos is not None:
+            print(f"  - pos shape: {first_graph.pos.shape}")
+        if hasattr(first_graph, 'agent_ids') and first_graph.agent_ids is not None:
+            print(f"  - agent_ids: {len(first_graph.agent_ids)} agents")
 
-    # Test 2: Iterate through all snapshots (no batching)
+    # Test 2: DataLoader with Sequence Batching (TRAINING-STYLE)
     print("\n" + "-" * 80)
-    print("TEST 2: Full Dataset Iteration")
+    print("TEST 2: DataLoader with Sequence Batching (TRAINING-STYLE)")
     print("-" * 80)
-    scenario_counts = {}
-    for data in dataset.snapshots():
-        scenario_counts[data.scenario_id] = scenario_counts.get(data.scenario_id, 0) + 1
-
-    print(f"Total scenarios: {len(scenario_counts)}")
-    for sid, count in sorted(scenario_counts.items()):
-        print(f"  - Scenario {sid}: {count} snapshots")
-
-    # Test 3: DataLoader with standard batching (PyG style)
-    print("\n" + "-" * 80)
-    print("TEST 3: DataLoader with Sequence Batching (TRAINING-STYLE)")
-    print("-" * 80)
-    
-    # Use the same dataset as training
-    from dataset import HDF5ScenarioDataset
-    scenario_dataset = HDF5ScenarioDataset(path, seq_len=sequence_length)
     
     dataloader = DataLoader(
-        scenario_dataset, 
+        dataset, 
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
@@ -552,7 +547,7 @@ def test_hdf5_and_lazy_loading(path):
         drop_last=True
     )
     print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
-    print(f"Expected batches: ~{len(scenario_dataset) // batch_size}")
+    print(f"Expected batches: ~{len(dataset) // batch_size}")
     print(f"Each batch contains {batch_size} different scenarios, each with {sequence_length} timesteps\n")
 
     for batch_idx, batch_dict in enumerate(dataloader):
@@ -562,77 +557,41 @@ def test_hdf5_and_lazy_loading(path):
         batched_graph_sequence = batch_dict["batch"]
         B = batch_dict["B"]
         T = batch_dict["T"]
+        scenario_ids = batch_dict.get("scenario_ids", [])
         
         print(f"Batch {batch_idx}:")
         print(f"  - B (# scenarios): {B}")
         print(f"  - T (# timesteps): {T}")
         print(f"  - Batched graphs: {len(batched_graph_sequence)}")
+        print(f"  - Scenario IDs: {scenario_ids}")
         
         # Show first timestep details
         first_timestep = batched_graph_sequence[0]
         print(f"  - First timestep graph:")
         print(f"    - x: {first_timestep.x.shape}")
         print(f"    - edge_index: {first_timestep.edge_index.shape}")
-        print(f"    - y: {first_timestep.y.shape}")
+        print(f"    - y: {first_timestep.y.shape if first_timestep.y is not None else None}")
+        print(f"    - pos: {first_timestep.pos.shape if hasattr(first_timestep, 'pos') and first_timestep.pos is not None else None}")
         print(f"    - batch: {first_timestep.batch.shape} (node→graph mapping)")
-        if hasattr(first_timestep, 'scenario_id'):
-            unique_scenarios = len(set([first_timestep.scenario_id]))
-            print(f"    - Unique scenarios in batch: {unique_scenarios}")
+        if hasattr(first_timestep, 'agent_ids') and first_timestep.agent_ids:
+            print(f"    - agent_ids: {len(first_timestep.agent_ids)} total agents")
         print()
 
     print(f"Total batches processed: {batch_idx + 1}")
     print("\n✓ This matches training: Each batch has B={batch_size} different scenarios,")
     print(f"  and you iterate through T={sequence_length} timesteps sequentially in training loop")
 
-    # Test 4: OLD-STYLE flat snapshot batching (for comparison)
+    # Test 3: Verify Lazy Loading (memory check)
     print("\n" + "-" * 80)
-    print("TEST 4: DataLoader Flat Snapshot Batching (OLD STYLE - NOT USED IN TRAINING)")
+    print("TEST 3: Verify Lazy Loading (memory check)")
     print("-" * 80)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers,
-        collate_fn=Batch.from_data_list  # PyG default batching
-    )
-    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
-    print(f"Expected batches: ~{len(dataset) // batch_size}")
-
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx < 3:  # Print first 3 batches
-            print(f"\nBatch {batch_idx}:")
-            print(f"  Type: {type(batch)}")
-            # DataLoader returns a Batch object (batched PyG Data)
-            print(f"  - x: {batch.x.shape}")
-            print(f"  - edge_index: {batch.edge_index.shape}")
-            print(f"  - edge_attr: {batch.edge_attr.shape if batch.edge_attr is not None else None}")
-            print(f"  - y: {batch.y.shape if batch.y is not None else None}")
-            print(f"  - batch size: {batch.num_graphs}")
-            if hasattr(batch, 'scenario_id'):
-                print(f"  - scenario_ids: {batch.scenario_id}")
-            if hasattr(batch, 'snapshot_id'):
-                print(f"  - snapshot_ids: {batch.snapshot_id}")
-
-    print(f"\nTotal batches processed: {batch_idx + 1}")
-    print("\n⚠ This batching treats snapshots independently (NOT used in training!)")
-
-    # Test 5: OLD custom sequence batching test
-    print("\n" + "-" * 80)
-    print("TEST 5: DataLoader with Custom Collate (OLD - SKIPPED)")
-    print("-" * 80)
-    print("⚠ Skipping - not compatible with HDF5TemporalDataset")
-    print("  (Use HDF5ScenarioDataset for sequence batching as shown in Test 3)")
-
-    # Test 6: Verify Lazy Loading (memory check)
-    print("\n" + "-" * 80)
-    print("TEST 6: Verify Lazy Loading (memory check)")
-    print("-" * 80)
-    print("Accessing 5 random snapshots without loading all data...")
+    print("Accessing 5 random scenarios without loading all data...")
     import random
     indices = random.sample(range(len(dataset)), min(5, len(dataset)))
     for idx in indices:
-        data = dataset[idx]
-        print(f"  Index {idx}: scenario={data.scenario_id}, time={data.snapshot_id}, nodes={data.x.shape[0]}")
+        data_list = dataset[idx]
+        first_graph = data_list[0]
+        print(f"  Index {idx}: scenario={first_graph.scenario_id}, timesteps={len(data_list)}, nodes={first_graph.x.shape[0]}")
     print("✓ If this was fast, lazy loading is working correctly!")
 
     print("\n" + "=" * 80)
@@ -664,18 +623,17 @@ def collate_graph_sequences_to_batch(scenario_list):
     for timestep in range(T):
         graphs_at_timestep = list(transposed[timestep])
         
-        # Debug: Check if pos exists in the first graph
-        #if timestep == 0 and len(graphs_at_timestep) > 0:
-            #first_graph = graphs_at_timestep[0]
-            #print(f"  DEBUG collate: First graph has pos: {hasattr(first_graph, 'pos')}, pos is None: {first_graph.pos is None if hasattr(first_graph, 'pos') else 'no attr'}")
-            #if hasattr(first_graph, 'pos') and first_graph.pos is not None:
-                #print(f"  DEBUG collate: pos shape: {first_graph.pos.shape}, pos dtype: {first_graph.pos.dtype}")
-        
         batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
         
-        # Debug: Check if pos exists after batching
-        #if timestep == 0:
-            #print(f"  DEBUG collate: After batching - hasattr pos: {hasattr(batched_graphs_at_timestep, 'pos')}, pos is None: {batched_graphs_at_timestep.pos is None if hasattr(batched_graphs_at_timestep, 'pos') else 'no attr'}")
+        # Manually preserve agent_ids (Batch.from_data_list doesn't preserve list attributes)
+        # Concatenate all agent_ids from individual graphs
+        all_agent_ids = []
+        for graph in graphs_at_timestep:
+            if hasattr(graph, 'agent_ids'):
+                all_agent_ids.extend(graph.agent_ids)
+        
+        if all_agent_ids:
+            batched_graphs_at_timestep.agent_ids = all_agent_ids
         
         batch.append(batched_graphs_at_timestep)
     
