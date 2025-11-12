@@ -124,10 +124,10 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             graph = batched_graph_sequence[t]
             
             # Debug: Check if pos exists in the batched graph
-            if t == 0:
-                print(f"  DEBUG: First graph - hasattr(graph, 'pos'): {hasattr(graph, 'pos')}, graph.pos is not None: {hasattr(graph, 'pos') and graph.pos is not None}")
-                if hasattr(graph, 'pos') and graph.pos is not None:
-                    print(f"  DEBUG: graph.pos.shape: {graph.pos.shape}")
+            #if t == 0:
+            #    print(f"  DEBUG: First graph - hasattr(graph, 'pos'): {hasattr(graph, 'pos')}, graph.pos is not None: {hasattr(graph, 'pos') and graph.pos is not None}")
+            #    if hasattr(graph, 'pos') and graph.pos is not None:
+            #        print(f"  DEBUG: graph.pos.shape: {graph.pos.shape}")
             
             # Current positions
             # Note: graph.pos contains RAW world coordinates (meters), not normalized
@@ -181,78 +181,128 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     # Gray colors for all map features
     map_feature_gray = '#808080'  # Medium gray for all map features
     
+    # Import config for vehicle-only filter
+    from config import viz_vehicles_only, max_nodes_per_graph_viz
+    
     # Process each graph (row) and timestep (column)
     for graph_idx in range(B):
+        # Get agent_ids from first timestep to track same agents across time
+        first_graph = batched_graph_sequence[0]
+        batch_mask_first = first_graph.batch == graph_idx
+        
+        if not hasattr(first_graph, 'agent_ids'):
+            print(f"Warning: graph missing agent_ids, skipping graph {graph_idx}")
+            continue
+        
+        # Get agent IDs for this graph sequence
+        all_agent_ids = [first_graph.agent_ids[i] for i in range(len(first_graph.agent_ids)) if batch_mask_first[i]]
+        
+        # Filter to vehicles only if configured
+        if viz_vehicles_only and hasattr(first_graph, 'x'):
+            # Get node features for this graph
+            node_features_first = first_graph.x[batch_mask_first]
+            # Check if agent is vehicle (feature index 5 is vehicle one-hot)
+            vehicle_mask = node_features_first[:, 5] == 1.0  # Index 5 is 'vehicle' in one-hot
+            vehicle_indices = torch.where(vehicle_mask)[0].numpy()
+            all_agent_ids = [all_agent_ids[i] for i in vehicle_indices]
+        
+        if len(all_agent_ids) == 0:
+            print(f"Warning: No agents found for graph {graph_idx}")
+            continue
+        
+        # Find SDC
+        sdc_idx_in_list = None
+        sdc_id = None
+        if scenario is not None:
+            sdc_track = scenario.tracks[scenario.sdc_track_index]
+            sdc_id = sdc_track.id
+            if sdc_id in all_agent_ids:
+                sdc_idx_in_list = all_agent_ids.index(sdc_id)
+        
+        # Select subset of agent IDs to track, always including SDC
+        if len(all_agent_ids) > max_nodes_per_graph_viz:
+            if sdc_idx_in_list is not None:
+                # Include SDC first, then evenly sample others
+                other_ids = [aid for i, aid in enumerate(all_agent_ids) if i != sdc_idx_in_list]
+                num_others = max_nodes_per_graph_viz - 1
+                if len(other_ids) > num_others:
+                    other_selected = np.linspace(0, len(other_ids) - 1, num_others, dtype=int)
+                    other_ids = [other_ids[i] for i in other_selected]
+                selected_agent_ids = [all_agent_ids[sdc_idx_in_list]] + other_ids
+            else:
+                selected_indices = np.linspace(0, len(all_agent_ids) - 1, max_nodes_per_graph_viz, dtype=int)
+                selected_agent_ids = [all_agent_ids[i] for i in selected_indices]
+        else:
+            selected_agent_ids = all_agent_ids
+        
+        # Assign consistent colors to each agent ID
+        agent_colors = {}
+        for idx, agent_id in enumerate(selected_agent_ids):
+            if agent_id == sdc_id:
+                agent_colors[agent_id] = '#27ae60'  # Green for SDC
+            else:
+                # Use tab20 colormap for other agents
+                color_idx = idx / max(len(selected_agent_ids) - 1, 1)
+                agent_colors[agent_id] = plt.cm.tab20(color_idx)
+        
+        # Get nodes for this graph across all timesteps
+        graph_data_per_timestep = []
+        
         # Get nodes for this graph across all timesteps
         graph_data_per_timestep = []
         
         for t in range(T):
+            graph = batched_graph_sequence[timestep_indices[t]]
             batch_mask = all_batch_indices[t] == graph_idx
-            if batch_mask.sum() > 0:
-                actual_next_pos = all_actual_next_pos[t][batch_mask]
-                pred_next_pos = all_pred_next_pos[t][batch_mask]
-                curr_pos = all_curr_pos[t][batch_mask]
+            
+            if batch_mask.sum() == 0 or not hasattr(graph, 'agent_ids'):
+                graph_data_per_timestep.append(None)
+                continue
+            
+            # Get agent IDs for this timestep
+            timestep_agent_ids = [graph.agent_ids[i] for i in range(len(graph.agent_ids)) if batch_mask[i]]
+            
+            # Find indices of our selected agents in this timestep
+            agent_indices_in_timestep = []
+            for agent_id in selected_agent_ids:
+                if agent_id in timestep_agent_ids:
+                    local_idx = timestep_agent_ids.index(agent_id)
+                    # Get global index in the batched tensors
+                    global_indices = torch.where(batch_mask)[0]
+                    agent_indices_in_timestep.append(global_indices[local_idx].item())
+                else:
+                    agent_indices_in_timestep.append(None)  # Agent not present
+            
+            # Extract positions for selected agents
+            curr_pos_t = all_curr_pos[t]
+            actual_next_pos_t = all_actual_next_pos[t]
+            pred_next_pos_t = all_pred_next_pos[t]
+            
+            # Build position tensors for selected agents (fill with NaN if agent missing)
+            selected_curr = []
+            selected_actual = []
+            selected_pred = []
+            
+            for global_idx in agent_indices_in_timestep:
+                if global_idx is not None:
+                    selected_curr.append(curr_pos_t[global_idx])
+                    selected_actual.append(actual_next_pos_t[global_idx])
+                    selected_pred.append(pred_next_pos_t[global_idx])
+                else:
+                    # Agent not present - use NaN
+                    selected_curr.append(torch.tensor([float('nan'), float('nan')]))
+                    selected_actual.append(torch.tensor([float('nan'), float('nan')]))
+                    selected_pred.append(torch.tensor([float('nan'), float('nan')]))
+            
+            if selected_curr:
                 graph_data_per_timestep.append({
-                    'actual_next': actual_next_pos,
-                    'pred_next': pred_next_pos,
-                    'curr': curr_pos,
-                    'num_nodes': actual_next_pos.shape[0]
+                    'curr': torch.stack(selected_curr),
+                    'actual_next': torch.stack(selected_actual),
+                    'pred_next': torch.stack(selected_pred),
+                    'agent_ids': selected_agent_ids
                 })
             else:
                 graph_data_per_timestep.append(None)
-        
-        # Determine consistent number of nodes for this graph
-        valid_counts = [d['num_nodes'] for d in graph_data_per_timestep if d is not None]
-        if not valid_counts:
-            continue
-        
-        # Use minimum node count across all timesteps
-        num_nodes = min(valid_counts)
-        
-        # Find SDC index by checking agent_ids in the first valid timestep
-        sdc_idx = None
-        first_valid_graph = batched_graph_sequence[0]
-        if hasattr(first_valid_graph, 'agent_ids'):
-            # Get SDC id from scenario
-            if scenario is not None:
-                sdc_track = scenario.tracks[scenario.sdc_track_index]
-                sdc_id = sdc_track.id
-                
-                # Find which nodes belong to current graph
-                batch_mask = first_valid_graph.batch == graph_idx
-                graph_agent_ids = [first_valid_graph.agent_ids[i] for i in range(len(first_valid_graph.agent_ids)) if batch_mask[i]]
-                
-                if sdc_id in graph_agent_ids:
-                    sdc_idx = graph_agent_ids.index(sdc_id)
-        
-        # Select subset of nodes to visualize, ensuring SDC is included
-        if num_nodes > max_nodes_per_graph:
-            if sdc_idx is not None and sdc_idx < num_nodes:
-                # Include SDC first, then evenly sample others
-                other_indices = [i for i in range(num_nodes) if i != sdc_idx]
-                num_others = max_nodes_per_graph - 1
-                if len(other_indices) > num_others:
-                    other_selected = np.linspace(0, len(other_indices) - 1, num_others, dtype=int)
-                    other_indices = [other_indices[i] for i in other_selected]
-                node_indices = np.array([sdc_idx] + other_indices)
-            else:
-                node_indices = np.linspace(0, num_nodes - 1, max_nodes_per_graph, dtype=int)
-        else:
-            node_indices = np.arange(num_nodes)
-            # Ensure SDC is in the list
-            if sdc_idx is not None and sdc_idx not in node_indices and sdc_idx < num_nodes:
-                node_indices = np.append([sdc_idx], node_indices[:-1])
-        
-        # Assign consistent colors to each node, with green for SDC
-        node_colors = []
-        for idx, node_idx in enumerate(node_indices):
-            if node_idx == sdc_idx:
-                node_colors.append('#27ae60')  # Green for SDC
-            else:
-                # Use tab20 colormap for other agents
-                color_idx = idx / max(len(node_indices) - 1, 1)
-                node_colors.append(plt.cm.tab20(color_idx))
-        node_colors = np.array(node_colors)
         
         # Calculate axis limits for this graph sequence (entire row)
         # Include map features if available for proper zoom
@@ -261,10 +311,10 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
         
         # Add agent positions
         for data in graph_data_per_timestep:
-            if data is not None and data['num_nodes'] >= num_nodes:
-                curr_pos = data['curr'][:num_nodes]
-                actual_next_pos = data['actual_next'][:num_nodes]
-                pred_next_pos = data['pred_next'][:num_nodes]
+            if data is not None:
+                curr_pos = data['curr']
+                actual_next_pos = data['actual_next']
+                pred_next_pos = data['pred_next']
                 all_x_coords.extend(curr_pos[:, 0].tolist())
                 all_y_coords.extend(curr_pos[:, 1].tolist())
                 all_x_coords.extend(actual_next_pos[:, 0].tolist())
@@ -317,13 +367,13 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                     if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
                         x_coords = [point.x for point in feature.lane.polyline]
                         y_coords = [point.y for point in feature.lane.polyline]
-                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.5, alpha=0.4, zorder=1)
+                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.5, alpha=0.15, zorder=1)
                         map_features_drawn += 1
                     
                     elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                         x_coords = [point.x for point in feature.road_edge.polyline]
                         y_coords = [point.y for point in feature.road_edge.polyline]
-                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=2.0, alpha=0.5, zorder=1)
+                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=2.0, alpha=0.2, zorder=1)
                         map_features_drawn += 1
                     
                     elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
@@ -331,7 +381,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                         y_coords = [point.y for point in feature.road_line.polyline]
                         # Use dashed line for road markings
                         ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.0, 
-                               linestyle='--', alpha=0.4, zorder=1)
+                               linestyle='--', alpha=0.15, zorder=1)
                         map_features_drawn += 1
                     
                     elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
@@ -339,7 +389,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                         y_coords = [point.y for point in feature.crosswalk.polygon]
                         x_coords.append(x_coords[0])
                         y_coords.append(y_coords[0])
-                        ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.3, zorder=1)
+                        ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.1, zorder=1)
                         map_features_drawn += 1
                 
                 if t == 0 and graph_idx == 0:
@@ -347,75 +397,82 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]
-            if data is None or data['num_nodes'] < num_nodes:
+            if data is None:
                 ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
                 ax.set_aspect('equal')
                 continue
             
-            # Truncate to consistent node count
-            curr_pos = data['curr'][:num_nodes]
-            actual_next_pos = data['actual_next'][:num_nodes]
-            pred_next_pos = data['pred_next'][:num_nodes]
+            # Get positions for selected agents
+            curr_pos = data['curr']
+            actual_next_pos = data['actual_next']
+            pred_next_pos = data['pred_next']
+            agent_ids_in_data = data['agent_ids']
             
-            # Draw trajectories first (so they're behind the points)
-            if t > 0:
-                prev_data = graph_data_per_timestep[t-1]
-                if prev_data is not None and prev_data['num_nodes'] >= num_nodes:
-                    prev_curr_pos = prev_data['curr'][:num_nodes]
-                    
-                    # Draw trajectory lines connecting previous timestep to current position
-                    for idx, node_idx in enumerate(node_indices):
-                        color = node_colors[idx]
-                        
-                        # Actual trajectory (solid line) - from previous current position to current position
-                        ax.plot([prev_curr_pos[node_idx, 0], curr_pos[node_idx, 0]], 
-                               [prev_curr_pos[node_idx, 1], curr_pos[node_idx, 1]], 
-                               color=color, linewidth=2.5, alpha=0.9, linestyle='-', zorder=2,
-                               label='Actual Trajectory' if idx == 0 and t == 1 else None)
-            
-            # Draw predicted trajectories from current position to predicted next
-            for idx, node_idx in enumerate(node_indices):
-                color = node_colors[idx]
+            # Draw predicted trajectories from current position to predicted next (1 timestep ahead)
+            for idx, agent_id in enumerate(agent_ids_in_data):
+                color = agent_colors[agent_id]
+                is_sdc = (agent_id == sdc_id)
                 
-                curr_xy = curr_pos[node_idx].numpy()
-                pred_next_xy = pred_next_pos[node_idx].numpy()
+                curr_xy = curr_pos[idx]
+                actual_next_xy = actual_next_pos[idx]
+                pred_next_xy = pred_next_pos[idx]
+                
+                # Skip if agent not present (NaN)
+                if torch.isnan(curr_xy).any():
+                    continue
+                
+                curr_xy = curr_xy.numpy()
+                actual_next_xy = actual_next_xy.numpy()
+                pred_next_xy = pred_next_xy.numpy()
                 
                 # Predicted trajectory (dotted line) - from current position to predicted next
+                linewidth = 3.5 if is_sdc else 3.0
                 ax.plot([curr_xy[0], pred_next_xy[0]], 
                        [curr_xy[1], pred_next_xy[1]], 
-                       color=color, linewidth=2.5, alpha=0.9, linestyle=':', zorder=2,
+                       color=color, linewidth=linewidth, alpha=1.0, linestyle=':', zorder=3,
                        label='Predicted Trajectory' if idx == 0 and t == 0 else None)
-            
-            # Plot each selected node
-            for idx, node_idx in enumerate(node_indices):
-                color = node_colors[idx]
-                is_sdc = (node_idx == sdc_idx)
                 
-                curr_xy = curr_pos[node_idx].numpy()
-                actual_next_xy = actual_next_pos[node_idx].numpy()
-                pred_next_xy = pred_next_pos[node_idx].numpy()
+                # Actual trajectory (solid line) - from current to actual next (ground truth)
+                ax.plot([curr_xy[0], actual_next_xy[0]], 
+                       [curr_xy[1], actual_next_xy[1]], 
+                       color=color, linewidth=linewidth, alpha=1.0, linestyle='-', zorder=3,
+                       label='Actual Trajectory' if idx == 0 and t == 0 else None)
+            
+            # Plot each selected agent
+            for idx, agent_id in enumerate(agent_ids_in_data):
+                color = agent_colors[agent_id]
+                is_sdc = (agent_id == sdc_id)
+                
+                curr_xy = curr_pos[idx]
+                actual_next_xy = actual_next_pos[idx]
+                pred_next_xy = pred_next_pos[idx]
+                
+                # Skip if agent not present (NaN)
+                if torch.isnan(curr_xy).any():
+                    continue
+                
+                curr_xy = curr_xy.numpy()
+                actual_next_xy = actual_next_xy.numpy()
+                pred_next_xy = pred_next_xy.numpy()
                 
                 # Plot current position (star for SDC, circle for others)
                 if is_sdc:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=100, 
-                              marker='*', alpha=1.0, zorder=3, 
-                              edgecolors='darkgreen', linewidths=2,
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=150, 
+                              marker='*', alpha=1.0, zorder=5, 
+                              edgecolors='darkgreen', linewidths=2.5,
                               label='SDC Current' if idx == 0 else None)
                 else:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=30, 
-                              marker='o', alpha=0.6, zorder=3, 
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=60, 
+                              marker='o', alpha=1.0, zorder=5, 
+                              edgecolors='white', linewidths=1.2,
                               label='Current' if idx == 1 else None)
                 
                 # Plot predicted next position (hollow circle)
-                marker_size = 25 if is_sdc else 20
-                linewidth = 2.0 if is_sdc else 1.5
+                marker_size = 50 if is_sdc else 40
+                linewidth = 3.0 if is_sdc else 2.5
                 ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, 
-                          s=marker_size, marker='o', linewidths=linewidth, alpha=0.9, zorder=4,
+                          s=marker_size, marker='o', linewidths=linewidth, alpha=1.0, zorder=5,
                           label='Predicted Next' if idx == 0 else None)
-                
-                # Draw thicker error line between actual and predicted next positions
-                #ax.plot([actual_next_xy[0], pred_next_xy[0]], [actual_next_xy[1], pred_next_xy[1]], 
-                #       color='red', linewidth=2.0, alpha=0.7, zorder=3)
                 
                 # Calculate error (distance between actual and predicted NEXT positions)
                 error = np.linalg.norm(actual_next_xy - pred_next_xy)
@@ -424,11 +481,14 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             
             # Calculate average error for this cell
             cell_errors = []
-            for idx in node_indices:
+            for idx, agent_id in enumerate(agent_ids_in_data):
+                curr_xy = curr_pos[idx]
+                if torch.isnan(curr_xy).any():
+                    continue
                 actual_next_xy = actual_next_pos[idx].numpy()
                 pred_next_xy = pred_next_pos[idx].numpy()
                 cell_errors.append(np.linalg.norm(actual_next_xy - pred_next_xy))
-            cell_avg_error = np.mean(cell_errors)
+            cell_avg_error = np.mean(cell_errors) if cell_errors else 0.0
             
             # Formatting
             ax.set_aspect('equal', adjustable='box')
@@ -506,7 +566,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     plt.close(fig)
     
     print(f"  Saved training progress visualization: {filepath}")
-    print(f"    Grid: {B} graphs × {T} timesteps | Avg Error: {avg_error:.2f}m | {len(node_indices)} nodes per cell")
+    print(f"    Grid: {B} graphs × {T} timesteps | Avg Error: {avg_error:.2f}m | {max_nodes_per_graph_viz} agents per graph")
     
     model.train()
     return filepath, avg_error

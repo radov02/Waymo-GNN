@@ -81,8 +81,8 @@ class HDF5TemporalDataset(Dataset):
         pos = torch.from_numpy(group["pos"][:]) if "pos" in group else None
         
         # Debug: Check if pos is being loaded
-        if idx == 0:  # Only print for first sample
-            print(f"  DEBUG: Loading first sample - 'pos' in group: {'pos' in group}, pos shape: {pos.shape if pos is not None else 'None'}")
+        #if idx == 0:  # Only print for first sample
+        #    print(f"  DEBUG: Loading first sample - 'pos' in group: {'pos' in group}, pos shape: {pos.shape if pos is not None else 'None'}")
 
         data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y, pos=pos)
         data.scenario_id = scenario_id      # attach metadata
