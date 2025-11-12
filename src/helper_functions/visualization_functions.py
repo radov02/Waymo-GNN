@@ -219,19 +219,58 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             if sdc_id in all_agent_ids:
                 sdc_idx_in_list = all_agent_ids.index(sdc_id)
         
-        # Select subset of agent IDs to track, always including SDC
+        # Calculate movement score for each agent (how much they move)
+        # This helps us select the most interesting agents to visualize
+        agent_movement_scores = {}
+        movement_threshold = 0.5  # meters - movement less than this is considered "stopped"
+        
+        for agent_id in all_agent_ids:
+            # Collect all positions for this agent across timesteps
+            positions = []
+            for t_idx in range(total_T):
+                graph = batched_graph_sequence[t_idx]
+                batch_mask = graph.batch == graph_idx
+                
+                if batch_mask.sum() > 0 and hasattr(graph, 'agent_ids'):
+                    timestep_agent_ids = [graph.agent_ids[i] for i in range(len(graph.agent_ids)) if batch_mask[i]]
+                    if agent_id in timestep_agent_ids:
+                        local_idx = timestep_agent_ids.index(agent_id)
+                        global_idx = torch.where(batch_mask)[0][local_idx]
+                        pos = graph.pos[global_idx].cpu().numpy()
+                        positions.append(pos)
+            
+            # Calculate total movement (sum of distances between consecutive valid positions)
+            total_movement = 0.0
+            valid_steps = 0
+            if len(positions) > 1:
+                for i in range(len(positions) - 1):
+                    dist = np.linalg.norm(positions[i+1] - positions[i])
+                    if dist > movement_threshold:  # Only count significant movements
+                        total_movement += dist
+                        valid_steps += 1
+            
+            agent_movement_scores[agent_id] = (total_movement, valid_steps)
+        
+        # Select subset of agent IDs to track, prioritizing moving agents
         if len(all_agent_ids) > max_nodes_per_graph_viz:
+            # Always include SDC
             if sdc_idx_in_list is not None:
-                # Include SDC first, then evenly sample others
                 other_ids = [aid for i, aid in enumerate(all_agent_ids) if i != sdc_idx_in_list]
                 num_others = max_nodes_per_graph_viz - 1
-                if len(other_ids) > num_others:
-                    other_selected = np.linspace(0, len(other_ids) - 1, num_others, dtype=int)
-                    other_ids = [other_ids[i] for i in other_selected]
-                selected_agent_ids = [all_agent_ids[sdc_idx_in_list]] + other_ids
+                
+                # Sort other agents by movement score (total_movement, then valid_steps)
+                other_ids_sorted = sorted(other_ids, 
+                                         key=lambda aid: agent_movement_scores[aid], 
+                                         reverse=True)
+                
+                # Take the most moving agents
+                selected_agent_ids = [all_agent_ids[sdc_idx_in_list]] + other_ids_sorted[:num_others]
             else:
-                selected_indices = np.linspace(0, len(all_agent_ids) - 1, max_nodes_per_graph_viz, dtype=int)
-                selected_agent_ids = [all_agent_ids[i] for i in selected_indices]
+                # No SDC, just take the most moving agents
+                all_agent_ids_sorted = sorted(all_agent_ids, 
+                                             key=lambda aid: agent_movement_scores[aid], 
+                                             reverse=True)
+                selected_agent_ids = all_agent_ids_sorted[:max_nodes_per_graph_viz]
         else:
             selected_agent_ids = all_agent_ids
         
@@ -408,13 +447,35 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             pred_next_pos = data['pred_next']
             agent_ids_in_data = data['agent_ids']
             
-            # Draw predicted trajectories from current position to predicted next (1 timestep ahead)
+            # Draw actual historical trajectory (all previous positions up to current)
             for idx, agent_id in enumerate(agent_ids_in_data):
                 color = agent_colors[agent_id]
                 is_sdc = (agent_id == sdc_id)
                 
+                # Collect all past positions for this agent (only valid ones)
+                historical_positions = []
+                for past_t in range(t + 1):  # 0 to current timestep
+                    past_data = graph_data_per_timestep[past_t]
+                    if past_data is not None and agent_id in past_data['agent_ids']:
+                        past_idx = past_data['agent_ids'].index(agent_id)
+                        past_pos = past_data['curr'][past_idx]
+                        # Only add position if valid (not NaN) - stops trajectory when agent becomes invalid
+                        if not torch.isnan(past_pos).any():
+                            historical_positions.append(past_pos.numpy())
+                        else:
+                            # Agent became invalid, clear history to break the trajectory
+                            historical_positions = []
+                
+                # Draw actual trajectory line through all historical positions
+                if len(historical_positions) > 1:
+                    historical_positions = np.array(historical_positions)
+                    linewidth = 1.2 if is_sdc else 1.0
+                    ax.plot(historical_positions[:, 0], historical_positions[:, 1], 
+                           color=color, linewidth=linewidth, alpha=0.8, linestyle='-', zorder=3,
+                           label='Actual Trajectory' if idx == 0 and t == 0 else None)
+                
+                # Draw 1-step prediction
                 curr_xy = curr_pos[idx]
-                actual_next_xy = actual_next_pos[idx]
                 pred_next_xy = pred_next_pos[idx]
                 
                 # Skip if agent not present (NaN)
@@ -422,21 +483,14 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                     continue
                 
                 curr_xy = curr_xy.numpy()
-                actual_next_xy = actual_next_xy.numpy()
                 pred_next_xy = pred_next_xy.numpy()
                 
-                # Predicted trajectory (dotted line) - from current position to predicted next
-                linewidth = 3.5 if is_sdc else 3.0
+                # Predicted next position (dotted line) - from current to predicted next
+                linewidth = 1.2 if is_sdc else 1.0
                 ax.plot([curr_xy[0], pred_next_xy[0]], 
                        [curr_xy[1], pred_next_xy[1]], 
-                       color=color, linewidth=linewidth, alpha=1.0, linestyle=':', zorder=3,
-                       label='Predicted Trajectory' if idx == 0 and t == 0 else None)
-                
-                # Actual trajectory (solid line) - from current to actual next (ground truth)
-                ax.plot([curr_xy[0], actual_next_xy[0]], 
-                       [curr_xy[1], actual_next_xy[1]], 
-                       color=color, linewidth=linewidth, alpha=1.0, linestyle='-', zorder=3,
-                       label='Actual Trajectory' if idx == 0 and t == 0 else None)
+                       color=color, linewidth=linewidth, alpha=0.8, linestyle=':', zorder=3,
+                       label='Predicted Step' if idx == 0 and t == 0 else None)
             
             # Plot each selected agent
             for idx, agent_id in enumerate(agent_ids_in_data):
@@ -455,23 +509,46 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 actual_next_xy = actual_next_xy.numpy()
                 pred_next_xy = pred_next_xy.numpy()
                 
-                # Plot current position (star for SDC, circle for others)
-                if is_sdc:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=150, 
-                              marker='*', alpha=1.0, zorder=5, 
-                              edgecolors='darkgreen', linewidths=2.5,
-                              label='SDC Current' if idx == 0 else None)
-                else:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=60, 
-                              marker='o', alpha=1.0, zorder=5, 
-                              edgecolors='white', linewidths=1.2,
-                              label='Current' if idx == 1 else None)
+                # Check if agent is stopped at this timestep (hasn't moved from previous position)
+                is_stopped = False
+                if t > 0:  # Can only check if we have a previous timestep
+                    prev_data = graph_data_per_timestep[t - 1]
+                    if prev_data is not None and agent_id in prev_data['agent_ids']:
+                        prev_idx = prev_data['agent_ids'].index(agent_id)
+                        prev_pos = prev_data['curr'][prev_idx]
+                        if not torch.isnan(prev_pos).any():
+                            prev_xy = prev_pos.numpy()
+                            # Check if agent moved less than 0.1m from previous timestep
+                            movement = np.linalg.norm(curr_xy - prev_xy)
+                            is_stopped = movement < 0.1  # Stopped threshold: 0.1 meters
                 
-                # Plot predicted next position (hollow circle)
-                marker_size = 50 if is_sdc else 40
-                linewidth = 3.0 if is_sdc else 2.5
+                # Plot current position (star for SDC, circle for others) - smaller markers
+                if is_sdc:
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=80, 
+                              marker='*', alpha=1.0, zorder=5, 
+                              edgecolors='darkgreen', linewidths=1.5,
+                              label='SDC Current' if idx == 0 else None)
+                    # Add "s" text inside marker if stopped
+                    if is_stopped:
+                        ax.text(curr_xy[0], curr_xy[1], 's', 
+                               fontsize=6, ha='center', va='center', 
+                               color='red', weight='bold', zorder=6)
+                else:
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=30, 
+                              marker='o', alpha=1.0, zorder=5, 
+                              edgecolors='white', linewidths=0.8,
+                              label='Current' if idx == 1 else None)
+                    # Add "s" text inside marker if stopped
+                    if is_stopped:
+                        ax.text(curr_xy[0], curr_xy[1], 's', 
+                               fontsize=5, ha='center', va='center', 
+                               color='red', weight='bold', zorder=6)
+                
+                # Plot predicted next position (hollow circle) - smaller markers
+                marker_size = 30 if is_sdc else 20
+                linewidth = 1.5 if is_sdc else 1.0
                 ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, 
-                          s=marker_size, marker='o', linewidths=linewidth, alpha=1.0, zorder=5,
+                          s=marker_size, marker='o', linewidths=linewidth, alpha=0.8, zorder=5,
                           label='Predicted Next' if idx == 0 else None)
                 
                 # Calculate error (distance between actual and predicted NEXT positions)

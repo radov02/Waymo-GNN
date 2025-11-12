@@ -3,6 +3,23 @@ from EvolveGCNH import EvolveGCNH
 from training import train
 from testing import test
 
+
+
+
+
+# TODO:
+# define model
+# train(model)
+# eval(model)
+# show results (and save them to wandb)
+
+
+
+
+
+
+
+
 model = EvolveGCNH(
             input_dim=config['input_dim'],
             hidden_dim=config['hidden_channels'],
