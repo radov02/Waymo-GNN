@@ -11,6 +11,179 @@ import matplotlib.pyplot as plt
 # Cache for loaded scenarios to avoid reloading the same scenario multiple times
 _scenario_cache = {}
 
+def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir=viz_scenario_dir, figsize=(16, 10)):
+    """Visualize a temporal sequence of graphs created from a scenario. Shows how the graph structure evolves over time."""
+    os.makedirs(save_dir, exist_ok=True)
+    T = len(graph_sequence)
+
+    sdc_track = scenario.tracks[scenario.sdc_track_index]
+    sdc_id = sdc_track.id
+    
+    max_timesteps_to_show = max_timesteps_to_show   # Create grid: show subset of timesteps (e.g., every 2nd or 3rd)
+    if T > max_timesteps_to_show:
+        timestep_indices = np.linspace(0, T-1, max_timesteps_to_show, dtype=int)
+    else:
+        timestep_indices = np.arange(T)
+    
+    num_plots = len(timestep_indices)
+    cols = 4
+    rows = (num_plots + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+    axes = axes.flatten()
+    
+    type_colors = {1: '#e74c3c', 2: '#3498db', 3: '#f39c12', 4: '#9b59b6'}
+    type_names = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
+    
+    # Gray color for all map features
+    map_feature_gray = '#808080'
+    
+    for plot_idx, t in enumerate(timestep_indices):
+        ax = axes[plot_idx]
+        graph = graph_sequence[t]
+        
+        for feature in scenario.map_features:       # Render map features (lightweight)
+            feature_type = feature.WhichOneof('feature_data')
+            
+            if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
+                x_coords = [point.x for point in feature.lane.polyline]
+                y_coords = [point.y for point in feature.lane.polyline]
+                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.3, zorder=1)
+            
+            elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
+                x_coords = [point.x for point in feature.road_edge.polyline]
+                y_coords = [point.y for point in feature.road_edge.polyline]
+                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.4, zorder=1)
+        
+        # Render graph edges
+        edge_index = graph.edge_index
+        pos = graph.pos.numpy()
+        
+        for i in range(edge_index.shape[1]):
+            src_idx = edge_index[0, i].item()
+            dst_idx = edge_index[1, i].item()
+            x_coords = [pos[src_idx, 0], pos[dst_idx, 0]]
+            y_coords = [pos[src_idx, 1], pos[dst_idx, 1]]
+            ax.plot(x_coords, y_coords, 'blue', linewidth=0.8, alpha=0.3, zorder=3)
+        
+        # Check if SDC is present in this graph
+        sdc_found = False
+        if hasattr(graph, 'agent_ids'):
+            # graph has agent_ids attribute (from Data creation)
+            agent_ids = graph.agent_ids
+            if sdc_id in agent_ids:
+                sdc_node_idx = agent_ids.index(sdc_id)
+                sdc_found = True
+        
+        # Render nodes (agent positions)
+        # Get agent types from node features (last 4 dimensions are one-hot)
+        node_features = graph.x.numpy()
+        for node_idx in range(graph.num_nodes):
+            x, y = pos[node_idx]
+            
+            # Determine agent type from one-hot encoding (indices 5-8)
+            type_onehot = node_features[node_idx, 5:9]
+            agent_type = np.argmax(type_onehot) + 1  # 1-indexed
+            color = type_colors.get(agent_type, '#95a5a6')
+            
+            # Check if this is the SDC node
+            is_sdc = False
+            if sdc_found and hasattr(graph, 'agent_ids') and node_idx == sdc_node_idx:
+                is_sdc = True
+            
+            if is_sdc:
+                # Special rendering for SDC: larger, green border, star marker
+                ax.scatter(x, y, c=color, s=100, marker='*', 
+                          edgecolors='#27ae60', linewidths=2.5, alpha=1.0, zorder=10)
+                # Add SDC label
+                ax.annotate('SDC', xy=(x, y), xytext=(8, 8), 
+                           textcoords='offset points', fontsize=7, 
+                           fontweight='bold', color='#27ae60',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                   edgecolor='#27ae60', alpha=0.9))
+            else:
+                # Normal agent rendering
+                ax.scatter(x, y, c=color, s=60, marker='o', 
+                          edgecolors='white', linewidths=1, alpha=0.9, zorder=5)
+        
+        # Check SDC validity and add warning if invalid
+        sdc_valid = t < len(sdc_track.states) and sdc_track.states[t].valid
+        
+        if not sdc_valid or not sdc_found:
+            # Add red warning banner
+            warning_text = "⚠ SDC INVALID" if not sdc_valid else "⚠ SDC NOT IN GRAPH"
+            ax.text(0.5, 0.95, warning_text, 
+                   transform=ax.transAxes, ha='center', va='top',
+                   fontsize=8, fontweight='bold', color='white',
+                   bbox=dict(boxstyle='round,pad=0.4', facecolor='red', alpha=0.9))
+        
+        # Add SDC coordinates in bottom right corner
+        if sdc_found and sdc_valid:
+            # Get SDC position from the graph
+            sdc_x, sdc_y = pos[sdc_node_idx]
+            coord_text = f'SDC: ({sdc_x:.1f}, {sdc_y:.1f})'
+            ax.text(0.98, 0.02, coord_text, 
+                   transform=ax.transAxes, ha='right', va='bottom',
+                   fontsize=7, fontweight='bold', color='#27ae60',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                           edgecolor='#27ae60', alpha=0.85, linewidth=1.5))
+        
+        # Formatting
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
+        ax.tick_params(labelsize=7)
+        
+        # Title
+        time_sec = scenario.timestamps_seconds[t] if t < len(scenario.timestamps_seconds) else 0
+        ax.set_title(f't={t} ({time_sec:.1f}s)\n{graph.num_nodes}N, {graph.num_edges}E', 
+                    fontsize=8, fontweight='bold')
+    
+    # Hide unused subplots
+    for idx in range(num_plots, len(axes)):
+        axes[idx].axis('off')
+    
+    # Overall title
+    method_str = f'{graph_creation_method} (r={radius}m)' if graph_creation_method == 'radius' else graph_creation_method
+    fig.suptitle(f'Graph Sequence Creation - Scenario: {scenario.scenario_id}\n'
+                f'Method: {method_str} | Total Timesteps: {T} | Showing: {num_plots} snapshots', 
+                fontsize=12, fontweight='bold', y=0.98)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    # Save
+    filename = f'graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png'
+    filepath = os.path.join(save_dir, filename)
+    plt.savefig(filepath, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+    
+    return filepath
+
+def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num_timesteps=15):
+    """Creates .png showing graphs for given scenario sequence"""
+    from config import radius, graph_creation_method, sequence_length
+    from helper_functions.graph_creation_functions import timestep_to_pyg_data
+    
+    print(f"Creating graph sequence visualization (from scenario {scenario.scenario_id}) into {save_dir} directory...")
+    try:
+        graph_sequence = []
+        print(f"sequence length: {sequence_length}, scenario.timestamps_seconds length: {len(scenario.timestamps_seconds)}")
+        for t in range(min(sequence_length-1, len(scenario.timestamps_seconds))):
+            graph = timestep_to_pyg_data(scenario, t, radius, use_valid_only=True, method=graph_creation_method)
+            if graph is not None:
+                graph_sequence.append(graph)
+            
+        if graph_sequence:
+            visualize_graph_sequence_creation(scenario, graph_sequence, num_timesteps, save_dir=save_dir)
+        else:
+            print("No valid graphs created for visualization")
+    except Exception as e:
+        print(f"Visualization failed: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")
+
 def load_scenario_by_id(scenario_id, scenario_dir="./data/scenario/training"):
     """
     Load a Waymo scenario from tfrecord files by scenario_id.
@@ -275,14 +448,26 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             selected_agent_ids = all_agent_ids
         
         # Assign consistent colors to each agent ID
+        # Use more vibrant colors that contrast well with gray map features
+        vibrant_colors = [
+            '#FF1744',  # Bright red
+            '#2979FF',  # Bright blue
+            '#FF9100',  # Bright amber (green removed - reserved for SDC only)
+            '#FF6D00',  # Bright orange
+            '#D500F9',  # Bright purple
+            '#FFEA00',  # Bright yellow
+            '#00E5FF',  # Bright cyan
+            '#FF4081',  # Bright pink
+        ]
+        
         agent_colors = {}
         for idx, agent_id in enumerate(selected_agent_ids):
             if agent_id == sdc_id:
-                agent_colors[agent_id] = '#27ae60'  # Green for SDC
+                agent_colors[agent_id] = '#00C853'  # Bright green for SDC (more vibrant than before)
             else:
-                # Use tab20 colormap for other agents
-                color_idx = idx / max(len(selected_agent_ids) - 1, 1)
-                agent_colors[agent_id] = plt.cm.tab20(color_idx)
+                # Cycle through vibrant colors
+                color_idx = (idx - 1) % len(vibrant_colors) if sdc_id in selected_agent_ids else idx % len(vibrant_colors)
+                agent_colors[agent_id] = vibrant_colors[color_idx]
         
         # Get nodes for this graph across all timesteps
         graph_data_per_timestep = []
@@ -344,48 +529,38 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 graph_data_per_timestep.append(None)
         
         # Calculate axis limits for this graph sequence (entire row)
-        # Include map features if available for proper zoom
+        # Focus on ACTUAL agent positions only (not predictions)
+        # Predictions that go outside will just be clipped/not shown
         all_x_coords = []
         all_y_coords = []
         
-        # Add agent positions
+        # Add only ACTUAL agent positions (current and actual_next)
+        # Do NOT include predictions - let them fall outside if they're wrong
         for data in graph_data_per_timestep:
             if data is not None:
                 curr_pos = data['curr']
                 actual_next_pos = data['actual_next']
-                pred_next_pos = data['pred_next']
+                # Only use actual positions, not predictions
                 all_x_coords.extend(curr_pos[:, 0].tolist())
                 all_y_coords.extend(curr_pos[:, 1].tolist())
                 all_x_coords.extend(actual_next_pos[:, 0].tolist())
                 all_y_coords.extend(actual_next_pos[:, 1].tolist())
-                all_x_coords.extend(pred_next_pos[:, 0].tolist())
-                all_y_coords.extend(pred_next_pos[:, 1].tolist())
         
-        # Add map feature bounds if scenario available
-        if scenario is not None:
-            for feature in scenario.map_features:
-                feature_type = feature.WhichOneof('feature_data')
-                
-                if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
-                    all_x_coords.extend([point.x for point in feature.lane.polyline])
-                    all_y_coords.extend([point.y for point in feature.lane.polyline])
-                
-                elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
-                    all_x_coords.extend([point.x for point in feature.road_edge.polyline])
-                    all_y_coords.extend([point.y for point in feature.road_edge.polyline])
+        # DON'T include predictions or all map features in zoom calculation
+        # Only zoom to actual agent movements
         
-        # Standardized axis limits with minimal padding to fit map features
+        # Standardized axis limits with padding around actual agent positions
         if all_x_coords and all_y_coords:
             x_min, x_max = min(all_x_coords), max(all_x_coords)
             y_min, y_max = min(all_y_coords), max(all_y_coords)
             
-            # Calculate range and use minimal padding
+            # Calculate range and use generous padding to show surrounding context
             x_range = x_max - x_min
             y_range = y_max - y_min
             
-            # Use 5% padding or 2m minimum (tight fit for map features)
-            x_padding = max(x_range * 0.05, 2.0)
-            y_padding = max(y_range * 0.05, 2.0)
+            # Use 20% padding or 20m minimum (show context around action)
+            x_padding = max(x_range * 0.2, 20.0)
+            y_padding = max(y_range * 0.2, 20.0)
             
             x_lim = (x_min - x_padding, x_max + x_padding)
             y_lim = (y_min - y_padding, y_max + y_padding)
@@ -398,7 +573,8 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             
             # Plot map features (only once per subplot)
             # Map features are in raw world coordinates (meters), not normalized
-            if scenario is not None:
+            # Only draw features that are within or near the action area (x_lim, y_lim)
+            if scenario is not None and x_lim is not None and y_lim is not None:
                 map_features_drawn = 0
                 for feature in scenario.map_features:
                     feature_type = feature.WhichOneof('feature_data')
@@ -406,33 +582,45 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                     if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
                         x_coords = [point.x for point in feature.lane.polyline]
                         y_coords = [point.y for point in feature.lane.polyline]
-                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.5, alpha=0.15, zorder=1)
-                        map_features_drawn += 1
+                        # Check if any point is within the visible area
+                        if any(x_lim[0] <= x <= x_lim[1] and y_lim[0] <= y <= y_lim[1] 
+                               for x, y in zip(x_coords, y_coords)):
+                            ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.5, alpha=0.15, zorder=1)
+                            map_features_drawn += 1
                     
                     elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                         x_coords = [point.x for point in feature.road_edge.polyline]
                         y_coords = [point.y for point in feature.road_edge.polyline]
-                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=2.0, alpha=0.2, zorder=1)
-                        map_features_drawn += 1
+                        # Check if any point is within the visible area
+                        if any(x_lim[0] <= x <= x_lim[1] and y_lim[0] <= y <= y_lim[1] 
+                               for x, y in zip(x_coords, y_coords)):
+                            ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=2.0, alpha=0.2, zorder=1)
+                            map_features_drawn += 1
                     
                     elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
                         x_coords = [point.x for point in feature.road_line.polyline]
                         y_coords = [point.y for point in feature.road_line.polyline]
-                        # Use dashed line for road markings
-                        ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.0, 
-                               linestyle='--', alpha=0.15, zorder=1)
-                        map_features_drawn += 1
+                        # Check if any point is within the visible area
+                        if any(x_lim[0] <= x <= x_lim[1] and y_lim[0] <= y <= y_lim[1] 
+                               for x, y in zip(x_coords, y_coords)):
+                            # Use dashed line for road markings
+                            ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=1.0, 
+                                   linestyle='--', alpha=0.15, zorder=1)
+                            map_features_drawn += 1
                     
                     elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
                         x_coords = [point.x for point in feature.crosswalk.polygon]
                         y_coords = [point.y for point in feature.crosswalk.polygon]
-                        x_coords.append(x_coords[0])
-                        y_coords.append(y_coords[0])
-                        ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.1, zorder=1)
-                        map_features_drawn += 1
+                        # Check if any point is within the visible area
+                        if any(x_lim[0] <= x <= x_lim[1] and y_lim[0] <= y <= y_lim[1] 
+                               for x, y in zip(x_coords, y_coords)):
+                            x_coords.append(x_coords[0])
+                            y_coords.append(y_coords[0])
+                            ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.1, zorder=1)
+                            map_features_drawn += 1
                 
                 if t == 0 and graph_idx == 0:
-                    print(f"  Drew {map_features_drawn} map features on first subplot")
+                    print(f"  Drew {map_features_drawn} map features on first subplot (filtered to action area)")
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]
@@ -466,13 +654,34 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                             # Agent became invalid, clear history to break the trajectory
                             historical_positions = []
                 
-                # Draw actual trajectory line through all historical positions
+                # Draw actual trajectory line through all historical positions (past)
                 if len(historical_positions) > 1:
                     historical_positions = np.array(historical_positions)
                     linewidth = 1.2 if is_sdc else 1.0
                     ax.plot(historical_positions[:, 0], historical_positions[:, 1], 
                            color=color, linewidth=linewidth, alpha=0.8, linestyle='-', zorder=3,
-                           label='Actual Trajectory' if idx == 0 and t == 0 else None)
+                           label='Actual Past Trajectory' if idx == 0 and t == 0 else None)
+                
+                # Collect all future positions for this agent (ground truth future)
+                future_positions = []
+                for future_t in range(t, T):  # current to last displayed timestep
+                    future_data = graph_data_per_timestep[future_t]
+                    if future_data is not None and agent_id in future_data['agent_ids']:
+                        future_idx = future_data['agent_ids'].index(agent_id)
+                        future_pos = future_data['curr'][future_idx]
+                        if not torch.isnan(future_pos).any():
+                            future_positions.append(future_pos.numpy())
+                        else:
+                            # Agent became invalid, stop future trajectory
+                            break
+                
+                # Draw actual future trajectory line (ground truth)
+                if len(future_positions) > 1:
+                    future_positions = np.array(future_positions)
+                    linewidth = 1.2 if is_sdc else 1.0
+                    ax.plot(future_positions[:, 0], future_positions[:, 1], 
+                           color=color, linewidth=linewidth, alpha=0.5, linestyle='--', zorder=3,
+                           label='Actual Future Trajectory' if idx == 0 and t == 0 else None)
                 
                 # Draw 1-step prediction
                 curr_xy = curr_pos[idx]
@@ -485,11 +694,11 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 curr_xy = curr_xy.numpy()
                 pred_next_xy = pred_next_xy.numpy()
                 
-                # Predicted next position (dotted line) - from current to predicted next
+                # Predicted next position (black dashed line) - from current to predicted next
                 linewidth = 1.2 if is_sdc else 1.0
                 ax.plot([curr_xy[0], pred_next_xy[0]], 
                        [curr_xy[1], pred_next_xy[1]], 
-                       color=color, linewidth=linewidth, alpha=0.8, linestyle=':', zorder=3,
+                       color='black', linewidth=linewidth, alpha=0.6, linestyle='--', zorder=3,
                        label='Predicted Step' if idx == 0 and t == 0 else None)
             
             # Plot each selected agent
@@ -509,9 +718,9 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 actual_next_xy = actual_next_xy.numpy()
                 pred_next_xy = pred_next_xy.numpy()
                 
-                # Check if agent is stopped at this timestep (hasn't moved from previous position)
+                # Check if agent is stopped at this timestep
                 is_stopped = False
-                if t > 0:  # Can only check if we have a previous timestep
+                if t > 0:  # Check movement from previous timestep
                     prev_data = graph_data_per_timestep[t - 1]
                     if prev_data is not None and agent_id in prev_data['agent_ids']:
                         prev_idx = prev_data['agent_ids'].index(agent_id)
@@ -521,34 +730,51 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                             # Check if agent moved less than 0.1m from previous timestep
                             movement = np.linalg.norm(curr_xy - prev_xy)
                             is_stopped = movement < 0.1  # Stopped threshold: 0.1 meters
+                else:  # t=0: check if next movement is negligible
+                    if not np.isnan(actual_next_xy).any():
+                        next_movement = np.linalg.norm(actual_next_xy - curr_xy)
+                        is_stopped = next_movement < 0.1  # Stopped if next step < 0.1m
                 
-                # Plot current position (star for SDC, circle for others) - smaller markers
+                # Plot current position (very small dots for all agents)
                 if is_sdc:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=80, 
-                              marker='*', alpha=1.0, zorder=5, 
-                              edgecolors='darkgreen', linewidths=1.5,
-                              label='SDC Current' if idx == 0 else None)
-                    # Add "s" text inside marker if stopped
-                    if is_stopped:
-                        ax.text(curr_xy[0], curr_xy[1], 's', 
-                               fontsize=6, ha='center', va='center', 
-                               color='red', weight='bold', zorder=6)
-                else:
-                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=30, 
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=12, 
                               marker='o', alpha=1.0, zorder=5, 
-                              edgecolors='white', linewidths=0.8,
-                              label='Current' if idx == 1 else None)
-                    # Add "s" text inside marker if stopped
+                              edgecolors='darkgreen', linewidths=1.0,
+                              label='SDC Current' if idx == 0 else None)
+                    # Add "s" text inside marker if stopped (black color)
                     if is_stopped:
                         ax.text(curr_xy[0], curr_xy[1], 's', 
-                               fontsize=5, ha='center', va='center', 
-                               color='red', weight='bold', zorder=6)
+                               fontsize=4, ha='center', va='center', 
+                               color='black', weight='bold', zorder=6)
+                else:
+                    ax.scatter(curr_xy[0], curr_xy[1], color=color, s=6, 
+                              marker='o', alpha=1.0, zorder=5, 
+                              edgecolors='white', linewidths=0.5,
+                              label='Current' if idx == 1 else None)
+                    # Add "s" text inside marker if stopped (black color)
+                    if is_stopped:
+                        ax.text(curr_xy[0], curr_xy[1], 's', 
+                               fontsize=3, ha='center', va='center', 
+                               color='black', weight='bold', zorder=6)
                 
-                # Plot predicted next position (hollow circle) - smaller markers
-                marker_size = 30 if is_sdc else 20
-                linewidth = 1.5 if is_sdc else 1.0
-                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, 
-                          s=marker_size, marker='o', linewidths=linewidth, alpha=0.8, zorder=5,
+                # Plot actual next position as a small thin arrow from current to actual next
+                # Arrow shows where agent actually moves in the next timestep
+                dx = actual_next_xy[0] - curr_xy[0]
+                dy = actual_next_xy[1] - curr_xy[1]
+                arrow_width = 0.3 if is_sdc else 0.2
+                head_width = 1.5 if is_sdc else 1.0
+                head_length = 1.2 if is_sdc else 0.8
+                ax.arrow(curr_xy[0], curr_xy[1], dx, dy, 
+                        head_width=head_width, head_length=head_length, 
+                        fc='black', ec='black', alpha=0.8, linewidth=arrow_width, 
+                        zorder=5, length_includes_head=True,
+                        label='Actual Next Step' if idx == 0 else None)
+                
+                # Plot predicted next position (small hollow circle)
+                marker_size = 10 if is_sdc else 6
+                linewidth = 1.0 if is_sdc else 0.8
+                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors='black', 
+                          s=marker_size, marker='o', linewidths=linewidth, alpha=0.6, zorder=5,
                           label='Predicted Next' if idx == 0 else None)
                 
                 # Calculate error (distance between actual and predicted NEXT positions)
@@ -593,37 +819,22 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     # Overall average error
     avg_error = total_error / max(1, error_counts)
     
-    # Create custom legend with all visualization elements
+    # Create custom legend - only show trajectory/line types, not points or map features
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
     
     legend_elements = [
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='#27ae60', markersize=12, 
-               label='SDC (Self-Driving Car)', markeredgecolor='darkgreen', markeredgewidth=2),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=6, 
-               label='Current Position', markeredgewidth=0),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='none', markersize=8,
-               markeredgecolor='tab:blue', markeredgewidth=1.5, label='Predicted Next Position'),
         Line2D([0], [0], color='tab:blue', linewidth=2, linestyle='-', 
-               label='Actual Trajectory (solid)', alpha=0.7),
-        Line2D([0], [0], color='tab:blue', linewidth=2, linestyle=':', 
-               label='Predicted Trajectory (dotted)', alpha=0.7),
-        Line2D([0], [0], color='red', linewidth=2, label='Prediction Error', alpha=0.7),
+               label='Actual Past Trajectory', alpha=0.8),
+        Line2D([0], [0], color='tab:blue', linewidth=2, linestyle='--', 
+               label='Actual Future Trajectory', alpha=0.5),
+        Line2D([0], [0], color='black', linewidth=2, linestyle='--', 
+               label='Predicted Next Step', alpha=0.6),
     ]
-    
-    # Add map feature legend items if scenario is present
-    if scenario is not None:
-        legend_elements.extend([
-            Line2D([0], [0], color=map_feature_gray, linewidth=1.5, alpha=0.4, label='Lane'),
-            Line2D([0], [0], color=map_feature_gray, linewidth=2.0, alpha=0.5, label='Road Edge'),
-            Line2D([0], [0], color=map_feature_gray, linewidth=1.0, linestyle='--', alpha=0.4, label='Road Marking'),
-            Patch(facecolor=map_feature_gray, alpha=0.3, label='Crosswalk'),
-        ])
     
     # Add legend to the figure (outside the subplots)
     fig.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(0.01, 0.98),
-               ncol=3 if scenario is not None else 2, fontsize=9, framealpha=0.95,
-               title='Legend', title_fontsize=10)
+               ncol=3, fontsize=10, framealpha=0.95,
+               title='Trajectory Types', title_fontsize=11)
     
     # Add overall title with more spacing
     map_note = ' with Map Features' if scenario is not None else ''
@@ -647,179 +858,6 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     
     model.train()
     return filepath, avg_error
-
-def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir=viz_scenario_dir, figsize=(16, 10)):
-    """Visualize a temporal sequence of graphs created from a scenario. Shows how the graph structure evolves over time."""
-    os.makedirs(save_dir, exist_ok=True)
-    T = len(graph_sequence)
-
-    sdc_track = scenario.tracks[scenario.sdc_track_index]
-    sdc_id = sdc_track.id
-    
-    max_timesteps_to_show = max_timesteps_to_show   # Create grid: show subset of timesteps (e.g., every 2nd or 3rd)
-    if T > max_timesteps_to_show:
-        timestep_indices = np.linspace(0, T-1, max_timesteps_to_show, dtype=int)
-    else:
-        timestep_indices = np.arange(T)
-    
-    num_plots = len(timestep_indices)
-    cols = 4
-    rows = (num_plots + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=figsize)
-    if rows == 1:
-        axes = axes.reshape(1, -1)
-    axes = axes.flatten()
-    
-    type_colors = {1: '#e74c3c', 2: '#3498db', 3: '#f39c12', 4: '#9b59b6'}
-    type_names = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    
-    # Gray color for all map features
-    map_feature_gray = '#808080'
-    
-    for plot_idx, t in enumerate(timestep_indices):
-        ax = axes[plot_idx]
-        graph = graph_sequence[t]
-        
-        for feature in scenario.map_features:       # Render map features (lightweight)
-            feature_type = feature.WhichOneof('feature_data')
-            
-            if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
-                x_coords = [point.x for point in feature.lane.polyline]
-                y_coords = [point.y for point in feature.lane.polyline]
-                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.3, zorder=1)
-            
-            elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
-                x_coords = [point.x for point in feature.road_edge.polyline]
-                y_coords = [point.y for point in feature.road_edge.polyline]
-                ax.plot(x_coords, y_coords, color=map_feature_gray, linewidth=0.5, alpha=0.4, zorder=1)
-        
-        # Render graph edges
-        edge_index = graph.edge_index
-        pos = graph.pos.numpy()
-        
-        for i in range(edge_index.shape[1]):
-            src_idx = edge_index[0, i].item()
-            dst_idx = edge_index[1, i].item()
-            x_coords = [pos[src_idx, 0], pos[dst_idx, 0]]
-            y_coords = [pos[src_idx, 1], pos[dst_idx, 1]]
-            ax.plot(x_coords, y_coords, 'blue', linewidth=0.8, alpha=0.3, zorder=3)
-        
-        # Check if SDC is present in this graph
-        sdc_found = False
-        if hasattr(graph, 'agent_ids'):
-            # graph has agent_ids attribute (from Data creation)
-            agent_ids = graph.agent_ids
-            if sdc_id in agent_ids:
-                sdc_node_idx = agent_ids.index(sdc_id)
-                sdc_found = True
-        
-        # Render nodes (agent positions)
-        # Get agent types from node features (last 4 dimensions are one-hot)
-        node_features = graph.x.numpy()
-        for node_idx in range(graph.num_nodes):
-            x, y = pos[node_idx]
-            
-            # Determine agent type from one-hot encoding (indices 5-8)
-            type_onehot = node_features[node_idx, 5:9]
-            agent_type = np.argmax(type_onehot) + 1  # 1-indexed
-            color = type_colors.get(agent_type, '#95a5a6')
-            
-            # Check if this is the SDC node
-            is_sdc = False
-            if sdc_found and hasattr(graph, 'agent_ids') and node_idx == sdc_node_idx:
-                is_sdc = True
-            
-            if is_sdc:
-                # Special rendering for SDC: larger, green border, star marker
-                ax.scatter(x, y, c=color, s=100, marker='*', 
-                          edgecolors='#27ae60', linewidths=2.5, alpha=1.0, zorder=10)
-                # Add SDC label
-                ax.annotate('SDC', xy=(x, y), xytext=(8, 8), 
-                           textcoords='offset points', fontsize=7, 
-                           fontweight='bold', color='#27ae60',
-                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
-                                   edgecolor='#27ae60', alpha=0.9))
-            else:
-                # Normal agent rendering
-                ax.scatter(x, y, c=color, s=60, marker='o', 
-                          edgecolors='white', linewidths=1, alpha=0.9, zorder=5)
-        
-        # Check SDC validity and add warning if invalid
-        sdc_valid = t < len(sdc_track.states) and sdc_track.states[t].valid
-        
-        if not sdc_valid or not sdc_found:
-            # Add red warning banner
-            warning_text = "⚠ SDC INVALID" if not sdc_valid else "⚠ SDC NOT IN GRAPH"
-            ax.text(0.5, 0.95, warning_text, 
-                   transform=ax.transAxes, ha='center', va='top',
-                   fontsize=8, fontweight='bold', color='white',
-                   bbox=dict(boxstyle='round,pad=0.4', facecolor='red', alpha=0.9))
-        
-        # Add SDC coordinates in bottom right corner
-        if sdc_found and sdc_valid:
-            # Get SDC position from the graph
-            sdc_x, sdc_y = pos[sdc_node_idx]
-            coord_text = f'SDC: ({sdc_x:.1f}, {sdc_y:.1f})'
-            ax.text(0.98, 0.02, coord_text, 
-                   transform=ax.transAxes, ha='right', va='bottom',
-                   fontsize=7, fontweight='bold', color='#27ae60',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
-                           edgecolor='#27ae60', alpha=0.85, linewidth=1.5))
-        
-        # Formatting
-        ax.set_aspect('equal', adjustable='box')
-        ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-        ax.tick_params(labelsize=7)
-        
-        # Title
-        time_sec = scenario.timestamps_seconds[t] if t < len(scenario.timestamps_seconds) else 0
-        ax.set_title(f't={t} ({time_sec:.1f}s)\n{graph.num_nodes}N, {graph.num_edges}E', 
-                    fontsize=8, fontweight='bold')
-    
-    # Hide unused subplots
-    for idx in range(num_plots, len(axes)):
-        axes[idx].axis('off')
-    
-    # Overall title
-    method_str = f'{graph_creation_method} (r={radius}m)' if graph_creation_method == 'radius' else graph_creation_method
-    fig.suptitle(f'Graph Sequence Creation - Scenario: {scenario.scenario_id}\n'
-                f'Method: {method_str} | Total Timesteps: {T} | Showing: {num_plots} snapshots', 
-                fontsize=12, fontweight='bold', y=0.98)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    
-    # Save
-    filename = f'graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png'
-    filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=120, bbox_inches='tight')
-    plt.close(fig)
-    
-    return filepath
-
-def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num_timesteps=15):
-    """Creates .png showing graphs for given scenario sequence"""
-    from config import radius, graph_creation_method, sequence_length
-    from helper_functions.graph_creation_functions import timestep_to_pyg_data
-    
-    print(f"Creating graph sequence visualization (from scenario {scenario.scenario_id}) into {save_dir} directory...")
-    try:
-        graph_sequence = []
-        print(f"sequence length: {sequence_length}, scenario.timestamps_seconds length: {len(scenario.timestamps_seconds)}")
-        for t in range(min(sequence_length-1, len(scenario.timestamps_seconds))):
-            graph = timestep_to_pyg_data(scenario, t, radius, use_valid_only=True, method=graph_creation_method)
-            if graph is not None:
-                graph_sequence.append(graph)
-            
-        if graph_sequence:
-            visualize_graph_sequence_creation(scenario, graph_sequence, num_timesteps, save_dir=save_dir)
-        else:
-            print("No valid graphs created for visualization")
-    except Exception as e:
-        print(f"Visualization failed: {e}")
-        import traceback
-        traceback.print_exc()
-    print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")
 
 def visualize_epoch(epoch, viz_batch, model, device, wandb):
     should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0

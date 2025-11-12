@@ -26,9 +26,10 @@ dropout = 0.3
 
 # training:
 batch_size = 1
-learning_rate = 0.01  # Higher LR now that data is normalized
+learning_rate = 0.02  # Higher LR now that data is normalized
 epochs = 20
 gradient_clip_value = 5.0  # Less aggressive clipping
+loss_alpha = 0.7  # Directional loss weight: 0.7=70% MSE + 30% angular, tune between 0.5-0.8
 
 # wandb:
 project_name = "waymo-project"
