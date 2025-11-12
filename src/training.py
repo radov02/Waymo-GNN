@@ -65,6 +65,28 @@ if __name__ == '__main__':
     viz_batch = None
     viz_scenario = None
     viz_batch_saved = False
+    
+    # Load first scenario for map visualization
+    try:
+        import tensorflow as tf
+        from waymo_open_dataset.protos import scenario_pb2
+        from pathlib import Path
+        
+        # Find first tfrecord file
+        scenario_dir = Path("./data/scenario/training")
+        tfrecord_files = sorted(scenario_dir.glob("*.tfrecord"))
+        
+        if tfrecord_files:
+            print(f"Loading first scenario from {tfrecord_files[0]} for visualization...")
+            scenario_dataset = tf.data.TFRecordDataset(str(tfrecord_files[0]), compression_type='')
+            
+            for raw_record in scenario_dataset:
+                viz_scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
+                print(f"  Loaded scenario {viz_scenario.scenario_id} with {len(viz_scenario.map_features)} map features")
+                break  # Just load the first one
+    except Exception as e:
+        print(f"Warning: Could not load scenario for visualization: {e}")
+        print("  Visualization will not include map features")
 
     for epoch in range(training_wandb_run.config['epochs']):
         model.train()

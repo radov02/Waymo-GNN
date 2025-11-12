@@ -203,26 +203,26 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                         x_coords = [point.x for point in feature.lane.polyline]
                         y_coords = [point.y for point in feature.lane.polyline]
                         color = lane_type_colors.get(lane_type, '#95a5a6')
-                        ax.plot(x_coords, y_coords, color=color, linewidth=1.0, alpha=0.3, zorder=1)
+                        ax.plot(x_coords, y_coords, color=color, linewidth=2.0, alpha=0.6, zorder=1)
                     
                     elif feature_type == 'road_edge' and hasattr(feature.road_edge, 'polyline'):
                         x_coords = [point.x for point in feature.road_edge.polyline]
                         y_coords = [point.y for point in feature.road_edge.polyline]
-                        ax.plot(x_coords, y_coords, color='#2c3e50', linewidth=1.5, alpha=0.4, zorder=1)
+                        ax.plot(x_coords, y_coords, color='#2c3e50', linewidth=2.5, alpha=0.7, zorder=1)
                     
                     elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
                         x_coords = [point.x for point in feature.road_line.polyline]
                         y_coords = [point.y for point in feature.road_line.polyline]
                         # Use dashed line for road markings
-                        ax.plot(x_coords, y_coords, color='white', linewidth=0.8, 
-                               linestyle='--', alpha=0.5, zorder=1)
+                        ax.plot(x_coords, y_coords, color='white', linewidth=1.5, 
+                               linestyle='--', alpha=0.8, zorder=1)
                     
                     elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
                         x_coords = [point.x for point in feature.crosswalk.polygon]
                         y_coords = [point.y for point in feature.crosswalk.polygon]
                         x_coords.append(x_coords[0])
                         y_coords.append(y_coords[0])
-                        ax.fill(x_coords, y_coords, color='yellow', alpha=0.3, zorder=1)
+                        ax.fill(x_coords, y_coords, color='yellow', alpha=0.5, zorder=1)
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]
@@ -247,16 +247,16 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                     for idx, node_idx in enumerate(node_indices):
                         color = node_colors[idx]
                         
-                        # Actual trajectory (solid line)
+                        # Actual trajectory (solid line, more visible)
                         ax.plot([prev_actual[node_idx, 0], curr_pos[node_idx, 0]], 
                                [prev_actual[node_idx, 1], curr_pos[node_idx, 1]], 
-                               color=color, linewidth=1.5, alpha=0.4, linestyle='-', zorder=1,
+                               color=color, linewidth=2.5, alpha=0.7, linestyle='-', zorder=2,
                                label='Actual Trajectory' if idx == 0 and t == 1 else None)
                         
-                        # Predicted trajectory (dashed line)
+                        # Predicted trajectory (dashed line, more visible)
                         ax.plot([prev_pred[node_idx, 0], curr_pos[node_idx, 0]], 
                                [prev_pred[node_idx, 1], curr_pos[node_idx, 1]], 
-                               color=color, linewidth=1.5, alpha=0.4, linestyle=':', zorder=1,
+                               color=color, linewidth=2.5, alpha=0.7, linestyle=':', zorder=2,
                                label='Predicted Trajectory' if idx == 0 and t == 1 else None)
             
             # Plot each selected node
@@ -267,18 +267,18 @@ def visualize_training_progress(model, batch_dict, epoch, scenario=None, save_di
                 actual_next_xy = actual_next_pos[node_idx].numpy()
                 pred_next_xy = pred_next_pos[node_idx].numpy()
                 
-                # Plot current position (medium gray dot)
-                ax.scatter(curr_xy[0], curr_xy[1], color='gray', s=80, 
+                # Plot current position (small gray dot)
+                ax.scatter(curr_xy[0], curr_xy[1], color='gray', s=30, 
                           marker='o', alpha=0.6, zorder=3, label='Current' if idx == 0 else None)
                 
-                # Plot actual next position (large filled circle)
-                ax.scatter(actual_next_xy[0], actual_next_xy[1], color=color, s=120, 
-                          marker='o', edgecolors='black', linewidths=1.5, 
+                # Plot actual next position (medium filled circle)
+                ax.scatter(actual_next_xy[0], actual_next_xy[1], color=color, s=50, 
+                          marker='o', edgecolors='black', linewidths=1.0, 
                           alpha=0.9, zorder=5, label='Actual Next' if idx == 0 else None)
                 
-                # Plot predicted next position (large hollow circle)
-                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, s=120, 
-                          marker='o', linewidths=2.0, alpha=0.9, zorder=4,
+                # Plot predicted next position (medium hollow circle)
+                ax.scatter(pred_next_xy[0], pred_next_xy[1], facecolors='none', edgecolors=color, s=50, 
+                          marker='o', linewidths=1.5, alpha=0.9, zorder=4,
                           label='Predicted Next' if idx == 0 else None)
                 
                 # Draw thicker arrow from current to actual next (ground truth trajectory)

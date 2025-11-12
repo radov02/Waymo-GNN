@@ -37,7 +37,7 @@ dataset_name = "waymo open motion dataset v 1_3_0"
 # visualization during training:
 visualize_every_n_epochs = 1
 visualize_first_batch_only = False
-max_nodes_per_graph_viz = 10  # Max nodes to show per graph in visualization
+max_nodes_per_graph_viz = 5  # Max nodes to show per graph in visualization
 show_timesteps_viz = 9  # Show 9 evenly-spaced timesteps instead of all 90
 viz_base_dir = 'visualizations'
 viz_training_dir = 'visualizations/training'
