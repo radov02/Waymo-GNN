@@ -59,7 +59,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
         
         # Render graph edges
         edge_index = graph.edge_index
-        pos = graph.pos.numpy()
+        pos = graph.pos.cpu().numpy()
         
         for i in range(edge_index.shape[1]):
             src_idx = edge_index[0, i].item()
@@ -79,7 +79,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
         
         # Render nodes (agent positions)
         # Get agent types from node features (last 4 dimensions are one-hot)
-        node_features = graph.x.numpy()
+        node_features = graph.x.cpu().numpy()
         for node_idx in range(graph.num_nodes):
             x, y = pos[node_idx]
             
@@ -372,11 +372,12 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
         
         # Filter to vehicles only if configured
         if viz_vehicles_only and hasattr(first_graph, 'x'):
-            # Get node features for this graph
+            # Get node features for this graph (may be on GPU)
             node_features_first = first_graph.x[batch_mask_first]
             # Check if agent is vehicle (feature index 5 is vehicle one-hot)
             vehicle_mask = node_features_first[:, 5] == 1.0  # Index 5 is 'vehicle' in one-hot
-            vehicle_indices = torch.where(vehicle_mask)[0].numpy()
+            # Ensure we move indices to CPU before converting to numpy to avoid device errors
+            vehicle_indices = torch.where(vehicle_mask)[0].cpu().numpy()
             all_agent_ids = [all_agent_ids[i] for i in vehicle_indices]
         
         if len(all_agent_ids) == 0:

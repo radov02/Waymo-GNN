@@ -28,14 +28,22 @@ def get_local_filename(dataset, i):
     return Path(local_data_prefix) / dataset_name / dataset / f"{str(i).zfill(5)}.tfrecord"
 
 def get_waymo_bucket():
-    adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"   # Try to load credentials from default ADC file location
-    
-    if not adc_path.exists():
-        raise RuntimeError("Missing credentials. Please run: gcloud auth application-default login")
-    
-    with open(adc_path, 'r') as f:
-        adc_info = json.load(f)
-    
+    try:
+        adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"   # Try to load credentials from default ADC file location
+        
+        if not adc_path.exists():
+            raise RuntimeError("Missing credentials. Please run: gcloud auth application-default login")
+        
+        with open(adc_path, 'r') as f:
+            adc_info = json.load(f)
+    except:
+        import os
+        import base64
+        adc_b64 = os.environ.get("ADC_B64")
+        if not adc_b64:
+            raise RuntimeError("Missing ADC_B64 environment variable, login with `gcloud auth application-default login`")
+        adc_json = base64.b64decode(adc_b64).decode("utf-8")
+        adc_info = json.loads(adc_json)
     credentials = UserCredentials.from_authorized_user_info(adc_info)
     storage_client = storage.Client(project=project_id, credentials=credentials)    
 
