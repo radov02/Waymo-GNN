@@ -312,7 +312,9 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
             # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
-            pred_displacement_norm = model(graph.x, graph.edge_index, graph.batch, batch_size=B).cpu()
+            pred_displacement_norm = model(graph.x, graph.edge_index, 
+                                          edge_weight=graph.edge_attr, 
+                                          batch=graph.batch, batch_size=B).cpu()
             
             # Denormalize displacement and add to current position to get predicted next position
             pred_displacement = pred_displacement_norm * POSITION_SCALE

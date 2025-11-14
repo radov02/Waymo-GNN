@@ -176,7 +176,13 @@ def create_scenario_dataset_dict(files, prinT=False):
         print(f"Error processing files: {e}")
 
 def build_edge_index_using_radius(position_tensor, radius, self_loops=False, valid_mask=None, min_distance=0.0):
-    """Convert position tensor that holds (x,y) positions of agents into edge tensor (edge_index) OF SHAPE (2, E) for graph using radius."""
+    """Convert position tensor that holds (x,y) positions of agents into edge tensor (edge_index) OF SHAPE (2, E) for graph using radius.
+    Also computes edge weights based on distance: weight = exp(-distance / radius) for distance-based attention.
+    
+    Returns:
+        edge_index: [2, E] tensor of edges
+        edge_weight: [E] tensor of edge weights (higher for closer agents)
+    """
     pairwise_norm2_distances = torch.cdist(position_tensor, position_tensor)
     if valid_mask is not None:  # mask out pairs with invalid endpoints
         vm = torch.as_tensor(valid_mask, dtype=torch.bool, device=pairwise_norm2_distances.device)
@@ -190,10 +196,27 @@ def build_edge_index_using_radius(position_tensor, radius, self_loops=False, val
     edges_mask = (pairwise_norm2_distances <= float(radius)) & (pairwise_norm2_distances > float(min_distance))
     n1, n2 = torch.where(edges_mask)
     edge_index = torch.stack([n1, n2], dim=0)
-    return edge_index
+    
+    # Compute edge weights: closer agents have higher weights (exponential decay)
+    # This allows the model to prioritize information from nearby agents
+    edge_distances = pairwise_norm2_distances[edges_mask]
+    # Use a more moderate decay: exp(-distance^2 / (2 * radius^2)) for smoother weights
+    # This gives weights in range [exp(-0.5), 1] ≈ [0.61, 1.0] which is less extreme
+    edge_weight = torch.exp(-edge_distances**2 / (2 * radius**2))
+    
+    # Optional: normalize edge weights to prevent scale issues
+    # edge_weight = edge_weight / edge_weight.max() if edge_weight.numel() > 0 else edge_weight
+    
+    return edge_index, edge_weight
 
 def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None, valid_mask=None, min_distance=0.0):
-    """Create star graph topology with SDC as center node. All other agents connect to SDC."""
+    """Create star graph topology with SDC as center node. All other agents connect to SDC.
+    Also computes edge weights based on distance from SDC.
+    
+    Returns:
+        edge_index: [2, E] tensor of edges
+        edge_weight: [E] tensor of edge weights (higher for agents closer to SDC)
+    """
     
     # Get SDC track using direct index access (O(1) instead of O(n) loop)
     sdc_track = scenario.tracks[scenario.sdc_track_index]
@@ -223,8 +246,9 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
     else:
         vm = torch.ones(num_nodes, dtype=torch.bool, device=position_tensor.device)
     
-    # Build star graph edges (bidirectional)
+    # Build star graph edges (bidirectional) and compute weights
     edge_list = []
+    edge_distances = []
     for i in range(num_nodes):
         if i == sdc_idx:
             continue  # Skip self-loop to SDC
@@ -232,24 +256,35 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
         if not vm[i]:  # Skip invalid agents
             continue
         
+        # Calculate distance from SDC to agent
+        dist = torch.norm(position_tensor[sdc_idx] - position_tensor[i])
+        
         # Check minimum distance if specified
         if min_distance > 0.0:
-            dist = torch.norm(position_tensor[sdc_idx] - position_tensor[i])
             if dist <= min_distance:
                 continue
         
         # Add bidirectional edges: SDC -> agent and agent -> SDC
         edge_list.append([sdc_idx, i])
         edge_list.append([i, sdc_idx])
+        # Store distance for both directions (same weight)
+        edge_distances.append(dist.item())
+        edge_distances.append(dist.item())
     
     if len(edge_list) == 0:
-        # Return empty edge_index with correct shape
-        return torch.zeros((2, 0), dtype=torch.long, device=position_tensor.device)
+        # Return empty edge_index and edge_weight with correct shape
+        return (torch.zeros((2, 0), dtype=torch.long, device=position_tensor.device),
+                torch.zeros(0, dtype=torch.float32, device=position_tensor.device))
     
     # Convert to edge_index format [2, num_edges]
     edge_index = torch.tensor(edge_list, dtype=torch.long, device=position_tensor.device).t()
     
-    return edge_index
+    # Compute edge weights: exp(-distance^2 / (2*sigma^2)) for reasonable scale
+    edge_distances_tensor = torch.tensor(edge_distances, dtype=torch.float32, device=position_tensor.device)
+    sigma = 30.0  # Similar to radius in typical scenarios
+    edge_weight = torch.exp(-edge_distances_tensor**2 / (2 * sigma**2))
+    
+    return edge_index, edge_weight
 
 def initial_feature_vector(agent, timestep, normalize=True):
     """returns **list** of features for agent at given timestep
@@ -385,16 +420,17 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     positions_2D_tensor = torch.tensor(positions_2D, dtype=torch.float32)
 
     if method == 'radius':
-        edge_index = build_edge_index_using_radius(positions_2D_tensor, radius, valid_mask=valid_mask, min_distance=0.1)
+        edge_index, edge_weight = build_edge_index_using_radius(positions_2D_tensor, radius, valid_mask=valid_mask, min_distance=0.1)
     elif method == 'star':
-        edge_index = build_edge_index_using_star_graph(positions_2D_tensor, scenario, agent_ids=agent_ids, valid_mask=valid_mask)
+        edge_index, edge_weight = build_edge_index_using_star_graph(positions_2D_tensor, scenario, agent_ids=agent_ids, valid_mask=valid_mask)
 
     y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
-    # Create Data object with all attributes
+    # Create Data object with all attributes including edge_weight
     data = Data(
         x=torch.tensor(x, dtype=torch.float32), 
-        edge_index=edge_index, 
+        edge_index=edge_index,
+        edge_attr=edge_weight,  # Add edge weights based on distance
         pos=positions_2D_tensor, 
         y=y,
         scenario_id=scenario.scenario_id,

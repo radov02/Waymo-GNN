@@ -45,7 +45,7 @@ class EvolveGCNH(nn.Module):
         
         # Layer normalization for stabilization
         self.layer_norms = nn.ModuleList()
-        for i in range(num_layers - 1):  # Don't normalize final output
+        for i in range(num_layers - 1):  # we don't normalize final output
             self.layer_norms.append(nn.LayerNorm(hidden_dim))
         
         # GRU hidden states:
@@ -147,9 +147,12 @@ class EvolveGCNH(nn.Module):
         
         return torch.stack(summaries)  # [B, topk * feature_dim]
 
-    def forward(self, x, edge_index, batch=None, batch_size=None, batch_num=-1, timestep=-1):
-        """Takes node feature matrix x [num_nodes_total, input_dim/feature_dim], edge_index [2, num_edges_total] and batch assignment vector [num_nodes_total] indicating which graph each node belongs to. 
-        Returns node embeddings [num_nodes_total, output_dim], in our case [num_nodes_total, 2], predicted position displacements (in x and y directions) for each node."""
+    def forward(self, x, edge_index, edge_weight=None, batch=None, batch_size=None, batch_num=-1, timestep=-1):
+        """Takes node feature matrix x [num_nodes_total, input_dim/feature_dim], edge_index [2, num_edges_total], 
+        optional edge_weight [num_edges_total] and batch assignment vector [num_nodes_total] indicating which graph each node belongs to. 
+        Returns node embeddings [num_nodes_total, output_dim], in our case [num_nodes_total, 2], predicted position displacements (in x and y directions) for each node.
+        
+        Edge weights allow the model to prioritize information from closer agents (higher weights)."""
 
         device = x.device
 
@@ -184,7 +187,9 @@ class EvolveGCNH(nn.Module):
             evolved_params = self.gru_h[layer_idx].mean(dim=0)  # take mean across all batches for each trainable parameter
             self._set_GCN_params_from_vector(gcn, evolved_params)
 
-            h = gcn(h, edge_index)     # put node embeddings and edge_index into GCNConv layer to perform GCN convolutions
+            # GCN convolution with edge weights: closer agents have more influence
+            # If edge_weight is None, standard GCN convolution is used
+            h = gcn(h, edge_index, edge_weight=edge_weight)
 
             if layer_idx < self.num_layers - 1:
                 # Apply layer normalization before activation for stability
@@ -193,80 +198,3 @@ class EvolveGCNH(nn.Module):
                 h = torchFunctional.dropout(h, p=self.dropout, training=self.training)
         
         return h  # Shape: [num_nodes_total, output_dim]
-
-
-
-
-"""def _gru_matrix(self, input_matrix, hidden_matrix, gru_cell):
-        
-        Apply GRU cell in matrix form (process each column independently).
-        
-        Args:
-            input_matrix: Input matrix of shape [topk, num_params]
-            hidden_matrix: Hidden state matrix (GCN weights) of shape [num_params]
-            gru_cell: GRUCell instance
-            
-        Returns:
-            Updated hidden state (new GCN weights) of shape [num_params]
-        
-        # Flatten input matrix to vector by taking mean over topk dimension
-        # This matches the GRU input dimension
-        input_vector = input_matrix.mean(dim=0)  # [num_params]
-        
-        # Apply GRU cell
-        new_hidden = gru_cell(input_vector.unsqueeze(0), hidden_matrix.unsqueeze(0))
-        
-        return new_hidden.squeeze(0)"""
-
-"""for layer_index, (GCN, GRU, p) in enumerate(zip(self.gcn_layers, self.gru_cells, self.p)):        # Process each GCN layer
-            
-            # For each graph in the batch, compute summarized embeddings and evolve weights
-            new_weights_batch = []
-            
-            for b in range(B):
-                # Get nodes belonging to this graph
-                node_mask = (batch == b)
-                h_b = h[node_mask]  # Nodes for graph b
-                
-                # Compute and flatten summary nodes for this graph
-                Z_t = self._summarize_node_embeddings(h_b, self.topk, p)  # [topk, feature_dim]
-                Z_t_flat = Z_t.T.flatten()  # [feature_dim * topk]
-                
-                # Evolve the weights for this specific sequence:
-                # W^(l)_t[b] = GRU(summarized(H^(l)_t[b]), W^(l)_{t-1}[b])
-                new_weights_b = GRU(Z_t_flat.unsqueeze(0), self.gru_h[layer_index][b].unsqueeze(0))
-                new_weights_batch.append(new_weights_b.squeeze(0))
-            
-            # Stack weights for all sequences: [B, num_params]
-            self.gru_h[layer_index] = torch.stack(new_weights_batch, dim=0)
-            
-            # Apply GCN with evolved weights for each graph separately
-            h_outputs = []
-            for b in range(B):
-                node_mask = (batch == b)
-                h_b = h[node_mask]
-                
-                # Get edge indices for this graph
-                edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
-                edge_index_b = edge_index[:, edge_mask]
-                
-                # Remap node indices to local graph indices
-                node_mapping = torch.zeros(x.size(0), dtype=torch.long, device=device)
-                node_mapping[node_mask] = torch.arange(h_b.size(0), device=device)
-                edge_index_b_local = node_mapping[edge_index_b]
-                
-                # Set GCN weights for this graph
-                self._set_params_from_vector(GCN, self.gru_h[layer_index][b])
-                
-                # Apply graph convolution: H^(l+1)_t = σ(Â_t H^(l)_t W^(l)_t)
-                h_b = GCN(h_b, edge_index_b_local)
-                
-                h_outputs.append(h_b)
-            
-            # Concatenate outputs from all graphs
-            h = torch.cat(h_outputs, dim=0)
-
-            # Apply activation and dropout:
-            if layer_index < len(self.gcn_layers)-1:
-                h = torchFunctional.relu(h)
-                h = torchFunctional.dropout(h, p=self.dropout, training=self.training)"""

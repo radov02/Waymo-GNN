@@ -6,7 +6,7 @@ num_workers = 0
 debug_mode = False
 
 # data download:
-number_of_training_tfrecord_files = 2
+number_of_training_tfrecord_files = 10
 number_of_validation_tfrecord_files = 10
 number_of_testing_tfrecord_files = 10
 
@@ -15,6 +15,7 @@ radius = 30.0  # 30m is more reasonable for local interactions
 graph_creation_method = 'radius'  # 'radius' or 'star'
 sequence_length = 91
 max_num_scenarios_per_tfrecord_file = 1  # set to None if all
+use_edge_weights = False  # Set to False to disable distance-based edge weights
 
 # model:
 input_dim = 9       # 5 properties (x, y, vx, vy, valid) + 4 one-hot object type
@@ -29,7 +30,10 @@ batch_size = 1
 learning_rate = 0.005  # Lower LR to avoid mode collapse with directional loss
 epochs = 30  # Extended for better convergence with stronger directional loss
 gradient_clip_value = 5.0  # Less aggressive clipping
-loss_alpha = 0.4  # Directional loss weight: 0.4=40% MSE + 60% directional (angle+cosine)
+loss_alpha = 0.6  # ANGLE weight: 60% - DOMINANT! (correct direction is critical)
+loss_beta = 0.15  # MSE weight: 15% (magnitude)
+loss_gamma = 0.15  # Velocity consistency: 15% (physics prior - increased, diversity removed)
+loss_delta = 0.1  # Cosine similarity: 10% (backup directional signal)
 
 # wandb:
 project_name = "waymo-project"
