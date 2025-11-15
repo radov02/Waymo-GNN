@@ -152,7 +152,11 @@ class EvolveGCNH(nn.Module):
         optional edge_weight [num_edges_total] and batch assignment vector [num_nodes_total] indicating which graph each node belongs to. 
         Returns node embeddings [num_nodes_total, output_dim], in our case [num_nodes_total, 2], predicted position displacements (in x and y directions) for each node.
         
-        Edge weights allow the model to prioritize information from closer agents (higher weights)."""
+        Edge weights allow the model to prioritize information from closer agents (higher weights).
+        
+        IMPORTANT: Each scenario in the batch has its own temporal evolution!
+        The GRU hidden states maintain separate parameter trajectories for each scenario,
+        ensuring temporal dependencies are scenario-specific, not shared across batch."""
 
         device = x.device
 
@@ -172,29 +176,57 @@ class EvolveGCNH(nn.Module):
         if debug_mode: print(f"------ Forward pass for batch: {batch_num} at time {timestep}: ------------------")
 
         h = x   # H^(0)_t = X_t (input node features)
-        for layer_idx, gcn in enumerate(self.gcn_layers):
-            if debug_mode: print(f"\tlayer: {layer_idx}, gcn: {gcn}")
-
-            Z = self._summarize_batch_embeddings(h, batch, batch_size, self.topk, self.p[layer_idx])  # Shape: [B, topk * feature_dim]
-            
-            # GRU update: update/evolve hidden states (GCN weights) using learned GRU cell parameters
-            self.gru_h[layer_idx] = self.gru_cells[layer_idx](Z, self.gru_h[layer_idx])     # W_t^(k) = GRU(Z_t^(k), W_{t-1}^(k))
-
-            if debug_mode: print(f"\t\tself.gru_h[layer_idx] = W_t^(k) has shape [B, num_params]: {self.gru_h[layer_idx].shape}, \n\t\t\tself.gru_h[layer_idx][0][:10]: {self.gru_h[layer_idx][0][:10]}")
-            
-            # get parameters that were evolved by GRU (across scenarios for this timestep) and average them (or use another aggregation strategy)
-            # set these parameters of GRU as GCN parameters
-            evolved_params = self.gru_h[layer_idx].mean(dim=0)  # take mean across all batches for each trainable parameter
-            self._set_GCN_params_from_vector(gcn, evolved_params)
-
-            # GCN convolution with edge weights: closer agents have more influence
-            # If edge_weight is None, standard GCN convolution is used
-            h = gcn(h, edge_index, edge_weight=edge_weight)
-
-            if layer_idx < self.num_layers - 1:
-                # Apply layer normalization before activation for stability
-                h = self.layer_norms[layer_idx](h)
-                h = torchFunctional.relu(h)
-                h = torchFunctional.dropout(h, p=self.dropout, training=self.training)
         
-        return h  # Shape: [num_nodes_total, output_dim]
+        # we process each of B batched scenarios separately to maintain temporal specificity
+        outputs = []
+        for scenario_idx in range(batch_size):
+        
+            scenario_mask = (batch == scenario_idx)     # Get nodes for this scenario
+            scenario_nodes = h[scenario_mask]  # [num_nodes_in_scenario, feature_dim]
+            
+            # get edges for this scenario (filter edges where both endpoints are in this scenario):
+            node_indices = torch.where(scenario_mask)[0]
+            edge_mask = torch.isin(edge_index[0], node_indices) & torch.isin(edge_index[1], node_indices)
+            scenario_edge_index = edge_index[:, edge_mask]
+            
+            # remap edge indices to local scenario indices (0 to num_nodes_in_scenario-1)
+            old_to_new = torch.full((h.size(0),), -1, dtype=torch.long, device=device)
+            old_to_new[node_indices] = torch.arange(scenario_nodes.size(0), device=device)
+            scenario_edge_index = old_to_new[scenario_edge_index]
+            
+            scenario_edge_weight = edge_weight[edge_mask] if edge_weight is not None else None
+            
+            # process through GCN layers with scenario-specific evolved parameters:
+            h_scenario = scenario_nodes
+            for layer_idx, gcn in enumerate(self.gcn_layers):
+                if debug_mode and scenario_idx == 0: print(f"\tlayer: {layer_idx}, gcn: {gcn}")
+
+                # Summarize this scenario's embeddings
+                Z = self._summarize_node_embeddings(h_scenario, self.topk, self.p[layer_idx])  # [topk, feature_dim]
+                Z_flat = Z.flatten().unsqueeze(0)  # [1, topk * feature_dim]
+                
+                # GRU update for THIS scenario only
+                h_prev = self.gru_h[layer_idx][scenario_idx:scenario_idx+1]  # [1, num_params]
+                h_new = self.gru_cells[layer_idx](Z_flat, h_prev)  # [1, num_params]
+                self.gru_h[layer_idx][scenario_idx] = h_new.squeeze(0)
+
+                if debug_mode and scenario_idx == 0: 
+                    print(f"\t\tScenario {scenario_idx} evolved params shape: {h_new.shape}")
+                
+                # Set GCN parameters from THIS scenario's evolved state
+                self._set_GCN_params_from_vector(gcn, h_new.squeeze(0))
+
+                # GCN convolution
+                h_scenario = gcn(h_scenario, scenario_edge_index, edge_weight=scenario_edge_weight)
+
+                if layer_idx < self.num_layers - 1:
+                    h_scenario = self.layer_norms[layer_idx](h_scenario)
+                    h_scenario = torchFunctional.relu(h_scenario)
+                    h_scenario = torchFunctional.dropout(h_scenario, p=self.dropout, training=self.training)
+            
+            outputs.append(h_scenario)
+        
+        # Concatenate outputs back into batch format
+        h_out = torch.cat(outputs, dim=0)  # [num_nodes_total, output_dim]
+        
+        return h_out

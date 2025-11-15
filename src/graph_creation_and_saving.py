@@ -25,5 +25,3 @@ if __name__ == '__main__':
     save_scenarios_to_hdf5_streaming(testing_files_filepaths, './data/graphs/testing/testing.hdf5', max_num_scenarios_per_tfrecord_file=max_num_scenarios_per_tfrecord_file)
 
     #test_hdf5_and_lazy_loading('./data/graphs/training/training.hdf5')
-
-

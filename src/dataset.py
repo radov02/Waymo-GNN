@@ -5,8 +5,8 @@ from config import device
 from torch_geometric.data import Data
 
 class HDF5ScenarioDataset(Dataset):
-    #stores dataset in one HDF5 file, containing dataset items; 
-    #dataset item is a sequence of seq_len graphs/snapshots for one scenario
+    # stores dataset in one HDF5 file, containing dataset items; 
+    # dataset item is a sequence of seq_len graphs/snapshots for one scenario
     def __init__(self, hdf5_path, seq_len=10):
         self.hdf5_path = hdf5_path
         self.seq_len = seq_len

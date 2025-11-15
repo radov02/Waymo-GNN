@@ -25,16 +25,11 @@ def train_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_beta, lo
     count = 0
     steps = 0
     
-    # Reset once per epoch - DON'T reset per batch (breaks temporal evolution!)
     model.reset_gru_hidden_states(batch_size=batch_size)
     
     for batch_dict in dataloader:
         batched_graph_sequence = batch_dict["batch"]
         B, T = batch_dict["B"], batch_dict["T"]
-        
-        # Auto-reinitialize if batch size changed
-        if B != batch_size:
-            model.reset_gru_hidden_states(batch_size=B)
         
         for t in range(T):
             batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
@@ -65,11 +60,11 @@ def train_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_beta, lo
             count += 1
         
         if valid_timesteps > 0:
-            avg_loss_batch = accumulated_loss / valid_timesteps
-            avg_loss_batch.backward()
+            #avg_loss_batch = accumulated_loss / valid_timesteps
+            accumulated_loss.backward()
             clip_grad_norm_(model.parameters(), gradient_clip_value)
             optimizer.step()
-            total_loss += avg_loss_batch.item()
+            total_loss += accumulated_loss.item()
             steps += 1
     
     return (total_loss / max(1, steps), 
@@ -86,17 +81,12 @@ def evaluate(model, dataloader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss
     count = 0
     steps = 0
     
-    # Reset once before evaluation
     model.reset_gru_hidden_states(batch_size=batch_size)
     
     with torch.no_grad():
         for batch_dict in dataloader:
             batched_graph_sequence = batch_dict["batch"]
             B, T = batch_dict["B"], batch_dict["T"]
-            
-            # Auto-reinitialize if batch size changed
-            if B != batch_size:
-                model.reset_gru_hidden_states(batch_size=B)
             
             for t in range(T):
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
@@ -174,10 +164,10 @@ if __name__ == '__main__':
             "loss_beta": loss_beta,
             "loss_gamma": loss_gamma,
             "loss_delta": loss_delta,
-            "loss_breakdown": "60% ANGLE (dominant!), 15% MSE, 15% velocity, 10% cosine",
+            "loss_breakdown": "40% target_angle, 25% VELOCITY_DIR (follow velocity!), 15% vel_mag, 10% MSE, 5% cosine, 5% diversity",
             "use_edge_weights": use_edge_weights
         },
-        name=f"Pipeline_r{radius}_h{hidden_channels}_angle_dominant{'_ew' if use_edge_weights else ''}",
+        name=f"Pipeline_r{radius}_h{hidden_channels}_vel_guided{'_ew' if use_edge_weights else ''}",
         dir="../wandb"
     )
     
