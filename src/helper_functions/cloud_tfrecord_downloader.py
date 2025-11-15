@@ -29,7 +29,7 @@ def get_local_filename(dataset, i):
 
 def get_waymo_bucket():
     try:
-        adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"   # Try to load credentials from default ADC file location
+        adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"
         
         if not adc_path.exists():
             raise RuntimeError("Missing credentials. Please run: gcloud auth application-default login")
@@ -47,7 +47,7 @@ def get_waymo_bucket():
     credentials = UserCredentials.from_authorized_user_info(adc_info)
     storage_client = storage.Client(project=project_id, credentials=credentials)    
 
-    bucket = storage_client.bucket(bucket_name)      # Don't specify user_project - this was causing the permission error
+    bucket = storage_client.bucket(bucket_name)
     return bucket
 
 def download_scenario_file(bucket, dataset, i):

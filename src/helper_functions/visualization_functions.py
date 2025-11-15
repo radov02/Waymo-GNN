@@ -312,7 +312,9 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
             # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
-            pred_displacement_norm = model(graph.x, graph.edge_index, graph.batch, batch_size=B).cpu()
+            pred_displacement_norm = model(graph.x, graph.edge_index, 
+                                          edge_weight=graph.edge_attr, 
+                                          batch=graph.batch, batch_size=B).cpu()
             
             # Denormalize displacement and add to current position to get predicted next position
             pred_displacement = pred_displacement_norm * POSITION_SCALE
@@ -620,8 +622,8 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                             ax.fill(x_coords, y_coords, color=map_feature_gray, alpha=0.1, zorder=1)
                             map_features_drawn += 1
                 
-                if t == 0 and graph_idx == 0:
-                    print(f"  Drew {map_features_drawn} map features on first subplot (filtered to action area)")
+                if t == 0:  # Print for first timestep of each graph
+                    print(f"  Drew {map_features_drawn} map features for graph {graph_idx} (filtered to action area)")
             
             # Get data for this timestep
             data = graph_data_per_timestep[t]

@@ -176,9 +176,11 @@ def create_scenario_dataset_dict(files, prinT=False):
         print(f"Error processing files: {e}")
 
 def build_edge_index_using_radius(position_tensor, radius, self_loops=False, valid_mask=None, min_distance=0.0):
-    """Convert position tensor that holds (x,y) positions of agents into edge tensor (edge_index) OF SHAPE (2, E) for graph using radius."""
-    pairwise_norm2_distances = torch.cdist(position_tensor, position_tensor)
-    if valid_mask is not None:  # mask out pairs with invalid endpoints
+    """Convert position tensor that holds (x,y) positions of agents into edge tensor (edge_index) OF SHAPE (2, E) for graph using radius.
+    Also computes edge weights based on distance: weight = exp(-distance^2 / (2 * radius^2)) for distance-based attention."""
+
+    pairwise_norm2_distances = torch.cdist(position_tensor, position_tensor)        # norm-2 distance between each pari of agent positions
+    if valid_mask is not None:      # mask out pairs with invalid endpoints
         vm = torch.as_tensor(valid_mask, dtype=torch.bool, device=pairwise_norm2_distances.device)
         if vm.numel() != pairwise_norm2_distances.size(0):
             raise ValueError("valid_mask length must match number of positions")
@@ -190,18 +192,21 @@ def build_edge_index_using_radius(position_tensor, radius, self_loops=False, val
     edges_mask = (pairwise_norm2_distances <= float(radius)) & (pairwise_norm2_distances > float(min_distance))
     n1, n2 = torch.where(edges_mask)
     edge_index = torch.stack([n1, n2], dim=0)
-    return edge_index
+    
+    edge_distances = pairwise_norm2_distances[edges_mask] 
+    edge_weight = torch.exp(-edge_distances**2 / (2 * radius**2))       # compute edge weights: closer agents have higher weights (exponential decay)
+    edge_weight = edge_weight / edge_weight.max() if edge_weight.numel() > 0 else edge_weight       # normalize edge weights to prevent scale issues
+    return edge_index, edge_weight
 
 def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None, valid_mask=None, min_distance=0.0):
-    """Create star graph topology with SDC as center node. All other agents connect to SDC."""
+    """Create star graph topology with SDC as center node. All other agents connect to SDC.
+    Also computes edge weights based on distance from SDC."""
     
-    # Get SDC track using direct index access (O(1) instead of O(n) loop)
     sdc_track = scenario.tracks[scenario.sdc_track_index]
     sdc_id = sdc_track.id
     
     num_nodes = position_tensor.shape[0]
     
-    # Find SDC's index in the position_tensor using agent_ids
     if agent_ids is not None:
         try:
             sdc_idx = agent_ids.index(sdc_id)
@@ -209,7 +214,7 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
             print(f"Warning: SDC (id={sdc_id}) not found in agent_ids, using index 0")
             sdc_idx = 0
     else:
-        # Fallback: use scenario.sdc_track_index (may be incorrect if agents are filtered)
+        # use scenario.sdc_track_index (may be incorrect if agents are filtered)
         sdc_idx = scenario.sdc_track_index
         if sdc_idx >= num_nodes:
             print(f"Warning: SDC index {sdc_idx} >= num_nodes {num_nodes}, using index 0")
@@ -223,8 +228,9 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
     else:
         vm = torch.ones(num_nodes, dtype=torch.bool, device=position_tensor.device)
     
-    # Build star graph edges (bidirectional)
+    # Build star graph edges (bidirectional) and compute weights
     edge_list = []
+    edge_distances = []
     for i in range(num_nodes):
         if i == sdc_idx:
             continue  # Skip self-loop to SDC
@@ -232,68 +238,55 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
         if not vm[i]:  # Skip invalid agents
             continue
         
+        # Calculate distance from SDC to agent
+        dist = torch.norm(position_tensor[sdc_idx] - position_tensor[i])
+        
         # Check minimum distance if specified
         if min_distance > 0.0:
-            dist = torch.norm(position_tensor[sdc_idx] - position_tensor[i])
             if dist <= min_distance:
                 continue
         
-        # Add bidirectional edges: SDC -> agent and agent -> SDC
+        # Add bidirectional edges:
         edge_list.append([sdc_idx, i])
         edge_list.append([i, sdc_idx])
+        edge_distances.append(dist.item())
+        edge_distances.append(dist.item())
     
     if len(edge_list) == 0:
-        # Return empty edge_index with correct shape
-        return torch.zeros((2, 0), dtype=torch.long, device=position_tensor.device)
+        return (torch.zeros((2, 0), dtype=torch.long, device=position_tensor.device),    # Return empty edge_index and edge_weight with correct shape
+                torch.zeros(0, dtype=torch.float32, device=position_tensor.device))
     
     # Convert to edge_index format [2, num_edges]
     edge_index = torch.tensor(edge_list, dtype=torch.long, device=position_tensor.device).t()
     
-    return edge_index
-
-def initial_feature_vector(agent, timestep, normalize=True):
-    """returns **list** of features for agent at given timestep
+    edge_distances_tensor = torch.tensor(edge_distances, dtype=torch.float32, device=position_tensor.device)    # compute edge weights: exp(-distance^2 / (2*sigma^2)) for reasonable scale
+    sigma = 30.0    # Similar to radius
+    edge_weight = torch.exp(-edge_distances_tensor**2 / (2 * sigma**2))
     
-    Args:
-        agent: Agent track from scenario
-        timestep: Current timestep index
-        normalize: If True, normalize velocity to reasonable scales
-        
-    Returns:
-        List of 7 features: [vx, vy, speed, heading, valid, vehicle, pedestrian, cyclist, other]
-        Note: Position (x, y) is NOT included here as it's stored separately in data.pos
-    """
-    # TODO: IMPLEMENT TECHNIQUES FROM FEATURE AUGMENTATION LECTURE (lec 7)
-    # consider adding: Acceleration: If you have velocity from previous timestep Normalized coordinates: Relative to ego vehicle or scene center Temporal encoding: Timestep information
+    return edge_index, edge_weight
+
+def initial_feature_vector(agent, timestep):
+    """returns list of node features for the agent at given timestep:
+    [vx_norm, vy_norm, speed_norm, heading_direc, valid, ENC_vehicle, ENC_pedestrian, ENC_cyclist, ENC_other]"""
+    # agent position is stored separately in Data.pos attribute
 
     if timestep >= len(agent.states):
         timestep = len(agent.states) - 1
 
     state = agent.states[timestep]
     
-    # Get velocity components
-    vx = state.velocity_x
-    vy = state.velocity_y
-    
-    # Normalize velocities to reasonable scales
-    if normalize:
-        # Divide by velocity scale (10 m/s ~ 36 km/h)
-        vx_norm = vx / 10.0
-        vy_norm = vy / 10.0
-    else:
-        vx_norm = vx
-        vy_norm = vy
-    
-    # Calculate speed (magnitude of velocity)
+    vx_norm = state.velocity_x / 10.0
+    vy_norm = state.velocity_y / 10.0
+
     import math
-    speed = math.sqrt(vx**2 + vy**2)
-    speed_norm = speed / 10.0 if normalize else speed
+    speed_norm = math.sqrt(vx_norm**2 + vy_norm**2)
     
-    # Calculate heading (direction of movement)
-    heading = math.atan2(vy, vx)  # Already in radians, in range [-pi, pi]
+    heading_direc = math.atan2(vy_norm, vx_norm)  # range [-pi, pi]
     
     object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
-    properties = [vx_norm, vy_norm, speed_norm, heading, float(state.valid)]
+
+
+    properties = [vx_norm, vy_norm, speed_norm, heading_direc, float(state.valid)]
     type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
                    1 if object_types[agent.object_type] == 'Pedestrian' else 0,
                    1 if object_types[agent.object_type] == 'Cyclist' else 0,
@@ -318,26 +311,16 @@ def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_m
         valid_mask.append(1 if valid else 0)
 
 def get_future_2D_trajectory_labels(scenario, agent_ids, timestep, normalize=True):
-    """outputs tensor of shape [N, 2], for each agent we have displacements stored
-    
-    Args:
-        scenario: Waymo scenario
-        agent_ids: List of agent IDs
-        timestep: Current timestep
-        normalize: If True, normalize displacements by dividing by 100.0 (typical scene scale)
-        
-    Returns:
-        Tensor of shape [N, 2] with position displacements
-    """
-    id_to_agent = {t.id: t for t in scenario.tracks}
+    """outputs tensor of shape [N, 2], for each agent we have position displacements stored as target labels"""
+    id_to_agent_track = {track.id: track for track in scenario.tracks}
     future_2d_position_displacements = []
 
     # get node positions for next timestep
-    # calculate displacements
+    # calculate displacements (current graph node position - next graph node position)
     # put displacements into list which is used as y of the graph
     
     for agent_id in agent_ids:
-        agent = id_to_agent.get(agent_id)   # agent data has its position at current timestep
+        agent = id_to_agent_track.get(agent_id)   # agent data has its position at current timestep
         if agent is None:
             future_2d_position_displacements.append([0, 0])
             continue
@@ -347,13 +330,8 @@ def get_future_2D_trajectory_labels(scenario, agent_ids, timestep, normalize=Tru
             next_timestep_positions = agent.states[timestep+1]
 
             if next_timestep_positions.valid:
-                dx = next_timestep_positions.center_x - current_timestep_positions.center_x
-                dy = next_timestep_positions.center_y - current_timestep_positions.center_y
-                
-                # Normalize displacements to match input feature scale
-                if normalize:
-                    dx /= 100.0
-                    dy /= 100.0
+                dx = (next_timestep_positions.center_x - current_timestep_positions.center_x) / 100.0
+                dy = (next_timestep_positions.center_y - current_timestep_positions.center_y) / 100.0
                 
                 displacement = [dx, dy]
                 future_2d_position_displacements.append(displacement)
@@ -385,16 +363,16 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     positions_2D_tensor = torch.tensor(positions_2D, dtype=torch.float32)
 
     if method == 'radius':
-        edge_index = build_edge_index_using_radius(positions_2D_tensor, radius, valid_mask=valid_mask, min_distance=0.1)
+        edge_index, edge_weight = build_edge_index_using_radius(positions_2D_tensor, radius, valid_mask=valid_mask, min_distance=0.1)
     elif method == 'star':
-        edge_index = build_edge_index_using_star_graph(positions_2D_tensor, scenario, agent_ids=agent_ids, valid_mask=valid_mask)
+        edge_index, edge_weight = build_edge_index_using_star_graph(positions_2D_tensor, scenario, agent_ids=agent_ids, valid_mask=valid_mask)
 
     y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
-    # Create Data object with all attributes
     data = Data(
         x=torch.tensor(x, dtype=torch.float32), 
-        edge_index=edge_index, 
+        edge_index=edge_index,
+        edge_attr=edge_weight,  # Add edge weights based on distance
         pos=positions_2D_tensor, 
         y=y,
         scenario_id=scenario.scenario_id,
@@ -403,22 +381,6 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     )
     
     return data
-
-def get_graphs_for_scenarios(dataset_dict, radius, graph_creation_method, prinT=False):
-    """returns dict like {scenarioID: [graphs...], ...}"""
-    scenarios_and_their_graphs = {}     # {scenarioID: [graphs...]}
-    for file in dataset_dict:
-        for scenario in dataset_dict[file]:
-            scenario_graphs = []
-            for timestep in range(sequence_length-1):
-                data = timestep_to_pyg_data(scenario, int(timestep), radius, method=graph_creation_method)
-                scenario_graphs.append(data)
-            scenarios_and_their_graphs[scenario.scenario_id] = scenario_graphs
-    if prinT:
-        #print(scenarios_and_their_graphs.values())
-        print(f"All the scenario IDs: {scenarios_and_their_graphs.keys()}")
-        print(f"Example of a graph from scenario with id {list(scenarios_and_their_graphs.keys())[0]}:\n\t{scenarios_and_their_graphs[list(scenarios_and_their_graphs.keys())[0]][0]}")
-    return scenarios_and_their_graphs
 
 def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_scenarios_per_tfrecord_file=None):
     """Stream directly from TFRecord files to HDF5 without storing in memory, HDF5 file structure:
@@ -610,7 +572,7 @@ def collate_graph_sequences_to_batch(scenario_list):
     T = len(scenario_list[0])   # sequence length
     transposed = list(zip(*scenario_list))  # transposes list-of-lists structure
 
-    # Extract scenario_ids from the first timestep (all timesteps have the same scenario_id per sequence)
+    # extract scenario_ids from the first timestep (all timesteps have the same scenario_id per sequence):
     scenario_ids = []
     for sequence in scenario_list:
         if sequence and len(sequence) > 0 and hasattr(sequence[0], 'scenario_id'):
@@ -625,8 +587,7 @@ def collate_graph_sequences_to_batch(scenario_list):
         
         batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
         
-        # Manually preserve agent_ids (Batch.from_data_list doesn't preserve list attributes)
-        # Concatenate all agent_ids from individual graphs
+        # manually preserve agent_ids (Batch.from_data_list doesn't preserve list attributes), concatenate all agent_ids from individual graphs:
         all_agent_ids = []
         for graph in graphs_at_timestep:
             if hasattr(graph, 'agent_ids'):
