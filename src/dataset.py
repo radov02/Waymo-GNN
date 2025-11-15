@@ -36,14 +36,13 @@ class HDF5ScenarioDataset(Dataset):
         scenario_id = self.scenario_ids[idx]
         snaps = self._h5file["scenarios"][scenario_id]["snapshot_graphs"]
         
-        # Get sorted timestep keys
-        timesteps = sorted(snaps.keys(), key=lambda x: int(x))[:self.seq_len]
+        timesteps = sorted(snaps.keys(), key=lambda x: int(x))[:self.seq_len]       # get sorted timestep keys
         
         data_list = []
         for timestep in timesteps:
             group = snaps[timestep]
             
-            # Load tensors
+            # load tensors
             x = torch.from_numpy(group["x"][:])
             edge_index = torch.from_numpy(group["edge_index"][:]).long()
             edge_weight = torch.from_numpy(group["edge_weight"][:]) if "edge_weight" in group else None
@@ -51,7 +50,7 @@ class HDF5ScenarioDataset(Dataset):
             pos = torch.from_numpy(group["pos"][:]) if "pos" in group else None
             agent_ids = group["agent_ids"][:].tolist() if "agent_ids" in group else None
             
-            # Create PyG Data object
+            # create PyG Data object
             data = Data(
                 x=x,
                 edge_index=edge_index,
@@ -59,15 +58,15 @@ class HDF5ScenarioDataset(Dataset):
                 y=y,
                 pos=pos
             )
-            data.scenario_id = scenario_id  # Add scenario_id to each graph
+            data.scenario_id = scenario_id  # add scenario_id to each graph
             data.snapshot_id = int(timestep)
             if agent_ids is not None:
-                data.agent_ids = agent_ids  # Add agent_ids as list
+                data.agent_ids = agent_ids  # add agent_ids as list
             data_list.append(data)
         
         return data_list
     
     def __del__(self):
-        # Clean up file handle when object is destroyed
+        # clean up file handle when object is destroyed
         if self._h5file is not None:
             self._h5file.close()

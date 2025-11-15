@@ -67,7 +67,7 @@ if __name__ == '__main__':
                             shuffle=True, 
                             num_workers=num_workers,    # number of working threads that are used for data loading
                             collate_fn=collate_graph_sequences_to_batch, 
-                            drop_last=True,    # discard last minibatch if it does not have enough snapshots
+                            drop_last=True,         # discard last minibatch if it does not have enough snapshots
                             persistent_workers=True if num_workers > 0 else False) 
 
     print(f"Training on {device}")
@@ -90,7 +90,7 @@ if __name__ == '__main__':
         
         for batch, batch_dict in enumerate(dataloader):
             batched_graph_sequence = batch_dict["batch"]  # list of length T of Batch objects
-            B = batch_dict["B"]  # Always 1 for EvolveGCN
+            B = batch_dict["B"]  # always 1 for EvolveGCN
             T = batch_dict["T"]
             
             assert B == 1, f"batch_size must be 1 for EvolveGCN! Got B={B}"
@@ -108,30 +108,28 @@ if __name__ == '__main__':
             for t in range(T): 
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
-            model.reset_gru_hidden_states(batch_size=1)     # Reset GRU hidden states (GCN parameters) for this scenario
+            model.reset_gru_hidden_states(batch_size=1)     # reset GRU hidden states (GCN parameters) for this scenario
             
             optimizer.zero_grad()
             accumulated_loss = 0.0
             
-            for t, batched_graph in enumerate(batched_graph_sequence):      # Process entire sequence for this scenario
+            for t, batched_graph in enumerate(batched_graph_sequence):      # process entire sequence for this scenario
                 if batched_graph.y is None or torch.all(batched_graph.y == 0):
                     continue
                 
-                # Forward pass (batch_size=1, so all nodes belong to single scenario)
+                # forward pass (batch_size=1, so all nodes belong to single scenario):
                 edge_w = batched_graph.edge_attr if use_edge_weights else None
                 out_predictions = model(batched_graph.x, batched_graph.edge_index,
                                       edge_weight=edge_w,
                                       batch=batched_graph.batch, batch_size=1, 
                                       batch_num=batch, timestep=t)
                 
-                # Compute loss
                 loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
                                batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                gamma=loss_gamma, delta=loss_delta)
                 accumulated_loss += loss_t
                 
-                # Track metrics
-                with torch.no_grad():
+                with torch.no_grad():       # track metrics:
                     mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
                     pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
@@ -159,7 +157,7 @@ if __name__ == '__main__':
         avg_cosine_sim = total_cosine_sim / max(1, metric_count)
         avg_mse = total_mse / max(1, metric_count)
         avg_angle_error = total_angular / max(1, metric_count)
-        avg_angle_error_deg = avg_angle_error * 180 / 3.14159  # Convert to degrees for readability
+        avg_angle_error_deg = avg_angle_error * 180 / 3.14159  # convert to degrees for readability
         
         wandb.log({
             "epoch": epoch,

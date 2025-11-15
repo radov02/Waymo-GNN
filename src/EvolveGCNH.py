@@ -151,10 +151,8 @@ class EvolveGCNH(nn.Module):
         """Takes node feature matrix x [num_nodes_total, input_dim/feature_dim], edge_index [2, num_edges_total], 
         optional edge_weight [num_edges_total] and batch assignment vector [num_nodes_total] indicating which graph each node belongs to. 
         Returns node embeddings [num_nodes_total, output_dim], in our case [num_nodes_total, 2], predicted position displacements (in x and y directions) for each node.
-        
         Edge weights allow the model to prioritize information from closer agents (higher weights).
-        
-        IMPORTANT: Each scenario in the batch has its own temporal evolution!
+        Each scenario in the batch has its own temporal evolution!
         The GRU hidden states maintain separate parameter trajectories for each scenario,
         ensuring temporal dependencies are scenario-specific, not shared across batch."""
 

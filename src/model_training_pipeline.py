@@ -128,8 +128,8 @@ def evaluate(model, dataloader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss
 
 
 # TODO:
-    # - num_workers not working for batches
     # - update README.md
+    # - encode map features?
     # - multi-step prediction
 
     # - use different graph creation methods
