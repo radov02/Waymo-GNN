@@ -3,6 +3,7 @@ import sys
 import os
 import h5py
 import time
+import math
 import numpy as np
 import tensorflow as tf
 from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
@@ -265,36 +266,103 @@ def build_edge_index_using_star_graph(position_tensor, scenario, agent_ids=None,
     
     return edge_index, edge_weight
 
-def initial_feature_vector(agent, timestep):
-    """returns list of node features for the agent at given timestep:
-    [vx_norm, vy_norm, speed_norm, heading_direc, valid, ENC_vehicle, ENC_pedestrian, ENC_cyclist, ENC_other]"""
-    # agent position is stored separately in Data.pos attribute
-
-    if timestep >= len(agent.states):
-        timestep = len(agent.states) - 1
-
+def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
+    """
+    Creates initial feature vector for given agent at given timestep.
+    Returns tensor of shape [15] with features:
+        [0-1]   vx_norm, vy_norm (normalized velocity)
+        [2]     speed_norm (speed magnitude)
+        [3]     heading_direc (heading direction, atan2)
+        [4]     valid (validity flag)
+        [5-6]   ax_norm, ay_norm (acceleration - velocity change from previous timestep)
+        [7-8]   rel_x_to_sdc_norm, rel_y_to_sdc_norm (normalized relative position to ego vehicle)
+        [9]     dist_to_sdc_norm (normalized distance to ego vehicle)
+        [10]    dist_to_nearest_norm (normalized distance to nearest neighbor)
+        [11-14] one-hot type (vehicle, pedestrian, cyclist, other)
+    """
     state = agent.states[timestep]
     
-    vx_norm = state.velocity_x / 10.0
-    vy_norm = state.velocity_y / 10.0
-
-    import math
-    speed_norm = math.sqrt(vx_norm**2 + vy_norm**2)
+    # Normalization constants
+    MAX_SPEED = 30.0        # ~108 km/h, reasonable max speed
+    MAX_ACCEL = 10.0        # ~1g acceleration
+    MAX_DIST_SDC = 100.0    # 100m max distance to SDC for normalization
+    MAX_DIST_NEAREST = 50.0 # 50m max distance to nearest neighbor
     
-    heading_direc = math.atan2(vy_norm, vx_norm)  # range [-pi, pi]
+    # Basic velocity features (normalized)
+    vx = state.velocity_x
+    vy = state.velocity_y
+    speed = (vx**2 + vy**2)**0.5
     
-    object_types = {1: 'Vehicle', 2: 'Pedestrian', 3: 'Cyclist', 4: 'Other'}
+    vx_norm = vx / MAX_SPEED
+    vy_norm = vy / MAX_SPEED
+    speed_norm = speed / MAX_SPEED
+    heading_direc = math.atan2(vy, vx) / math.pi  # normalize to [-1, 1]
+    
+    valid = 1.0 if state.valid else 0.0
+    
+    # Acceleration features (velocity change from previous timestep)
+    ax_norm, ay_norm = 0.0, 0.0
+    if timestep > 0:
+        prev_state = agent.states[timestep - 1]
+        if prev_state.valid and state.valid:
+            ax = state.velocity_x - prev_state.velocity_x
+            ay = state.velocity_y - prev_state.velocity_y
+            ax_norm = ax / MAX_ACCEL
+            ay_norm = ay / MAX_ACCEL
+    
+    # Relative position to SDC (ego vehicle) - normalized
+    rel_x_to_sdc_norm, rel_y_to_sdc_norm, dist_to_sdc_norm = 0.0, 0.0, 0.0
+    if scenario is not None:
+        sdc_track_index = scenario.sdc_track_index
+        if sdc_track_index < len(scenario.tracks):
+            sdc_track = scenario.tracks[sdc_track_index]
+            sdc_state = sdc_track.states[timestep]
+            if sdc_state.valid and state.valid:
+                rel_x = state.center_x - sdc_state.center_x
+                rel_y = state.center_y - sdc_state.center_y
+                dist_to_sdc = (rel_x**2 + rel_y**2)**0.5
+                
+                rel_x_to_sdc_norm = rel_x / MAX_DIST_SDC
+                rel_y_to_sdc_norm = rel_y / MAX_DIST_SDC
+                dist_to_sdc_norm = min(dist_to_sdc / MAX_DIST_SDC, 1.0)  # clip to [0, 1]
+    
+    # Distance to nearest neighbor - normalized
+    dist_to_nearest_norm = 1.0  # default: far away (normalized max)
+    if all_positions is not None and state.valid and len(all_positions) > 1:
+        current_pos = (state.center_x, state.center_y)
+        min_dist = float('inf')
+        for pos in all_positions:
+            if pos != current_pos:
+                d = math.sqrt((pos[0] - current_pos[0])**2 + (pos[1] - current_pos[1])**2)
+                min_dist = min(min_dist, d)
+        if min_dist != float('inf'):
+            dist_to_nearest_norm = min(min_dist / MAX_DIST_NEAREST, 1.0)  # clip to [0, 1]
+    
+    # One-hot object type
+    obj_type = agent.object_type
+    type_vehicle = 1.0 if obj_type == 1 else 0.0
+    type_pedestrian = 1.0 if obj_type == 2 else 0.0
+    type_cyclist = 1.0 if obj_type == 3 else 0.0
+    type_other = 1.0 if obj_type not in [1, 2, 3] else 0.0
+    
+    return torch.tensor([
+        vx_norm, vy_norm,                           # [0-1] normalized velocity
+        speed_norm,                                  # [2] normalized speed
+        heading_direc,                               # [3] heading in [-1, 1]
+        valid,                                       # [4] validity
+        ax_norm, ay_norm,                            # [5-6] normalized acceleration
+        rel_x_to_sdc_norm, rel_y_to_sdc_norm,       # [7-8] normalized relative position to SDC
+        dist_to_sdc_norm,                            # [9] normalized distance to SDC
+        dist_to_nearest_norm,                        # [10] normalized distance to nearest
+        type_vehicle, type_pedestrian,               # [11-12] one-hot type
+        type_cyclist, type_other                     # [13-14] one-hot type
+    ], dtype=torch.float32)
 
-
-    properties = [vx_norm, vy_norm, speed_norm, heading_direc, float(state.valid)]
-    type_onehot = [1 if object_types[agent.object_type] == 'Vehicle' else 0,
-                   1 if object_types[agent.object_type] == 'Pedestrian' else 0,
-                   1 if object_types[agent.object_type] == 'Cyclist' else 0,
-                   1 if object_types[agent.object_type] == 'Other' else 0 ]
-    return properties + type_onehot
-
-def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_mask, timestep, use_valid_only):
+def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_mask, timestep, use_valid_only, scenario=None):
     """returns lists node_features [N, d], positions_2D [N, 2] and agent_ids and valid_mask"""
+    # First pass: collect all positions for nearest neighbor calculation
+    all_positions = []
+    valid_agents = []
     for agent in agents:
         if timestep >= len(agent.states):
             state = agent.states[-1]
@@ -304,8 +372,13 @@ def get_data_from_agents(agents, node_features, positions_2D, agent_ids, valid_m
         valid = state.valid
         if use_valid_only and not valid:
             continue
-
-        node_features.append(initial_feature_vector(agent, timestep))
+        
+        all_positions.append((state.center_x, state.center_y))
+        valid_agents.append((agent, state, valid))
+    
+    # Second pass: build features with all_positions available
+    for agent, state, valid in valid_agents:
+        node_features.append(initial_feature_vector(agent, timestep, scenario=scenario, all_positions=all_positions))
         positions_2D.append([state.center_x, state.center_y])
         agent_ids.append(agent.id)
         valid_mask.append(1 if valid else 0)
@@ -355,7 +428,7 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     positions_2D = []
     agent_ids = []
     valid_mask = []
-    get_data_from_agents(scenario.tracks, x, positions_2D, agent_ids, valid_mask, timestep, use_valid_only)
+    get_data_from_agents(scenario.tracks, x, positions_2D, agent_ids, valid_mask, timestep, use_valid_only, scenario=scenario)
 
     if len(x) == 0:
         return None
@@ -370,7 +443,7 @@ def timestep_to_pyg_data(scenario, timestep, radius, use_valid_only=True, method
     y = get_future_2D_trajectory_labels(scenario, agent_ids, timestep)
 
     data = Data(
-        x=torch.tensor(x, dtype=torch.float32), 
+        x=torch.stack(x) if isinstance(x[0], torch.Tensor) else torch.tensor(x, dtype=torch.float32), 
         edge_index=edge_index,
         edge_attr=edge_weight,  # Add edge weights based on distance
         pos=positions_2D_tensor, 

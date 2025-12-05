@@ -56,12 +56,12 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.4, beta=0.1, 
         diversity_loss = torch.tensor(0.0, device=pred.device)
     
     total_loss = (alpha * angle_loss +                    # target angle (should have big importance)
-                  gamma * heading_direction_loss +        # heading alignment (also should have big importance)
-                  delta * velocity_magnitude_loss +       # velocity magnitude
+                  #gamma * heading_direction_loss +        # heading alignment (also should have big importance)
+                  gamma * velocity_magnitude_loss +       # velocity magnitude
                   beta * mse_loss +                       # MSE magnitude
-                  0.05 * cosine_loss +                    # backup direction
-                  0.05 * diversity_loss)                  # diversity
-    
+                  delta * cosine_loss #+                    # backup direction
+                  #0.05 * diversity_loss)                  # diversity
+    )
     return total_loss
 
 def compute_metrics(predictions, targets, features):

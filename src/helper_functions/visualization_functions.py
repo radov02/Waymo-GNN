@@ -83,8 +83,9 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
         for node_idx in range(graph.num_nodes):
             x, y = pos[node_idx]
             
-            # Determine agent type from one-hot encoding (indices 5-8)
-            type_onehot = node_features[node_idx, 5:9]
+            # Determine agent type from one-hot encoding (indices 11-14 for 15-dim features)
+            # Feature order: [vx, vy, speed, heading, valid, ax, ay, rel_x_sdc, rel_y_sdc, dist_sdc, dist_nearest, vehicle, ped, cyclist, other]
+            type_onehot = node_features[node_idx, 11:15]
             agent_type = np.argmax(type_onehot) + 1  # 1-indexed
             color = type_colors.get(agent_type, '#95a5a6')
             
@@ -313,7 +314,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             
             # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
             pred_displacement_norm = model(graph.x, graph.edge_index, 
-                                          edge_weight=graph.edge_attr, 
+                                          edge_weight=None,  # edge_weight=graph.edge_attr, 
                                           batch=graph.batch, batch_size=B).cpu()
             
             # Denormalize displacement and add to current position to get predicted next position
@@ -376,8 +377,9 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
         if viz_vehicles_only and hasattr(first_graph, 'x'):
             # Get node features for this graph
             node_features_first = first_graph.x[batch_mask_first]
-            # Check if agent is vehicle (feature index 5 is vehicle one-hot)
-            vehicle_mask = node_features_first[:, 5] == 1.0  # Index 5 is 'vehicle' in one-hot
+            # Check if agent is vehicle (feature index 11 is vehicle one-hot for 15-dim features)
+            # Feature order: [vx, vy, speed, heading, valid, ax, ay, rel_x_sdc, rel_y_sdc, dist_sdc, dist_nearest, vehicle, ped, cyclist, other]
+            vehicle_mask = node_features_first[:, 11] == 1.0  # Index 11 is 'vehicle' in one-hot
             vehicle_indices = torch.where(vehicle_mask)[0].numpy()
             all_agent_ids = [all_agent_ids[i] for i in vehicle_indices]
         

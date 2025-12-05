@@ -43,7 +43,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_beta, lo
                 continue
             
             out_predictions = model(batched_graph.x, batched_graph.edge_index, 
-                                   edge_weight=batched_graph.edge_attr if use_edge_weights else None,
+                                   edge_weight=None,  # edge_weight=batched_graph.edge_attr if use_edge_weights else None,
                                    batch=batched_graph.batch, batch_size=B, batch_num=0, timestep=t)
             
             loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
@@ -99,7 +99,7 @@ def evaluate(model, dataloader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss
                     continue
                 
                 out_predictions = model(batched_graph.x, batched_graph.edge_index, 
-                                       edge_weight=batched_graph.edge_attr if use_edge_weights else None,
+                                       edge_weight=None,  # edge_weight=batched_graph.edge_attr if use_edge_weights else None,
                                        batch=batched_graph.batch, batch_size=B, batch_num=0, timestep=t)
                 
                 loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
@@ -129,6 +129,7 @@ def evaluate(model, dataloader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss
 
 # TODO:
     # - update README.md
+    # - remove edge weights
     # - encode map features?
     # - multi-step prediction
 
@@ -251,9 +252,11 @@ if __name__ == '__main__':
     best_val_loss = float('inf')
     
     for epoch in range(epochs):
+        # train:
         train_loss, train_mse, train_cos, train_angle = train_epoch(
             model, train_loader, optimizer, loss_fn, loss_alpha, loss_beta, loss_gamma, loss_delta, device)
         
+        # validate:
         val_loss, val_mse, val_cos, val_angle = evaluate(
             model, val_loader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss_delta, device, phase='val')
         
@@ -294,6 +297,7 @@ if __name__ == '__main__':
     checkpoint = torch.load('best_model.pt')
     model.load_state_dict(checkpoint['model_state_dict'])
     
+    # test:
     test_loss, test_mse, test_cos, test_angle = evaluate(
         model, test_loader, loss_fn, loss_alpha, loss_beta, loss_gamma, loss_delta, device, 'test')
     

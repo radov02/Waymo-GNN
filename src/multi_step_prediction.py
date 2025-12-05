@@ -123,7 +123,7 @@ def train_epoch_multistep(model, dataloader, optimizer, loss_fn, num_future_step
                 continue
             
             out_predictions = model(batched_graph.x, batched_graph.edge_index, 
-                                   edge_weight=batched_graph.edge_attr,
+                                   edge_weight=None,  # edge_weight=batched_graph.edge_attr,
                                    batch=batched_graph.batch, batch_size=B, batch_num=0, timestep=t)
             
             targets_tensor = torch.stack(future_targets, dim=1).to(out_predictions.dtype)
@@ -184,7 +184,7 @@ def evaluate_multistep(model, dataloader, loss_fn, num_future_steps, device):
                     continue
                 
                 out_predictions = model(batched_graph.x, batched_graph.edge_index, 
-                                       edge_weight=batched_graph.edge_attr,
+                                       edge_weight=None,  # edge_weight=batched_graph.edge_attr,
                                        batch=batched_graph.batch, batch_size=B, batch_num=0, timestep=t)
                 
                 targets_tensor = torch.stack(future_targets, dim=1).to(out_predictions.dtype)

@@ -53,11 +53,12 @@ class EvolveGCNH(nn.Module):
     
     def reset_parameters(self):
         """Reset all learnable parameters."""
+        for gcn in self.gcn_layers:
+            gcn.reset_parameters()
         for gru in self.gru_cells:
             gru.reset_parameters()
-        for param in self.summarize_params:
-            nn.init.normal_(param)
-        self.gru_h = None
+        for param in self.p:
+            nn.init.normal_(param, mean=0, std=0.1)
 
     def reset_gru_hidden_states(self, batch_size=None):
         if batch_size is None:
@@ -218,9 +219,9 @@ class EvolveGCNH(nn.Module):
                 h_scenario = gcn(h_scenario, scenario_edge_index, edge_weight=scenario_edge_weight)
 
                 if layer_idx < self.num_layers - 1:
-                    h_scenario = self.layer_norms[layer_idx](h_scenario)
                     h_scenario = torchFunctional.relu(h_scenario)
                     h_scenario = torchFunctional.dropout(h_scenario, p=self.dropout, training=self.training)
+                    h_scenario = self.layer_norms[layer_idx](h_scenario)
             
             outputs.append(h_scenario)
         
