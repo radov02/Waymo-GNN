@@ -858,7 +858,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     plt.close(fig)
     
     print(f"  Saved training progress visualization: {filepath}")
-    print(f"    Grid: {B} graphs × {T} timesteps | Avg Error: {avg_error:.2f}m | {max_nodes_per_graph_viz} agents per graph")
+    print(f"    Grid: {B} graphs x {T} timesteps | Avg Error: {avg_error:.2f}m | {max_nodes_per_graph_viz} agents per graph")
     
     model.train()
     return filepath, avg_error

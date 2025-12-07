@@ -1,4 +1,5 @@
 import torch
+import os
 import wandb
 import torch.nn.functional as F
 from EvolveGCNH import EvolveGCNH
@@ -7,7 +8,8 @@ from config import (device, batch_size, num_workers, num_layers, topk, epochs,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, visualize_first_batch_only, debug_mode, 
-                    gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta, use_edge_weights)
+                    gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta, use_edge_weights,
+                    checkpoint_dir)
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
@@ -256,12 +258,17 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
                             drop_last=True,         # discard last minibatch if it does not have enough snapshots
                             persistent_workers=True if num_workers > 0 else False) 
 
+    # Create checkpoint directory
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     print(f"Training on {device}")
     print(f"Dataset size: {len(dataset)} scenarios")
     print(f"Batch size: {batch_size}, num workers: {num_workers}")
     print(f"Sequence length: {sequence_length}")
-    print(f"Learning rate: {learning_rate} (with ReduceLROnPlateau scheduler)\n")
+    print(f"Learning rate: {learning_rate} (with ReduceLROnPlateau scheduler)")
+    print(f"Model checkpoints will be saved to: {checkpoint_dir}\n")
     best_val_loss = float('inf')
+    best_train_loss = float('inf')
     last_viz_batch = None  # Will store the last batch from the final epoch
 
     for epoch in range(epochs):
@@ -284,14 +291,49 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
             # Update learning rate scheduler based on validation loss
             scheduler.step(val_loss)
             
-            # Track best model
+            # Track best model and save checkpoint
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                # Optionally save best model here:
-                # torch.save(model.state_dict(), 'best_model.pt')
+                checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'val_loss': val_loss,
+                    'train_loss': avg_loss_epoch,
+                    'config': {
+                        'input_dim': input_dim,
+                        'hidden_channels': hidden_channels,
+                        'output_dim': output_dim,
+                        'num_layers': num_layers,
+                        'dropout': dropout,
+                        'topk': topk
+                    }
+                }, checkpoint_path)
+                print(f"  → Saved best model (val_loss: {val_loss:.6f}) to {checkpoint_path}")
         else:
-            # If no validation, use training loss for scheduler
+            # If no validation, use training loss for scheduler and save best based on train loss
             scheduler.step(avg_loss_epoch)
+            if avg_loss_epoch < best_train_loss:
+                best_train_loss = avg_loss_epoch
+                checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'train_loss': avg_loss_epoch,
+                    'config': {
+                        'input_dim': input_dim,
+                        'hidden_channels': hidden_channels,
+                        'output_dim': output_dim,
+                        'num_layers': num_layers,
+                        'dropout': dropout,
+                        'topk': topk
+                    }
+                }, checkpoint_path)
+                print(f"  → Saved best model (train_loss: {avg_loss_epoch:.6f}) to {checkpoint_path}")
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
@@ -326,6 +368,27 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
         else:
             print(f"Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss_epoch:.6f} | Cosine Sim: {avg_cosine_sim:.4f} | "
                   f"Angle Err: {avg_angle_error_deg:.1f}° | LR: {current_lr:.2e}")
+    
+    # Save final model
+    final_checkpoint_path = os.path.join(checkpoint_dir, 'final_model.pt')
+    torch.save({
+        'epoch': epochs - 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss if val_dataloader is not None else None,
+        'final_train_loss': avg_loss_epoch,
+        'config': {
+            'input_dim': input_dim,
+            'hidden_channels': hidden_channels,
+            'output_dim': output_dim,
+            'num_layers': num_layers,
+            'dropout': dropout,
+            'topk': topk
+        }
+    }, final_checkpoint_path)
+    print(f"\n✓ Training complete! Final model saved to {final_checkpoint_path}")
+    print(f"✓ Best model saved to {os.path.join(checkpoint_dir, 'best_model.pt')}")
 
     if should_finish_wandb:
         wandb_run.finish()

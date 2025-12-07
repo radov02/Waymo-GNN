@@ -15,12 +15,12 @@ radius = 30.0
 graph_creation_method = 'radius'    # 'radius' or 'star'
 sequence_length = 30    # max is 91
 max_num_scenarios_per_tfrecord_file = 1  # set to None if all
-use_edge_weights = True  # False to disable distance-based edge weights
+use_edge_weights = False  # False to disable distance-based edge weights
 
 # model:
 input_dim = 15      # 11 properties (vx, vy, speed, heading, valid, ax, ay, rel_x_sdc, rel_y_sdc, dist_sdc, dist_nearest) + 4 one-hot object type
 output_dim = 2      # predicting (dx, dy) for next timestep
-hidden_channels = 128
+hidden_channels = 64
 num_layers = 3
 topk = 7
 dropout = 0.2
@@ -48,3 +48,6 @@ viz_vehicles_only = True  # Only show vehicles (not pedestrians/cyclists) in tra
 viz_base_dir = 'visualizations'
 viz_training_dir = 'visualizations/training'
 viz_scenario_dir = 'visualizations/scenario_sequence'
+
+# model checkpoints:
+checkpoint_dir = 'checkpoints'
