@@ -7,6 +7,8 @@ data/graphs/training/*
 !data/graphs/*/.gitkeep
 !data/scenario/*/.gitkeep
 
+checkpoints/*
+
 .env
 wandb/*
 

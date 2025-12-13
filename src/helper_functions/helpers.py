@@ -20,8 +20,8 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.4, beta=0.1, 
     cosine_loss = (1 - cos_sim).mean()
     
     # heading direction alignment
-    heading = node_features[:, 3]   # already computed as node feature (atan2(vy, vx))
-    speed = node_features[:, 2] * 10.0  # Denormalize speed
+    heading = node_features[:, 3]   # already computed as node feature (atan2(vy, vx) / pi) → [-1, 1]
+    speed = node_features[:, 2] * 30.0  # Denormalize speed (normalized by MAX_SPEED=30)
     
     moving_mask = speed > 0.5        # filter out stopped/very slow agents (speed < 0.5 m/s)
     
@@ -39,12 +39,28 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.4, beta=0.1, 
     else:
         heading_direction_loss = torch.tensor(0.0, device=pred.device)
     
-    # velocity magnitude consistency - displacement should match velocity * dt
-    vx = node_features[:, 0] * 10.0  # denormalize velocity
-    vy = node_features[:, 1] * 10.0
+    # velocity magnitude consistency - displacement should roughly match velocity * dt
+    # BUT: this is only valid for constant velocity motion, which doesn't hold for turning/accelerating vehicles
+    # So we'll make this loss less strict and only apply to agents with low acceleration
+    vx = node_features[:, 0] * 30.0  # denormalize velocity (normalized by MAX_SPEED=30)
+    vy = node_features[:, 1] * 30.0
     velocity_vector = torch.stack([vx, vy], dim=1)
     expected_disp = velocity_vector * 0.1      # 0.1s timestep
-    velocity_magnitude_loss = F.mse_loss(pred, expected_disp)
+    
+    # Only apply velocity consistency to agents with low acceleration (approximately constant velocity)
+    if node_features.shape[1] > 6:  # Check if acceleration features exist
+        ax = node_features[:, 5] * 10.0  # denormalize acceleration (normalized by MAX_ACCEL=10)
+        ay = node_features[:, 6] * 10.0
+        accel_magnitude = torch.sqrt(ax**2 + ay**2 + 1e-6)
+        low_accel_mask = accel_magnitude < 2.0  # Less than 2 m/s² acceleration
+        
+        if low_accel_mask.any():
+            velocity_magnitude_loss = F.mse_loss(pred[low_accel_mask], expected_disp[low_accel_mask])
+        else:
+            velocity_magnitude_loss = torch.tensor(0.0, device=pred.device)
+    else:
+        # Fallback if no acceleration features (shouldn't happen with 15-dim features)
+        velocity_magnitude_loss = F.mse_loss(pred, expected_disp)
     
     # diversity penalty to prevent mode collapse:
     if len(pred) > 1:

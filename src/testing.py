@@ -2,11 +2,11 @@ import torch
 import os
 import numpy as np
 import torch.nn.functional as F
-from EvolveGCNH import EvolveGCNH
+from SpatioTemporalGNN import SpatioTemporalGNN
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, num_workers, num_layers, topk,
+from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     radius, input_dim, sequence_length, hidden_channels,
-                    dropout, checkpoint_dir, use_edge_weights)
+                    dropout, checkpoint_dir, use_edge_weights, use_gat)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from helper_functions.helpers import compute_metrics
@@ -25,13 +25,14 @@ def load_trained_model(checkpoint_path, device):
     
     # Recreate model with saved config
     config = checkpoint['config']
-    model = EvolveGCNH(
+    model = SpatioTemporalGNN(
         input_dim=config['input_dim'],
         hidden_dim=config['hidden_channels'],
-        output_dim=config['output_dim'],
-        num_layers=config['num_layers'],
+        output_dim=config.get('output_dim', 2),
+        num_gcn_layers=config['num_layers'],
+        num_gru_layers=config.get('num_gru_layers', 1),
         dropout=config['dropout'],
-        topk=config['topk']
+        use_gat=config.get('use_gat', False)
     ).to(device)
     
     # Load weights
@@ -45,7 +46,6 @@ def load_trained_model(checkpoint_path, device):
         print(f"  Training loss: {checkpoint['train_loss']:.6f}")
     
     return model, checkpoint
-
 
 def predict_single_step(model, graph, device, edge_weights=None):
     """
@@ -90,7 +90,7 @@ def autoregressive_rollout(model, initial_graph, num_steps, device, edge_weights
     5. Repeat for num_steps
     
     Args:
-        model: Trained EvolveGCNH model
+        model: Trained SpatioTemporalGNN model
         initial_graph: PyG Data object at time t
         num_steps: Number of future timesteps to predict
         device: Torch device
@@ -230,8 +230,9 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             for t in range(T):
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
             
-            # Reset GRU hidden states for this scenario
-            model.reset_gru_hidden_states(batch_size=1)
+            # Reset GRU hidden states for this scenario (per-agent)
+            num_nodes = batched_graph_sequence[0].num_nodes
+            model.reset_gru_hidden_states(num_agents=num_nodes)
             
             # Warm-up: process first half of sequence to initialize GRU states
             warmup_steps = T // 2
@@ -386,7 +387,7 @@ def run_testing(test_dataset_path="./data/graphs/testing/testing.hdf5",
     
     test_dataloader = DataLoader(
         test_dataset,
-        batch_size=1,  # Must be 1 for EvolveGCN
+        batch_size=1,  # Must be 1 for per-scenario temporal processing
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_graph_sequences_to_batch,

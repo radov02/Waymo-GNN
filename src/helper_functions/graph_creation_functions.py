@@ -148,17 +148,41 @@ def get_data_files(filepath):
         print(e)
 
 def parse_scenario_file(file):
+    from waymo_open_dataset.protos import scenario_pb2
+    
+    # Check if file exists and has content
+    if not os.path.exists(file):
+        print(f"  ERROR: File does not exist: {file}")
+        return []
+    
+    file_size = os.path.getsize(file)
+    print(f"  File size: {file_size} bytes")
+    
+    if file_size == 0:
+        print(f"  ERROR: File is empty: {file}")
+        return []
+    
     scenario_dataset = tf.data.TFRecordDataset(file, compression_type='')
     scenarios = []
-    from waymo_open_dataset.protos import scenario_pb2
+    record_count = 0
 
-    for raw_record in scenario_dataset:
-        try:
-            scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
-            scenarios.append(scenario)
-        except Exception as e:
-            print(f"Error parsing scenario: {e}")
-            break
+    try:
+        for idx, raw_record in enumerate(scenario_dataset):
+            record_count += 1
+            try:
+                scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
+                scenarios.append(scenario)
+            except Exception as e:
+                print(f"  ERROR parsing scenario {idx} in {file}: {e}")
+                continue  # Continue instead of break to process remaining scenarios
+    except Exception as e:
+        print(f"  ERROR iterating TFRecordDataset for {file}: {e}")
+    
+    print(f"  Found {record_count} records, successfully parsed {len(scenarios)} scenarios")
+    
+    if len(scenarios) == 0 and record_count == 0:
+        print(f"  WARNING: No records found in {file} - file may be corrupted or wrong format")
+    
     return scenarios
 
 def create_scenario_dataset_dict(files, prinT=False):
@@ -280,6 +304,11 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
         [10]    dist_to_nearest_norm (normalized distance to nearest neighbor)
         [11-14] one-hot type (vehicle, pedestrian, cyclist, other)
     """
+    # Bounds check for testing data (only 11 timesteps)
+    if timestep >= len(agent.states):
+        # Return zero vector if timestep out of bounds
+        return torch.zeros(15, dtype=torch.float32)
+    
     state = agent.states[timestep]
     
     # Normalization constants
@@ -311,6 +340,7 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
             ay_norm = ay / MAX_ACCEL
     
     # Relative position to SDC (ego vehicle) - normalized
+    # NOTE: Waymo dataset uses CENTIMETERS, so divide by 100.0 to convert to meters first
     rel_x_to_sdc_norm, rel_y_to_sdc_norm, dist_to_sdc_norm = 0.0, 0.0, 0.0
     if scenario is not None:
         sdc_track_index = scenario.sdc_track_index
@@ -318,8 +348,9 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
             sdc_track = scenario.tracks[sdc_track_index]
             sdc_state = sdc_track.states[timestep]
             if sdc_state.valid and state.valid:
-                rel_x = state.center_x - sdc_state.center_x
-                rel_y = state.center_y - sdc_state.center_y
+                # Convert from centimeters to meters
+                rel_x = (state.center_x - sdc_state.center_x) / 100.0
+                rel_y = (state.center_y - sdc_state.center_y) / 100.0
                 dist_to_sdc = (rel_x**2 + rel_y**2)**0.5
                 
                 rel_x_to_sdc_norm = rel_x / MAX_DIST_SDC
@@ -327,13 +358,15 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
                 dist_to_sdc_norm = min(dist_to_sdc / MAX_DIST_SDC, 1.0)  # clip to [0, 1]
     
     # Distance to nearest neighbor - normalized
+    # NOTE: all_positions are in CENTIMETERS, convert to meters
     dist_to_nearest_norm = 1.0  # default: far away (normalized max)
     if all_positions is not None and state.valid and len(all_positions) > 1:
         current_pos = (state.center_x, state.center_y)
         min_dist = float('inf')
         for pos in all_positions:
             if pos != current_pos:
-                d = math.sqrt((pos[0] - current_pos[0])**2 + (pos[1] - current_pos[1])**2)
+                # Distance in centimeters, convert to meters
+                d = math.sqrt((pos[0] - current_pos[0])**2 + (pos[1] - current_pos[1])**2) / 100.0
                 min_dist = min(min_dist, d)
         if min_dist != float('inf'):
             dist_to_nearest_norm = min(min_dist / MAX_DIST_NEAREST, 1.0)  # clip to [0, 1]
@@ -477,8 +510,12 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                 scenario_group = scenarios_group.create_group(str(scenario.scenario_id))
                 snapshots_group = scenario_group.create_group("snapshot_graphs")
                 
+                # Detect actual sequence length from this scenario (testing=11, training=91)
+                actual_timesteps = len(scenario.tracks[0].states) if len(scenario.tracks) > 0 else 0
+                max_timestep = min(actual_timesteps - 1, sequence_length - 1)  # Use min of actual and config
+                
                 # Create and save graphs for this scenario
-                for timestep in range(sequence_length - 1):
+                for timestep in range(max_timestep):
                     graph = timestep_to_pyg_data(scenario, timestep, radius, method=graph_creation_method)
                     snapshot_group = snapshots_group.create_group(str(timestep))
                     

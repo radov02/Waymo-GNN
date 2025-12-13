@@ -275,12 +275,13 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
         timestep_indices = np.arange(total_T)
         T = total_T
     
-    # Reset hidden states with correct batch size
-    model.reset_gru_hidden_states(batch_size=B)
-    
-    # Move to device
+    # Move to device first to get correct num_nodes
     for t in range(len(batch_dict["batch"])):
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+    
+    # Reset hidden states with correct number of agents
+    num_nodes = batched_graph_sequence[0].num_nodes
+    model.reset_gru_hidden_states(num_agents=num_nodes)
     
     # Denormalization factor (we normalized by dividing by 100)
     POSITION_SCALE = 100.0

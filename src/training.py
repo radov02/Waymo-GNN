@@ -2,14 +2,15 @@ import torch
 import os
 import wandb
 import torch.nn.functional as F
-from EvolveGCNH import EvolveGCNH
+from SpatioTemporalGNN import SpatioTemporalGNN
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, num_workers, num_layers, topk, epochs, 
+from config import (device, batch_size, num_workers, num_layers, num_gru_layers, epochs, 
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
-                    visualize_every_n_epochs, visualize_first_batch_only, debug_mode, 
+                    visualize_every_n_epochs, debug_mode, use_gat,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta, use_edge_weights,
-                    checkpoint_dir)
+                    checkpoint_dir, scheduler_patience, scheduler_factor, min_lr,
+                    early_stopping_patience, early_stopping_min_delta)
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
@@ -18,6 +19,37 @@ from helper_functions.visualization_functions import visualize_epoch
 from helper_functions.helpers import advanced_directional_loss, compute_metrics
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/training.py
+
+
+class EarlyStopping:
+    """Early stopping to stop training when validation loss doesn't improve."""
+    
+    def __init__(self, patience=10, min_delta=0.001, verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f"  EarlyStopping counter: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+            
+    def reset(self):
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
 
 def train_single_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_beta, loss_gamma, loss_delta, 
                        device, epoch, visualize_callback=None):
@@ -36,7 +68,7 @@ def train_single_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_b
     
     for batch, batch_dict in enumerate(dataloader):
         batched_graph_sequence = batch_dict["batch"]  # list of length T of Batch objects
-        B = batch_dict["B"]  # always 1 for EvolveGCN
+        B = batch_dict["B"]  # always 1 for per-scenario temporal processing
         T = batch_dict["T"]
         
         assert B == 1, f"batch_size must be 1 for EvolveGCN! Got B={B}"
@@ -45,7 +77,9 @@ def train_single_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_b
         for t in range(T): 
             batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
-        model.reset_gru_hidden_states(batch_size=1)     # reset GRU hidden states (GCN parameters) for this scenario
+        # Reset GRU hidden states for this scenario (per-agent hidden states)
+        num_nodes = batched_graph_sequence[0].num_nodes
+        model.reset_gru_hidden_states(num_agents=num_nodes)
         
         optimizer.zero_grad()
         accumulated_loss = 0.0
@@ -127,12 +161,14 @@ def validate_single_epoch(model, dataloader, loss_fn, loss_alpha, loss_beta, los
             B = batch_dict["B"]
             T = batch_dict["T"]
             
-            assert B == 1, f"batch_size must be 1 for EvolveGCN! Got B={B}"
+            assert B == 1, f"batch_size must be 1 for per-scenario processing! Got B={B}"
 
             for t in range(T): 
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
 
-            model.reset_gru_hidden_states(batch_size=1)
+            # Reset GRU for this validation scenario
+            num_nodes = batched_graph_sequence[0].num_nodes
+            model.reset_gru_hidden_states(num_agents=num_nodes)
             
             accumulated_loss = 0.0
             
@@ -140,8 +176,9 @@ def validate_single_epoch(model, dataloader, loss_fn, loss_alpha, loss_beta, los
                 if batched_graph.y is None or torch.all(batched_graph.y == 0):
                     continue
                 
+                edge_w = batched_graph.edge_attr if use_edge_weights else None
                 out_predictions = model(batched_graph.x, batched_graph.edge_index,
-                                      edge_weight=None,
+                                      edge_weight=edge_w,
                                       batch=batched_graph.batch, batch_size=1, 
                                       batch_num=batch, timestep=t)
                 
@@ -189,38 +226,44 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
         wandb_run = wandb.init(
             project=project_name,
             config={
+                "model": "SpatioTemporalGNN",
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
                 "dataset": dataset_name,
                 "dropout": dropout,
                 "hidden_channels": hidden_channels,
-                "topk": topk,
-                "num_layers": num_layers,
+                "num_gcn_layers": num_layers,
+                "num_gru_layers": num_gru_layers,
+                "use_gat": use_gat,
                 "epochs": epochs,
                 "loss_alpha": loss_alpha,
                 "loss_beta": loss_beta,
                 "loss_gamma": loss_gamma,
                 "loss_delta": loss_delta,
                 "use_edge_weights": use_edge_weights,
-                "scheduler": "ReduceLROnPlateau"
+                "scheduler": "ReduceLROnPlateau",
+                "early_stopping_patience": early_stopping_patience
             },
-            name=f"GCN_r{radius}_h{hidden_channels}_vel_guided{'_ew' if use_edge_weights else ''}",
+            name=f"SpatioTemporalGNN_r{radius}_h{hidden_channels}{'_gat' if use_gat else ''}{'_ew' if use_edge_weights else ''}",
             dir="../wandb"
         )
         should_finish_wandb = True
 
-    model = EvolveGCNH(
-            input_dim=input_dim,
-            hidden_dim=hidden_channels,
-            output_dim=2,       # we are predicting the position displacements
-            num_layers=num_layers,
-            dropout=dropout,
-            topk=topk
-        ).to(device)
+    # Initialize SpatioTemporalGNN
+    model = SpatioTemporalGNN(
+        input_dim=input_dim,
+        hidden_dim=hidden_channels,
+        output_dim=output_dim,
+        num_gcn_layers=num_layers,
+        num_gru_layers=num_gru_layers,
+        dropout=dropout,
+        use_gat=use_gat
+    ).to(device)
     wandb.watch(model, log='all', log_freq=10)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
+                                  patience=scheduler_patience, verbose=True, min_lr=min_lr)
     loss_fn = advanced_directional_loss
 
     # Load training dataset
@@ -261,11 +304,19 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
     
+    # Initialize early stopping
+    early_stopper = EarlyStopping(
+        patience=early_stopping_patience, 
+        min_delta=early_stopping_min_delta, 
+        verbose=True
+    )
+    
     print(f"Training on {device}")
     print(f"Dataset size: {len(dataset)} scenarios")
     print(f"Batch size: {batch_size}, num workers: {num_workers}")
     print(f"Sequence length: {sequence_length}")
     print(f"Learning rate: {learning_rate} (with ReduceLROnPlateau scheduler)")
+    print(f"Early stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
     print(f"Model checkpoints will be saved to: {checkpoint_dir}\n")
     best_val_loss = float('inf')
     best_train_loss = float('inf')
@@ -291,6 +342,9 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
             # Update learning rate scheduler based on validation loss
             scheduler.step(val_loss)
             
+            # Check early stopping
+            early_stopper(val_loss)
+            
             # Track best model and save checkpoint
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -307,14 +361,16 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
                         'hidden_channels': hidden_channels,
                         'output_dim': output_dim,
                         'num_layers': num_layers,
+                        'num_gru_layers': num_gru_layers,
                         'dropout': dropout,
-                        'topk': topk
+                        'use_gat': use_gat
                     }
                 }, checkpoint_path)
                 print(f"  → Saved best model (val_loss: {val_loss:.6f}) to {checkpoint_path}")
         else:
             # If no validation, use training loss for scheduler and save best based on train loss
             scheduler.step(avg_loss_epoch)
+            early_stopper(avg_loss_epoch)  # Use train loss for early stopping if no validation
             if avg_loss_epoch < best_train_loss:
                 best_train_loss = avg_loss_epoch
                 checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
@@ -329,8 +385,9 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
                         'hidden_channels': hidden_channels,
                         'output_dim': output_dim,
                         'num_layers': num_layers,
+                        'num_gru_layers': num_gru_layers,
                         'dropout': dropout,
-                        'topk': topk
+                        'use_gat': use_gat
                     }
                 }, checkpoint_path)
                 print(f"  → Saved best model (train_loss: {avg_loss_epoch:.6f}) to {checkpoint_path}")
@@ -368,23 +425,31 @@ def run_training(dataset_path="./data/graphs/training/training.hdf5",
         else:
             print(f"Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss_epoch:.6f} | Cosine Sim: {avg_cosine_sim:.4f} | "
                   f"Angle Err: {avg_angle_error_deg:.1f}° | LR: {current_lr:.2e}")
+        
+        # Check early stopping
+        if early_stopper.early_stop:
+            print(f"\n⚠️  Early stopping triggered at epoch {epoch+1}!")
+            print(f"   Best {'validation' if val_dataloader else 'training'} loss: {early_stopper.best_loss:.6f}")
+            break
     
     # Save final model
     final_checkpoint_path = os.path.join(checkpoint_dir, 'final_model.pt')
     torch.save({
-        'epoch': epochs - 1,
+        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_val_loss': best_val_loss if val_dataloader is not None else None,
         'final_train_loss': avg_loss_epoch,
+        'early_stopped': early_stopper.early_stop,
         'config': {
             'input_dim': input_dim,
             'hidden_channels': hidden_channels,
             'output_dim': output_dim,
             'num_layers': num_layers,
+            'num_gru_layers': num_gru_layers,
             'dropout': dropout,
-            'topk': topk
+            'use_gat': use_gat
         }
     }, final_checkpoint_path)
     print(f"\n✓ Training complete! Final model saved to {final_checkpoint_path}")
