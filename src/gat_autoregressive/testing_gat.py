@@ -1,0 +1,512 @@
+"""Testing script for GAT-based autoregressive trajectory prediction.
+
+This module evaluates trained GAT models using autoregressive multi-step prediction.
+"""
+
+import sys
+import os
+# Add parent directory (src/) to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Set matplotlib backend to non-interactive before importing pyplot
+import matplotlib
+matplotlib.use('Agg')
+
+import torch
+import numpy as np
+import torch.nn.functional as F
+from SpatioTemporalGAT import SpatioTemporalGAT
+from dataset import HDF5ScenarioDataset
+from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
+                    radius, input_dim, output_dim, sequence_length, hidden_channels,
+                    dropout,
+                    num_gpus, use_data_parallel, setup_model_parallel, load_model_state)
+from torch.utils.data import DataLoader
+from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
+from helper_functions.helpers import compute_metrics
+from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features,
+                                                       MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
+import matplotlib.pyplot as plt
+
+# PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing.py
+
+# GAT-specific directories
+CHECKPOINT_DIR = 'checkpoints/gat'
+CHECKPOINT_DIR_AUTOREG = 'checkpoints/gat/autoregressive'
+VIZ_DIR = 'visualizations/autoreg/gat/testing'
+
+# Constants
+POSITION_SCALE = 100.0
+
+
+def load_trained_model(checkpoint_path, device):
+    """Load a trained GAT model from checkpoint."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    print(f"Loading GAT model from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    config = checkpoint['config']
+    model = SpatioTemporalGAT(
+        input_dim=config['input_dim'],
+        hidden_dim=config['hidden_channels'],
+        output_dim=config.get('output_dim', 2),
+        num_gat_layers=config['num_layers'],
+        num_gru_layers=config.get('num_gru_layers', 1),
+        dropout=config['dropout'],
+        num_heads=config.get('num_heads', 4)
+    )
+    
+    model, is_parallel = setup_model_parallel(model, device)
+    load_model_state(model, checkpoint['model_state_dict'], is_parallel)
+    model.eval()
+    
+    print(f"✓ GAT Model loaded from epoch {checkpoint['epoch']}")
+    if 'val_loss' in checkpoint:
+        print(f"  Validation loss: {checkpoint['val_loss']:.6f}")
+    if 'train_loss' in checkpoint:
+        print(f"  Training loss: {checkpoint['train_loss']:.6f}")
+    
+    return model, checkpoint
+
+
+def predict_single_step(model, graph, device):
+    """Predict one timestep ahead for all agents in a graph."""
+    graph = graph.to(device)
+    
+    with torch.no_grad():
+        # GAT doesn't use edge weights
+        predictions = model(
+            graph.x, 
+            graph.edge_index,
+            batch=graph.batch,
+            batch_size=1,
+            batch_num=0,
+            timestep=0
+        )
+    
+    return predictions
+
+
+def update_graph_features(graph, pred_displacement, device):
+    """Update node features based on predicted displacement."""
+    updated_graph = graph.clone()
+    
+    if hasattr(updated_graph, 'pos'):
+        updated_graph.pos = updated_graph.pos + pred_displacement * 100.0
+    
+    dt = 0.1
+    
+    new_vx = pred_displacement[:, 0] / dt
+    new_vy = pred_displacement[:, 1] / dt
+    
+    old_vx = updated_graph.x[:, 0]
+    old_vy = updated_graph.x[:, 1]
+    ax = (new_vx - old_vx) / dt / 10.0
+    ay = (new_vy - old_vy) / dt / 10.0
+    
+    updated_graph.x[:, 0] = new_vx
+    updated_graph.x[:, 1] = new_vy
+    updated_graph.x[:, 2] = torch.sqrt(new_vx**2 + new_vy**2)
+    updated_graph.x[:, 3] = torch.atan2(new_vy, new_vx) / np.pi
+    updated_graph.x[:, 5] = ax
+    updated_graph.x[:, 6] = ay
+    
+    return updated_graph
+
+
+def autoregressive_rollout(model, initial_graph, num_steps, device):
+    """Autoregressive multi-step prediction."""
+    model.eval()
+    current_graph = initial_graph.clone().to(device)
+    
+    all_predictions = []
+    updated_graphs = [current_graph.cpu()]
+    
+    for step in range(num_steps):
+        pred_displacement = predict_single_step(model, current_graph, device)
+        all_predictions.append(pred_displacement.cpu())
+        current_graph = update_graph_features(current_graph, pred_displacement, device)
+        updated_graphs.append(current_graph.cpu())
+    
+    return all_predictions, updated_graphs
+
+
+def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_scenarios=None):
+    """Evaluate GAT model using autoregressive rollout on test set."""
+    model.eval()
+    
+    horizons = [10, 30, 50, min(80, num_rollout_steps)]
+    horizon_metrics = {h: {'ade': [], 'fde': [], 'angle_error': [], 'cosine_sim': []} for h in horizons}
+    
+    all_scenario_results = []
+    scenario_count = 0
+    
+    print(f"\nEvaluating GAT with {num_rollout_steps}-step autoregressive rollout...")
+    print(f"Horizons: {[f'{h*0.1}s' for h in horizons]}")
+    
+    with torch.no_grad():
+        for batch_idx, batch_dict in enumerate(dataloader):
+            if max_scenarios and scenario_count >= max_scenarios:
+                break
+            
+            batched_graph_sequence = batch_dict["batch"]
+            B = batch_dict["B"]
+            T = batch_dict["T"]
+            scenario_ids = batch_dict.get("scenario_ids", [])
+            
+            for t in range(T):
+                batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+            
+            num_nodes = batched_graph_sequence[0].num_nodes
+            model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+            
+            warmup_steps = T // 2
+            print(f"Scenario {scenario_count+1} ({scenario_ids[0] if scenario_ids else 'unknown'}): "
+                  f"Warming up with {warmup_steps} steps, then rolling out {num_rollout_steps} steps...")
+            
+            for t in range(warmup_steps):
+                graph = batched_graph_sequence[t]
+                _ = predict_single_step(model, graph, device)
+            
+            actual_rollout = min(num_rollout_steps, T - warmup_steps - 1)
+            if actual_rollout <= 0:
+                print(f"  Skipping: not enough timesteps for rollout")
+                continue
+            
+            initial_graph = batched_graph_sequence[warmup_steps]
+            predictions, _ = autoregressive_rollout(model, initial_graph, actual_rollout, device)
+            
+            ground_truths = []
+            for step in range(1, actual_rollout + 1):
+                if warmup_steps + step < T:
+                    gt_graph = batched_graph_sequence[warmup_steps + step]
+                    ground_truths.append(gt_graph.y.cpu())
+                else:
+                    break
+            
+            scenario_metrics = {}
+            for horizon in horizons:
+                if horizon <= len(predictions) and horizon <= len(ground_truths):
+                    ade = 0.0
+                    for step in range(horizon):
+                        pred = predictions[step] * 100.0
+                        gt = ground_truths[step] * 100.0
+                        displacement_error = torch.norm(pred - gt, dim=1).mean()
+                        ade += displacement_error.item()
+                    ade /= horizon
+                    
+                    pred_final = predictions[horizon-1] * 100.0
+                    gt_final = ground_truths[horizon-1] * 100.0
+                    fde = torch.norm(pred_final - gt_final, dim=1).mean().item()
+                    
+                    pred_angle = torch.atan2(predictions[horizon-1][:, 1], predictions[horizon-1][:, 0])
+                    gt_angle = torch.atan2(ground_truths[horizon-1][:, 1], ground_truths[horizon-1][:, 0])
+                    angle_diff = torch.atan2(torch.sin(pred_angle - gt_angle), torch.cos(pred_angle - gt_angle))
+                    angle_error = torch.abs(angle_diff).mean().item() * 180 / np.pi
+                    
+                    pred_norm = F.normalize(predictions[horizon-1], p=2, dim=1, eps=1e-6)
+                    gt_norm = F.normalize(ground_truths[horizon-1], p=2, dim=1, eps=1e-6)
+                    cosine_sim = F.cosine_similarity(pred_norm, gt_norm, dim=1).mean().item()
+                    
+                    horizon_metrics[horizon]['ade'].append(ade)
+                    horizon_metrics[horizon]['fde'].append(fde)
+                    horizon_metrics[horizon]['angle_error'].append(angle_error)
+                    horizon_metrics[horizon]['cosine_sim'].append(cosine_sim)
+                    
+                    scenario_metrics[f'{horizon*0.1}s'] = {
+                        'ade': ade,
+                        'fde': fde,
+                        'angle_error': angle_error,
+                        'cosine_sim': cosine_sim
+                    }
+            
+            all_scenario_results.append({
+                'scenario_id': scenario_ids[0] if scenario_ids else f'scenario_{batch_idx}',
+                'metrics': scenario_metrics
+            })
+            
+            print(f"  Metrics:")
+            for h in horizons:
+                if f'{h*0.1}s' in scenario_metrics:
+                    m = scenario_metrics[f'{h*0.1}s']
+                    print(f"    {h*0.1}s: ADE={m['ade']:.2f}m, FDE={m['fde']:.2f}m, "
+                          f"Angle={m['angle_error']:.1f}°, Cos={m['cosine_sim']:.3f}")
+            
+            scenario_count += 1
+    
+    print("\n" + "="*80)
+    print("GAT AGGREGATED TEST RESULTS")
+    print("="*80)
+    
+    results = {
+        'horizons': {},
+        'scenarios': all_scenario_results
+    }
+    
+    for horizon in horizons:
+        if horizon_metrics[horizon]['ade']:
+            results['horizons'][f'{horizon*0.1}s'] = {
+                'ade_mean': np.mean(horizon_metrics[horizon]['ade']),
+                'ade_std': np.std(horizon_metrics[horizon]['ade']),
+                'fde_mean': np.mean(horizon_metrics[horizon]['fde']),
+                'fde_std': np.std(horizon_metrics[horizon]['fde']),
+                'angle_error_mean': np.mean(horizon_metrics[horizon]['angle_error']),
+                'angle_error_std': np.std(horizon_metrics[horizon]['angle_error']),
+                'cosine_sim_mean': np.mean(horizon_metrics[horizon]['cosine_sim']),
+                'cosine_sim_std': np.std(horizon_metrics[horizon]['cosine_sim'])
+            }
+            
+            r = results['horizons'][f'{horizon*0.1}s']
+            print(f"\n{horizon*0.1}s Horizon ({horizon} steps):")
+            print(f"  ADE: {r['ade_mean']:.2f} ± {r['ade_std']:.2f} m")
+            print(f"  FDE: {r['fde_mean']:.2f} ± {r['fde_std']:.2f} m")
+            print(f"  Angle Error: {r['angle_error_mean']:.1f} ± {r['angle_error_std']:.1f}°")
+            print(f"  Cosine Sim: {r['cosine_sim_mean']:.3f} ± {r['cosine_sim_std']:.3f}")
+    
+    print("\n" + "="*80)
+    
+    return results
+
+
+def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
+    """Visualize predictions vs ground truth for a test scenario."""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    batched_graph_sequence = batch_dict["batch"]
+    T = batch_dict["T"]
+    scenario_ids = batch_dict.get("scenario_ids", [])
+    scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{scenario_idx}"
+    
+    for t in range(T):
+        batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+    
+    num_nodes = batched_graph_sequence[0].num_nodes
+    model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+    
+    # Find persistent agents
+    persistent_agent_ids = None
+    for t in range(T):
+        graph = batched_graph_sequence[t]
+        current_ids = set(graph.agent_id.cpu().numpy())
+        if persistent_agent_ids is None:
+            persistent_agent_ids = current_ids
+        else:
+            persistent_agent_ids = persistent_agent_ids & current_ids
+    
+    persistent_agent_ids = sorted(list(persistent_agent_ids))
+    if len(persistent_agent_ids) == 0:
+        print(f"  No persistent agents found, skipping visualization")
+        return
+    
+    # Collect ground truth positions
+    gt_positions = {agent_id: [] for agent_id in persistent_agent_ids}
+    
+    for t in range(T):
+        graph = batched_graph_sequence[t]
+        agent_ids_t = graph.agent_id.cpu().numpy()
+        positions_t = graph.pos.cpu().numpy()
+        
+        for agent_id in persistent_agent_ids:
+            idx = np.where(agent_ids_t == agent_id)[0]
+            if len(idx) > 0:
+                gt_positions[agent_id].append(positions_t[idx[0]])
+    
+    # Run autoregressive prediction
+    warmup_steps = T // 2
+    num_rollout_steps = min(T - warmup_steps - 1, 20)
+    
+    if num_rollout_steps <= 0:
+        print(f"  Not enough timesteps for visualization")
+        return
+    
+    for t in range(warmup_steps):
+        graph = batched_graph_sequence[t]
+        _ = predict_single_step(model, graph, device)
+    
+    initial_graph = batched_graph_sequence[warmup_steps]
+    agent_ids_init = initial_graph.agent_id.cpu().numpy()
+    positions_init = initial_graph.pos.cpu().numpy()
+    
+    predictions, _ = autoregressive_rollout(model, initial_graph, num_rollout_steps, device)
+    
+    # Build predicted trajectories
+    pred_positions = {agent_id: [] for agent_id in persistent_agent_ids}
+    
+    for agent_id in persistent_agent_ids:
+        idx = np.where(agent_ids_init == agent_id)[0]
+        if len(idx) == 0:
+            continue
+        idx = idx[0]
+        
+        current_pos = positions_init[idx].copy()
+        pred_positions[agent_id].append(current_pos.copy())
+        
+        for step_pred in predictions:
+            pred_np = step_pred.cpu().numpy()
+            if idx < len(pred_np):
+                displacement = pred_np[idx] * POSITION_SCALE
+                current_pos = current_pos + displacement
+                pred_positions[agent_id].append(current_pos.copy())
+    
+    # Create visualization
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(persistent_agent_ids))))
+    agent_colors = {agent_id: colors[i % len(colors)] for i, agent_id in enumerate(persistent_agent_ids)}
+    
+    total_error = 0
+    num_agents_plotted = 0
+    
+    for agent_id in persistent_agent_ids:
+        gt_traj = np.array(gt_positions[agent_id])
+        pred_traj = np.array(pred_positions[agent_id])
+        
+        if len(gt_traj) < 2 or len(pred_traj) < 2:
+            continue
+        
+        color = agent_colors[agent_id]
+        
+        ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color=color, linewidth=1.5,
+                label=f'Agent {agent_id} GT' if num_agents_plotted < 5 else None)
+        
+        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, linewidth=1.5,
+                label=f'Agent {agent_id} Pred' if num_agents_plotted < 5 else None)
+        
+        # Mark start and end points of ground truth
+        ax.scatter(gt_traj[0, 0], gt_traj[0, 1], color=color, marker='o', s=30, zorder=5)
+        ax.scatter(gt_traj[-1, 0], gt_traj[-1, 1], color=color, marker='x', s=30, zorder=5)
+        
+        # Mark predicted trajectory endpoint (same color as prediction, square marker)
+        ax.scatter(pred_traj[-1, 0], pred_traj[-1, 1], color=color, marker='s', s=40, 
+                   edgecolors='black', linewidths=0.5, zorder=6)
+        
+        gt_segment = np.array(gt_positions[agent_id][warmup_steps:warmup_steps+len(pred_traj)])
+        if len(gt_segment) > 0 and len(pred_traj) > 0:
+            min_len = min(len(gt_segment), len(pred_traj))
+            errors = np.linalg.norm(gt_segment[:min_len] - pred_traj[:min_len], axis=1)
+            agent_ade = np.mean(errors)
+            total_error += agent_ade
+            num_agents_plotted += 1
+    
+    avg_error = total_error / max(1, num_agents_plotted)
+    
+    ax.set_xlabel('X (meters)')
+    ax.set_ylabel('Y (meters)')
+    ax.set_title(f'GAT Test Scenario {scenario_id}\n'
+                 f'{num_agents_plotted} agents, {num_rollout_steps} rollout steps\n'
+                 f'Average Displacement Error: {avg_error:.2f}m')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    
+    save_path = os.path.join(save_dir, f'gat_test_scenario_{scenario_idx:04d}_{scenario_id}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"  Saved: {save_path} (ADE: {avg_error:.2f}m)")
+    return avg_error
+
+
+def run_testing(test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
+                checkpoint_path=None,
+                num_rollout_steps=20,
+                max_scenarios=None,
+                visualize=True,
+                visualize_max=10):
+    """Run testing with autoregressive multi-step prediction using GAT model."""
+    
+    # Use autoregressive checkpoint by default
+    if checkpoint_path is None:
+        autoreg_path = os.path.join(CHECKPOINT_DIR_AUTOREG, 'best_autoregressive_20step.pt')
+        base_path = os.path.join(CHECKPOINT_DIR, 'best_model.pt')
+        
+        if os.path.exists(autoreg_path):
+            checkpoint_path = autoreg_path
+            print(f"Using GAT autoregressive fine-tuned checkpoint")
+        elif os.path.exists(base_path):
+            checkpoint_path = base_path
+            print(f"Using GAT base single-step checkpoint")
+        else:
+            print(f"ERROR: No GAT checkpoint found!")
+            print(f"  Checked: {autoreg_path}")
+            print(f"  Checked: {base_path}")
+            exit(1)
+    
+    # Load model
+    model, checkpoint = load_trained_model(checkpoint_path, device)
+    
+    # Load test dataset
+    try:
+        test_dataset = HDF5ScenarioDataset(test_dataset_path, seq_len=sequence_length)
+        print(f"\n✓ Loaded test dataset: {len(test_dataset)} scenarios")
+    except FileNotFoundError:
+        print(f"ERROR: {test_dataset_path} not found!")
+        print("Please run graph_creation_and_saving.py to create test data.")
+        exit(1)
+    
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_graph_sequences_to_batch,
+        drop_last=False
+    )
+    
+    effective_rollout = min(num_rollout_steps, sequence_length - 2)
+    
+    print(f"\nGAT Test Configuration:")
+    print(f"  Device: {device}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Rollout steps: {effective_rollout} ({effective_rollout * 0.1:.1f}s)")
+    print(f"  Max scenarios: {max_scenarios if max_scenarios else 'all'}")
+    
+    # Create visualization directory
+    os.makedirs(VIZ_DIR, exist_ok=True)
+    
+    # Run evaluation with visualization
+    if visualize:
+        print(f"\nGenerating visualizations (max {visualize_max} scenarios)...")
+        viz_count = 0
+        total_ade = 0
+        
+        for batch_idx, batch_dict in enumerate(test_dataloader):
+            if viz_count >= visualize_max:
+                break
+            
+            ade = visualize_test_scenario(model, batch_dict, batch_idx, VIZ_DIR, device)
+            if ade is not None:
+                total_ade += ade
+                viz_count += 1
+        
+        if viz_count > 0:
+            print(f"\nVisualization Summary:")
+            print(f"  Scenarios visualized: {viz_count}")
+            print(f"  Average ADE: {total_ade / viz_count:.2f}m")
+            print(f"  Saved to: {VIZ_DIR}")
+    
+    # Run full evaluation
+    results = evaluate_autoregressive(
+        model, test_dataloader, effective_rollout, device, max_scenarios
+    )
+    
+    # Save results
+    results_path = os.path.join(CHECKPOINT_DIR_AUTOREG, 'test_results.pt')
+    os.makedirs(CHECKPOINT_DIR_AUTOREG, exist_ok=True)
+    torch.save(results, results_path)
+    print(f"\n✓ Results saved to {results_path}")
+    
+    return results
+
+
+if __name__ == '__main__':
+    results = run_testing(
+        test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
+        checkpoint_path=None,
+        num_rollout_steps=20,
+        max_scenarios=10,
+        visualize=True,
+        visualize_max=5
+    )
