@@ -1,32 +1,60 @@
 #!/bin/bash
 # =============================================================================
-# Remote Instance Setup Script (No Docker Required)
-# For instances with pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime base
+# Remote Instance Setup Script for Blackwell GPUs (sm_120)
+# RTX PRO 6000 Blackwell Server Edition requires PyTorch 2.5+
 # =============================================================================
 
 set -e  # Exit on error
 
 echo "=========================================="
 echo "Setting up Waymo GNN Training Environment"
+echo "For Blackwell GPU (sm_120) Support"
 echo "=========================================="
 
 # Check if we're on a GPU instance
 echo ""
-echo "[1/6] Checking GPU availability..."
+echo "[1/7] Checking GPU availability..."
 if command -v nvidia-smi &> /dev/null; then
-    nvidia-smi --query-gpu=name,memory.total --format=csv
+    nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv
 else
     echo "WARNING: nvidia-smi not found. GPU might not be available."
 fi
 
-# Check PyTorch and CUDA
+# Uninstall old PyTorch
 echo ""
-echo "[2/6] Verifying PyTorch and CUDA..."
-python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU count: {torch.cuda.device_count()}')"
+echo "[2/7] Removing old PyTorch (incompatible with Blackwell)..."
+pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
+
+# Install PyTorch with Blackwell support
+# Blackwell (sm_120) requires PyTorch nightly as of Dec 2025
+echo ""
+echo "[3/7] Installing PyTorch with Blackwell (sm_120) support..."
+echo "Trying PyTorch nightly (required for Blackwell architecture)..."
+pip install --no-cache-dir --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
+
+# Verify PyTorch installation
+echo ""
+echo "[4/7] Verifying PyTorch and CUDA compatibility..."
+python -c "
+import torch
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'CUDA version: {torch.version.cuda}')
+if torch.cuda.is_available():
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    print(f'GPU count: {torch.cuda.device_count()}')
+    # Test actual CUDA operation
+    try:
+        x = torch.randn(10, 10, device='cuda')
+        y = x @ x.T
+        print('CUDA tensor operations: OK')
+    except Exception as e:
+        print(f'CUDA test failed: {e}')
+"
 
 # Install system dependencies (if running as root or with sudo)
 echo ""
-echo "[3/6] Installing system dependencies..."
+echo "[5/7] Installing system dependencies..."
 if [ "$EUID" -eq 0 ]; then
     apt-get update && apt-get install -y --no-install-recommends \
         git wget curl vim htop tmux \
@@ -37,16 +65,22 @@ else
     echo "Not running as root. Skipping system packages (may already be installed)."
 fi
 
-# Install PyTorch Geometric
+# Install PyTorch Geometric (must match new PyTorch version)
 echo ""
-echo "[4/6] Installing PyTorch Geometric..."
-pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv \
-    -f https://data.pyg.org/whl/torch-2.4.0+cu124.html
+echo "[6/7] Installing PyTorch Geometric..."
+# For nightly PyTorch, we need to install from source or use compatible wheels
+# Try multiple approaches
+TORCH_VERSION=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+echo "Detected PyTorch version: $TORCH_VERSION"
+
+# Try PyG wheels, fallback to pip install which will build from source
 pip install --no-cache-dir torch-geometric
+pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv || \
+    echo "Note: Some PyG extensions may need to be built from source for nightly PyTorch"
 
 # Install other Python dependencies
 echo ""
-echo "[5/6] Installing Python dependencies..."
+echo "[7/7] Installing Python dependencies..."
 pip install --no-cache-dir \
     h5py>=3.10.0 \
     pandas>=2.1.0 \
@@ -59,9 +93,7 @@ pip install --no-cache-dir \
     Pillow>=10.0.0 \
     pyyaml>=6.0
 
-# Install TensorFlow CPU (for Waymo data parsing only - much smaller than GPU version)
-echo ""
-echo "[6/6] Installing TensorFlow (CPU-only for data parsing)..."
+# Install TensorFlow CPU (for Waymo data parsing only)
 pip install --no-cache-dir tensorflow-cpu>=2.15.0
 
 # Create directories
