@@ -1,0 +1,116 @@
+# Docker Compose for Waymo GNN Trajectory Prediction
+# Optimized for PrimeIntellect RTX Pro 6000 96GB instance
+version: "3.8"
+
+services:
+  waymo-gnn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: waymo-gnn-training
+    
+    # Enable GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use all available GPUs
+              capabilities: [gpu, compute, utility]
+    
+    # Interactive terminal for training
+    stdin_open: true
+    tty: true
+    
+    # Environment variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0  # Adjust if using multiple GPUs
+      - WANDB_API_KEY=${WANDB_API_KEY:-}  # Set in .env file or export
+      - PYTHONPATH=/workspace/src:/workspace
+      - TF_CPP_MIN_LOG_LEVEL=2
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+    
+    # Volume mounts for persistence
+    volumes:
+      # Data persistence (mount your data directory)
+      - ./data:/workspace/data
+      # Checkpoints persistence
+      - ./checkpoints:/workspace/checkpoints
+      # Visualizations output
+      - ./visualizations:/workspace/visualizations
+      # W&B logs persistence
+      - ./wandb:/workspace/wandb
+      # Source code (for development - mount as read-only in production)
+      - ./src:/workspace/src:ro
+    
+    # Working directory
+    working_dir: /workspace
+    
+    # Shared memory size (important for PyTorch DataLoader with multiple workers)
+    shm_size: '32gb'
+    
+    # Ulimits for better performance
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    # Network mode
+    network_mode: host
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Default command - interactive bash
+    command: /bin/bash
+
+  # Training service (same config, specific command)
+  train-gcn:
+    extends:
+      service: waymo-gnn
+    container_name: waymo-train-gcn
+    command: >
+      python src/autoregressive_predictions/training_batched.py
+    profiles:
+      - training
+
+  # GAT Training service
+  train-gat:
+    extends:
+      service: waymo-gnn
+    container_name: waymo-train-gat
+    command: >
+      python src/gat_autoregressive/training_gat_batched.py
+    profiles:
+      - training
+
+  # Graph creation service
+  create-graphs:
+    extends:
+      service: waymo-gnn
+    container_name: waymo-create-graphs
+    volumes:
+      - ./data:/workspace/data
+      - ./src:/workspace/src:ro
+    command: >
+      bash -c "export PYTHONWARNINGS=ignore && export TF_CPP_MIN_LOG_LEVEL=3 && python src/graph_creation_and_saving.py"
+    profiles:
+      - preprocessing
+
+  # Testing service
+  test-model:
+    extends:
+      service: waymo-gnn
+    container_name: waymo-test-model
+    command: >
+      python src/autoregressive_predictions/testing.py
+    profiles:
+      - testing
+
+# Volumes (external data can be mounted here)
+volumes:
+  waymo-data:
+    driver: local
+  waymo-checkpoints:
+    driver: local
