@@ -23,7 +23,7 @@ fi
 # Uninstall old PyTorch
 echo ""
 echo "[2/7] Removing old PyTorch (incompatible with Blackwell)..."
-pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
+pip uninstall -y torch torchvision torchaudio --root-user-action=ignore 2>/dev/null || true
 
 # Install PyTorch with Blackwell support
 # Blackwell (sm_120) requires PyTorch nightly as of Dec 2025
@@ -34,16 +34,16 @@ echo "Trying PyTorch nightly (required for Blackwell architecture)..."
 # Try to install torch+torchvision from the nightly index.
 # Use --no-deps to avoid pip dependency resolution failures between dev wheels;
 # if that fails, attempt a safer two-step install.
-if pip install --no-cache-dir --no-deps --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124; then
+if pip install --no-cache-dir --no-deps --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --root-user-action=ignore; then
     echo "Installed torch + torchvision (no-deps) from nightly index."
 else
     echo "Initial no-deps install failed; trying two-step install (torch then torchvision)."
-    if pip install --no-cache-dir --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124; then
-        if pip install --no-cache-dir --no-deps --pre torchvision --index-url https://download.pytorch.org/whl/nightly/cu124; then
+    if pip install --no-cache-dir --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124 --root-user-action=ignore; then
+        if pip install --no-cache-dir --no-deps --pre torchvision --index-url https://download.pytorch.org/whl/nightly/cu124 --root-user-action=ignore; then
             echo "Installed torch and torchvision (torch full, torchvision no-deps)."
         else
             echo "Failed to install torchvision from nightly index. Will try PyPI fallback for torchvision."
-            pip install --no-cache-dir torchvision || echo "WARNING: torchvision install failed; continue and debug manually."
+            pip install --no-cache-dir torchvision --root-user-action=ignore || echo "WARNING: torchvision install failed; continue and debug manually."
         fi
     else
         echo "ERROR: Failed to install torch from nightly index."
@@ -52,9 +52,9 @@ else
 fi
 
 # Try torchaudio on the same index; fallback to PyPI; warn and continue if still not available
-if ! pip install --no-cache-dir --pre torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124; then
+if ! pip install --no-cache-dir --pre torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124 --root-user-action=ignore; then
     echo "torchaudio not found on nightly index; trying PyPI..."
-    if ! pip install --no-cache-dir torchaudio; then
+    if ! pip install --no-cache-dir torchaudio --root-user-action=ignore; then
         echo "WARNING: torchaudio install failed. Continuing without torchaudio."
         echo "If you need torchaudio, install manually: https://pytorch.org/audio/stable/installation.html"
     fi
@@ -102,14 +102,14 @@ TORCH_VERSION=$(python -c "import torch; print(torch.__version__.split('+')[0])"
 echo "Detected PyTorch version: $TORCH_VERSION"
 
 # Try PyG wheels, fallback to pip install which will build from source
-pip install --no-cache-dir torch-geometric
-pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv || \
+pip install --no-cache-dir torch-geometric --root-user-action=ignore
+pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv --root-user-action=ignore || \
     echo "Note: Some PyG extensions may need to be built from source for nightly PyTorch"
 
 # Install other Python dependencies
 echo ""
 echo "[7/7] Installing Python dependencies..."
-pip install --no-cache-dir \
+pip install --no-cache-dir --root-user-action=ignore \
     h5py>=3.10.0 \
     pandas>=2.1.0 \
     wandb>=0.16.0 \
@@ -123,7 +123,7 @@ pip install --no-cache-dir \
     google-cloud-storage>=2.14.0
 
 # Install TensorFlow CPU (for Waymo data parsing only)
-pip install --no-cache-dir tensorflow-cpu>=2.15.0
+pip install --no-cache-dir tensorflow-cpu>=2.15.0 --root-user-action=ignore
 
 # Create directories
 echo ""
