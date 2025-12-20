@@ -421,7 +421,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
-                                  patience=scheduler_patience, verbose=True, min_lr=min_lr)
+                                  patience=scheduler_patience, min_lr=min_lr)
     loss_fn = advanced_directional_loss
 
     # Load datasets
