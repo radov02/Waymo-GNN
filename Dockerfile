@@ -3,9 +3,9 @@
 # Based on NVIDIA CUDA 12.4 with cuDNN 9 for Ada Lovelace architecture
 
 # =============================================================================
-# BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 9 (much smaller than NGC)
+# BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 8 (much smaller than NGC)
 # =============================================================================
-FROM nvcr.io/nvidia/pytorch:24.10-py3
+FROM pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
@@ -62,9 +62,9 @@ COPY requirements.txt /workspace/requirements.txt
 
 # Install PyTorch Geometric and other dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    # Install PyTorch Geometric dependencies
+    # Install PyTorch Geometric dependencies (match torch 2.4.0)
     pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv \
-        -f https://data.pyg.org/whl/torch-2.5.0+cu124.html && \
+        -f https://data.pyg.org/whl/torch-2.4.0+cu124.html && \
     pip install --no-cache-dir torch-geometric && \
     # Install remaining requirements
     pip install --no-cache-dir \
