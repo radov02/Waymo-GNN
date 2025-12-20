@@ -1,11 +1,11 @@
 # Dockerfile for Waymo GNN Trajectory Prediction
 # Optimized for PrimeIntellect RTX Pro 6000 96GB instance
-# Based on NVIDIA CUDA 12.4 with cuDNN 9 for Ada Lovelace architecture
+# Using the SAME base image as the remote instance
 
 # =============================================================================
-# BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 8 (much smaller than NGC)
+# BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 8 (matches remote instance)
 # =============================================================================
-FROM pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn8-devel
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
@@ -27,10 +27,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Weights & Biases configuration (set your key at runtime)
     WANDB_DIR=/workspace/wandb \
     # HDF5 thread-safety
-    HDF5_USE_FILE_LOCKING=FALSE
+    HDF5_USE_FILE_LOCKING=FALSE \
+    # Pip cache settings to reduce disk usage
+    PIP_NO_CACHE_DIR=1
 
 # =============================================================================
-# SYSTEM DEPENDENCIES
+# SYSTEM DEPENDENCIES (minimal to save space)
 # =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -39,15 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     htop \
     tmux \
-    screen \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
     libgomp1 \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # =============================================================================
 # WORKING DIRECTORY
@@ -55,19 +53,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /workspace
 
 # =============================================================================
-# PYTHON DEPENDENCIES
+# PYTHON DEPENDENCIES (optimized to reduce disk usage)
 # =============================================================================
-# Copy requirements first for better Docker layer caching
-COPY requirements.txt /workspace/requirements.txt
-
-# Install PyTorch Geometric and other dependencies
+# Install PyTorch Geometric and other dependencies in stages to reduce layer size
 RUN pip install --no-cache-dir --upgrade pip && \
     # Install PyTorch Geometric dependencies (match torch 2.4.0)
     pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv \
         -f https://data.pyg.org/whl/torch-2.4.0+cu124.html && \
     pip install --no-cache-dir torch-geometric && \
-    # Install remaining requirements
-    pip install --no-cache-dir \
+    # Clean up pip cache
+    rm -rf ~/.cache/pip
+
+# Install remaining requirements (split to avoid large layers)
+RUN pip install --no-cache-dir \
         h5py>=3.10.0 \
         pandas>=2.1.0 \
         wandb>=0.16.0 \
@@ -78,8 +76,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
         protobuf>=4.25.0 \
         Pillow>=10.0.0 \
         pyyaml>=6.0 && \
-    # Install TensorFlow for Waymo dataset parsing
-    pip install --no-cache-dir tensorflow>=2.15.0
+    rm -rf ~/.cache/pip
+
+# Install TensorFlow CPU-only (much smaller ~500MB vs ~3GB for GPU version)
+# Only needed for Waymo dataset parsing, not training
+RUN pip install --no-cache-dir tensorflow-cpu>=2.15.0 && \
+    rm -rf ~/.cache/pip /tmp/* /var/tmp/*
 
 # =============================================================================
 # PROJECT FILES
