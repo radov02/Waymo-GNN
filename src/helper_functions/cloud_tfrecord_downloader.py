@@ -30,22 +30,94 @@ def get_local_filename(dataset, i):
     return Path(local_data_prefix) / dataset_name / dataset / f"{str(i).zfill(5)}.tfrecord"
 
 def get_waymo_bucket():
+    """
+    Get the Waymo bucket using various authentication methods (in order of priority):
+    1. GOOGLE_APPLICATION_CREDENTIALS env var (path to service account JSON file)
+    2. ADC_B64 env var (base64-encoded JSON credentials)
+    3. ADC_JSON_PATH env var (path to credentials JSON file)
+    4. Default gcloud credentials file (Windows/Linux paths)
+    5. Application Default Credentials (ADC) - for GCP instances with attached service account
+    """
+    from google.auth import default as google_auth_default
+    from google.oauth2 import service_account
     
-    adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"
+    credentials = None
     
-    if adc_path.exists():
-        with open(adc_path, 'r') as f:
-            adc_info = json.load(f)
-    else:
+    # Method 1: GOOGLE_APPLICATION_CREDENTIALS (standard Google Cloud method)
+    gac_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if gac_path and Path(gac_path).exists():
+        print(f"Using credentials from GOOGLE_APPLICATION_CREDENTIALS: {gac_path}")
+        credentials = service_account.Credentials.from_service_account_file(gac_path)
+    
+    # Method 2: ADC_JSON_PATH - explicit path to JSON credentials
+    if credentials is None:
+        adc_json_path = os.environ.get("ADC_JSON_PATH")
+        if adc_json_path and Path(adc_json_path).exists():
+            print(f"Using credentials from ADC_JSON_PATH: {adc_json_path}")
+            with open(adc_json_path, 'r') as f:
+                adc_info = json.load(f)
+            if adc_info.get("type") == "service_account":
+                credentials = service_account.Credentials.from_service_account_info(adc_info)
+            else:
+                credentials = UserCredentials.from_authorized_user_info(adc_info)
+    
+    # Method 3: ADC_B64 - base64-encoded JSON credentials
+    if credentials is None:
         adc_b64 = os.environ.get("ADC_B64")
-        if not adc_b64:
-            raise RuntimeError("Missing ADC_B64 environment variable, login with `gcloud auth application-default login`")
-        adc_json = base64.b64decode(adc_b64).decode("utf-8")
-        adc_info = json.loads(adc_json)
+        if adc_b64:
+            try:
+                adc_json = base64.b64decode(adc_b64).decode("utf-8")
+                adc_info = json.loads(adc_json)
+                print("Using credentials from ADC_B64 environment variable")
+                if adc_info.get("type") == "service_account":
+                    credentials = service_account.Credentials.from_service_account_info(adc_info)
+                else:
+                    credentials = UserCredentials.from_authorized_user_info(adc_info)
+            except Exception as e:
+                print(f"WARNING: Failed to decode ADC_B64: {e}")
+                print("ADC_B64 must be a base64-encoded JSON credentials file.")
+                print("Generate it with: base64 -w0 /path/to/credentials.json")
     
-    credentials = UserCredentials.from_authorized_user_info(adc_info)
-    storage_client = storage.Client(project=project_id, credentials=credentials)    
-
+    # Method 4: Default gcloud credentials file
+    if credentials is None:
+        # Try Windows path
+        adc_path = Path.home() / "AppData" / "Roaming" / "gcloud" / "application_default_credentials.json"
+        # Try Linux/Mac path if Windows doesn't exist
+        if not adc_path.exists():
+            adc_path = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+        
+        if adc_path.exists():
+            print(f"Using credentials from gcloud default location: {adc_path}")
+            with open(adc_path, 'r') as f:
+                adc_info = json.load(f)
+            if adc_info.get("type") == "service_account":
+                credentials = service_account.Credentials.from_service_account_info(adc_info)
+            else:
+                credentials = UserCredentials.from_authorized_user_info(adc_info)
+    
+    # Method 5: Application Default Credentials (works on GCP instances)
+    if credentials is None:
+        try:
+            print("Attempting to use Application Default Credentials (ADC)...")
+            credentials, _ = google_auth_default()
+            print("Using Application Default Credentials")
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not find valid credentials. Tried:\n"
+                f"  1. GOOGLE_APPLICATION_CREDENTIALS env var\n"
+                f"  2. ADC_JSON_PATH env var\n"
+                f"  3. ADC_B64 env var (base64-encoded JSON)\n"
+                f"  4. gcloud default credentials file\n"
+                f"  5. Application Default Credentials\n\n"
+                f"To fix, either:\n"
+                f"  - Set GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json\n"
+                f"  - Set ADC_JSON_PATH=/path/to/credentials.json\n"
+                f"  - Run: gcloud auth application-default login\n"
+                f"  - On GCP: attach a service account to the instance\n\n"
+                f"Last error: {e}"
+            )
+    
+    storage_client = storage.Client(project=project_id, credentials=credentials)
     bucket = storage_client.bucket(bucket_name)
     return bucket
 
