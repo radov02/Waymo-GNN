@@ -5,7 +5,7 @@
 # =============================================================================
 # BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 9 (much smaller than NGC)
 # =============================================================================
-FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
+FROM nvcr.io/nvidia/pytorch:24.10-py3
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
