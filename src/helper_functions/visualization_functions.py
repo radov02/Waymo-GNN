@@ -264,19 +264,92 @@ def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num
         traceback.print_exc()
     print(f"Sequence visualized successfully at {save_dir}/graph_sequence_{scenario.scenario_id}_{graph_creation_method}.png\n")
 
-def load_scenario_by_id(scenario_id, scenario_dirs=None):
+# Scenario index for fast lookups (maps scenario_id -> (tfrecord_file, record_index))
+_scenario_index = None
+_scenario_index_path = "./data/scenario/scenario_index.json"
+
+
+def _build_scenario_index(scenario_dirs=None):
+    """Build an index of scenario_id -> (file_path, record_index) for fast lookups."""
+    global _scenario_index
+    
+    import json
+    from pathlib import Path
+    
+    # Try to load existing index
+    if Path(_scenario_index_path).exists():
+        try:
+            with open(_scenario_index_path, 'r') as f:
+                _scenario_index = json.load(f)
+            print(f"  Loaded scenario index with {len(_scenario_index)} scenarios")
+            return _scenario_index
+        except Exception as e:
+            print(f"  Warning: Could not load scenario index: {e}")
+    
+    # Build index from scratch
+    print("  Building scenario index (this is a one-time operation)...")
+    
+    if scenario_dirs is None:
+        scenario_dirs = [
+            "./data/scenario/training",
+            "./data/scenario/validation"
+        ]
+    
+    _scenario_index = {}
+    
+    try:
+        import tensorflow as tf
+        from waymo_open_dataset.protos import scenario_pb2
+        
+        for scenario_dir in scenario_dirs:
+            scenario_path = Path(scenario_dir)
+            if not scenario_path.exists():
+                continue
+            
+            tfrecord_files = sorted(scenario_path.glob("*.tfrecord"))
+            
+            for tfrecord_file in tfrecord_files:
+                print(f"    Indexing {tfrecord_file}...")
+                scenario_dataset = tf.data.TFRecordDataset(str(tfrecord_file), compression_type='')
+                
+                for record_idx, raw_record in enumerate(scenario_dataset):
+                    scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
+                    _scenario_index[scenario.scenario_id] = {
+                        'file': str(tfrecord_file),
+                        'index': record_idx
+                    }
+        
+        # Save index for future use
+        try:
+            Path(_scenario_index_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(_scenario_index_path, 'w') as f:
+                json.dump(_scenario_index, f)
+            print(f"  Saved scenario index with {len(_scenario_index)} scenarios to {_scenario_index_path}")
+        except Exception as e:
+            print(f"  Warning: Could not save scenario index: {e}")
+        
+        return _scenario_index
+        
+    except Exception as e:
+        print(f"  Warning: Could not build scenario index: {e}")
+        return {}
+
+
+def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True):
     """
     Load a Waymo scenario from tfrecord files by scenario_id.
-    Uses caching to avoid reloading the same scenario multiple times.
-    Searches in both training and validation directories by default.
+    Uses caching and indexing for fast lookups.
     
     Args:
         scenario_id: The scenario ID to load
         scenario_dirs: List of directories to search, or None for default [training, validation]
+        use_index: If True, use/build scenario index for fast lookups
         
     Returns:
         Scenario object or None if not found
     """
+    global _scenario_index
+    
     # Check cache first
     if scenario_id in _scenario_cache:
         return _scenario_cache[scenario_id]
@@ -295,6 +368,30 @@ def load_scenario_by_id(scenario_id, scenario_dirs=None):
         from waymo_open_dataset.protos import scenario_pb2
         from pathlib import Path
         
+        # Try using index for fast lookup
+        if use_index:
+            if _scenario_index is None:
+                _build_scenario_index(scenario_dirs)
+            
+            if _scenario_index and scenario_id in _scenario_index:
+                entry = _scenario_index[scenario_id]
+                tfrecord_file = entry['file']
+                record_idx = entry['index']
+                
+                # Load directly from the known file and position
+                scenario_dataset = tf.data.TFRecordDataset(tfrecord_file, compression_type='')
+                
+                for idx, raw_record in enumerate(scenario_dataset):
+                    if idx == record_idx:
+                        scenario = scenario_pb2.Scenario.FromString(raw_record.numpy())
+                        _scenario_cache[scenario_id] = scenario
+                        print(f"  Loaded scenario {scenario_id} from index (file: {Path(tfrecord_file).name})")
+                        return scenario
+                    elif idx > record_idx:
+                        break
+        
+        # Fallback: linear search (slow)
+        print(f"  Scenario {scenario_id} not in index, falling back to linear search...")
         for scenario_dir in scenario_dirs:
             scenario_path = Path(scenario_dir)
             if not scenario_path.exists():

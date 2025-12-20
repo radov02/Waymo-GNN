@@ -116,10 +116,19 @@ def train_single_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_b
         
         # Reduced logging - only log every N batches
         if batch % log_every_n_batches == 0:
+            # Compute running averages for display
+            avg_mse_so_far = total_mse / max(1, metric_count)
+            avg_cos_so_far = total_cosine_sim / max(1, metric_count)
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
+            
             if torch.cuda.is_available():
                 print(f"\n[Epoch {epoch+1}] Batch {batch}/{total_batches} | Nodes: {num_nodes} | Edges: {num_edges} | T={T}")
+                if metric_count > 0:
+                    print(f"[METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             else:
                 print(f"Batch {batch}/{total_batches}: T={T} timesteps, Nodes={num_nodes}")
+                if metric_count > 0:
+                    print(f"  MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
 
         # Move all timesteps to device in batch for efficiency
         for t in range(T): 
@@ -219,6 +228,12 @@ def train_single_epoch(model, dataloader, optimizer, loss_fn, loss_alpha, loss_b
     avg_mse = total_mse / max(1, metric_count)
     avg_angle_error = total_angular / max(1, metric_count)
     
+    # Print epoch summary with RMSE in meters
+    rmse_meters = (avg_mse ** 0.5) * 100.0
+    print(f"\n[TRAIN EPOCH {epoch+1} SUMMARY]")
+    print(f"  Loss: {avg_loss_epoch:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
+    
     if visualize_callback is not None and last_batch_dict is not None:
         visualize_callback(epoch, last_batch_dict, model, device, wandb)
     
@@ -295,6 +310,12 @@ def validate_single_epoch(model, dataloader, loss_fn, loss_alpha, loss_beta, los
     avg_cosine_sim = total_cosine_sim / max(1, metric_count)
     avg_mse = total_mse / max(1, metric_count)
     avg_angle_error = total_angular / max(1, metric_count)
+    
+    # Print validation summary with RMSE in meters
+    rmse_meters = (avg_mse ** 0.5) * 100.0
+    print(f"\n[VALIDATION SUMMARY]")
+    print(f"  Loss: {avg_loss:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
     
     return avg_loss, avg_mse, avg_cosine_sim, avg_angle_error
 

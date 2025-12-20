@@ -30,7 +30,7 @@ import wandb
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
-from SpatioTemporalGNN import SpatioTemporalGNN
+from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, num_workers, num_layers, num_gru_layers, epochs,
                     input_dim, output_dim, sequence_length, hidden_channels,
@@ -38,10 +38,11 @@ from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     gradient_clip_value, checkpoint_dir_autoreg, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs, autoreg_viz_dir,
+                    autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_skip_map_features,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
-                    cache_validation_data, max_validation_scenarios)
+                    cache_validation_data, max_validation_scenarios,
+                    use_gradient_checkpointing)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
@@ -84,7 +85,11 @@ class EarlyStopping:
 
 
 def load_pretrained_model(checkpoint_path, device):
-    """Load pre-trained single-step model from training.py checkpoint."""
+    """Load pre-trained single-step model from training_batched.py checkpoint.
+    
+    Uses SpatioTemporalGNNBatched for proper batch processing support.
+    Compatible with checkpoints from both training.py and training_batched.py.
+    """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
@@ -92,28 +97,35 @@ def load_pretrained_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Recreate model with saved config or use defaults
+    # SpatioTemporalGNNBatched is architecture-compatible with SpatioTemporalGNN
+    # but supports batch_size > 1 properly
     if 'config' in checkpoint:
         config = checkpoint['config']
-        model = SpatioTemporalGNN(
+        model = SpatioTemporalGNNBatched(
             input_dim=config['input_dim'],
             hidden_dim=config['hidden_channels'],
             output_dim=config.get('output_dim', output_dim),
             num_gcn_layers=config['num_layers'],
             num_gru_layers=config.get('num_gru_layers', 1),
             dropout=config['dropout'],
-            use_gat=config.get('use_gat', False)  # Backward compat with old checkpoints
+            use_gat=config.get('use_gat', False),  # Backward compat with old checkpoints
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            max_agents_per_scenario=128
         )
     else:
         # Checkpoint doesn't have config - use default values from config.py
+        # This handles checkpoints from training_batched.py which don't save full config
         print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
-        model = SpatioTemporalGNN(
+        model = SpatioTemporalGNNBatched(
             input_dim=input_dim,
             hidden_dim=hidden_channels,
             output_dim=output_dim,
             num_gcn_layers=num_layers,
             num_gru_layers=num_gru_layers,
             dropout=dropout,
-            use_gat=False
+            use_gat=False,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            max_agents_per_scenario=128
         )
     
     # Setup multi-GPU if available
@@ -122,9 +134,16 @@ def load_pretrained_model(checkpoint_path, device):
     # Load weights
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     
-    print(f"✓ Loaded model from epoch {checkpoint['epoch']}")
+    print(f" Loaded model from epoch {checkpoint['epoch']}")
     if 'val_loss' in checkpoint:
-        print(f"  Pre-trained val_loss: {checkpoint['val_loss']:.6f}")
+        val_loss = checkpoint['val_loss']
+        # Estimate RMSE from val_loss (assuming it's combined loss, MSE component is roughly half)
+        # This is approximate - actual MSE may differ
+        print(f"  Pre-trained val_loss: {val_loss:.6f}")
+        # Note: val_loss includes cosine loss, so MSE is roughly val_loss * alpha where alpha~0.5
+        estimated_mse = val_loss * 0.5  # Rough estimate
+        estimated_rmse = (estimated_mse ** 0.5) * 100.0
+        print(f"  Estimated RMSE (rough): {estimated_rmse:.2f}m (based on val_loss)")
     
     return model, is_parallel, checkpoint
 
@@ -150,7 +169,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         save_dir: Directory to save visualizations (defaults to autoreg_viz_dir from config)
     """
     if save_dir is None:
-        save_dir = autoreg_viz_dir
+        save_dir = os.path.join(autoreg_viz_dir, 'finetuning')
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
@@ -160,26 +179,19 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     B, T = batch_dict["B"], batch_dict["T"]
     scenario_ids = batch_dict.get("scenario_ids", ["unknown"])
     
-    # Load scenario for map features (with timeout to avoid hanging)
+    # Load scenario for map features (optional - can be skipped via config)
     scenario = None
-    if scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
+    if not autoreg_skip_map_features and scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
         try:
             print(f"  Loading scenario {scenario_ids[0]} for map visualization...")
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Scenario loading timed out")
-            
-            # Set 10 second timeout
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)
-            
+            # Use indexed loading for speed (index is built once and cached)
             scenario = load_scenario_by_id(scenario_ids[0])
-            signal.alarm(0)  # Cancel alarm
-            
-        except (TimeoutError, Exception) as e:
-            signal.alarm(0)  # Ensure alarm is cancelled
+            if scenario is None:
+                print(f"  Proceeding without map features.")
+        except Exception as e:
             print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
+    elif autoreg_skip_map_features:
+        print(f"  Skipping map features (autoreg_skip_map_features=True)")
     
     # Move to device
     for t in range(T):
@@ -355,6 +367,22 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         graph_for_prediction = start_graph
         completed_steps = 0
         
+        # Build agent_id -> GT position mapping for all timesteps (for correct error calculation)
+        gt_positions_by_agent_and_time = {}
+        for step in range(actual_rollout_steps + 1):
+            t = start_t + step
+            if t >= T:
+                break
+            graph_at_t = batched_graph_sequence[t]
+            if hasattr(graph_at_t, 'pos') and graph_at_t.pos is not None:
+                pos_at_t = graph_at_t.pos.cpu().numpy()
+                if hasattr(graph_at_t, 'agent_ids'):
+                    for idx, aid in enumerate(graph_at_t.agent_ids):
+                        if idx < pos_at_t.shape[0]:
+                            if aid not in gt_positions_by_agent_and_time:
+                                gt_positions_by_agent_and_time[aid] = {}
+                            gt_positions_by_agent_and_time[aid][t] = pos_at_t[idx].copy()
+        
         for step in range(actual_rollout_steps):
             target_t = start_t + step + 1
             if target_t >= T:
@@ -375,12 +403,6 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             else:
                 current_agent_ids = [i for i in pred_scenario_indices]
             
-            # Check node count match (no need to check since we're working with batched graphs that should maintain structure)
-            # Note: When B > 1, both graphs have nodes from all scenarios, so total count should match
-            # if graph_for_prediction.x.shape[0] != target_graph.num_nodes:
-            #     print(f"  [DEBUG VIZ] Node count changed at step {step} (t={target_t}), stopping predictions")
-            #     break
-            
             edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
             pred = model(graph_for_prediction.x, graph_for_prediction.edge_index,
                         edge_weight=edge_w, batch=graph_for_prediction.batch,
@@ -388,28 +410,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             pred_disp = pred.cpu().numpy() * POSITION_SCALE
             
-            # Get GT displacement for this step
-            # At step=0, we predict from start_t to start_t+1, so GT is start_graph.y
-            # At step=n, we predict from (start_t+n) to (start_t+n+1)
-            # But we're using graph_for_prediction which at step n should correspond to time start_t+n
-            # The GT displacement for step n is in batched_graph_sequence[start_t + step].y
-            current_source_t = start_t + step
-            current_source_graph = batched_graph_sequence[current_source_t]
-            gt_disp_full = current_source_graph.y.cpu().numpy() * POSITION_SCALE if current_source_graph.y is not None else None
-            
-            # Build agent_id -> gt_disp mapping for the SOURCE graph (not target!)
-            gt_disp_by_agent = {}
-            if gt_disp_full is not None and hasattr(current_source_graph, 'agent_ids'):
-                source_all_ids = list(current_source_graph.agent_ids)
-                for idx, aid in enumerate(source_all_ids):
-                    if idx < gt_disp_full.shape[0]:
-                        gt_disp_by_agent[aid] = gt_disp_full[idx]
-            
-            # DEBUG: Print prediction vs GT stats on first few steps
+            # DEBUG: Print prediction stats on first few steps
             if step < 5:
                 pred_batch0 = pred_disp[pred_scenario_indices]
-                print(f"  [DEBUG VIZ] Step {step}: Pred disp (batch0) range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]" + 
-                      (f", GT disp range=[{gt_disp_full.min():.2f}, {gt_disp_full.max():.2f}]" if gt_disp_full is not None else ""))
+                print(f"  [DEBUG VIZ] Step {step}: Pred disp (batch0) range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]")
             
             # Map predictions to persistent agents using current graph's agent ordering (only first scenario)
             step_errors = []
@@ -419,17 +423,20 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                     global_idx = pred_scenario_indices[local_idx]
                     if global_idx < pred_disp.shape[0]:
                         pred_d = pred_disp[global_idx]
-                        new_pos = agent_pred_positions[agent_id] + pred_d
+                        current_pred_pos = agent_pred_positions[agent_id].copy()
+                        new_pos = current_pred_pos + pred_d
                         agent_pred_positions[agent_id] = new_pos
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
                         
-                        # DEBUG: Compare individual agent prediction to GT using correct mapping
-                        if agent_id in gt_disp_by_agent:
-                            gt_d = gt_disp_by_agent[agent_id]
-                            step_err = np.linalg.norm(pred_d - gt_d)
+                        # DEBUG: Compare using CORRECT target - displacement from current pred pos to GT next pos
+                        if agent_id in gt_positions_by_agent_and_time and target_t in gt_positions_by_agent_and_time[agent_id]:
+                            gt_next_pos = gt_positions_by_agent_and_time[agent_id][target_t]
+                            correct_target_disp = gt_next_pos - current_pred_pos
+                            step_err = np.linalg.norm(pred_d - correct_target_disp)
                             step_errors.append(step_err)
                             if step < 3 and local_idx < 3:
-                                print(f"    Agent {agent_id}: pred_disp={pred_d}, gt_disp={gt_d}, error={step_err:.2f}m")
+                                print(f"    Agent {agent_id}: current_pos={current_pred_pos}, pred_disp={pred_d}")
+                                print(f"      gt_next_pos={gt_next_pos}, correct_target={correct_target_disp}, error={step_err:.2f}m")
             
             # Print average step error
             if step_errors and step < 5:
@@ -757,6 +764,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     """
     Train one epoch with scheduled sampling for autoregressive prediction (with optional AMP).
     
+    IMPORTANT: When using autoregressive rollout, the target displacement must be computed
+    relative to the CURRENT predicted position, not the original GT position. Otherwise
+    errors compound incorrectly.
+    
     Args:
         model: SpatioTemporalGNN model
         dataloader: Training data loader
@@ -773,6 +784,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_cosine = 0.0
     steps = 0
     count = 0
+    
+    POSITION_SCALE = 100.0  # Must match graph_creation_functions.py
     
     # Get underlying model for reset_gru_hidden_states
     base_model = model.module if is_parallel else model
@@ -818,21 +831,29 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             # Autoregressive rollout from this starting point
             rollout_loss = torch.tensor(0.0, device=device)
             graph_for_prediction = current_graph
+            is_using_predicted_positions = False  # Track if we've diverged from GT
             
             for step in range(effective_rollout):
                 target_t = t + step + 1
                 if target_t >= T:
                     break
                 
+                # source_graph is the graph at time (t + step) - this is where we predict FROM
+                # target_graph is the graph at time target_t - this is where we predict TO
+                source_t = t + step
+                source_graph = batched_graph_sequence[source_t]
                 target_graph = batched_graph_sequence[target_t]
-                if target_graph.y is None:
+                
+                # The target displacement is in source_graph.y (displacement from source_t to source_t+1)
+                if source_graph.y is None:
                     break
                 
                 # Check if node counts match - skip if they don't
                 # (agents can appear/disappear between timesteps)
-                if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
+                if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
                     # Node count changed - switch to teacher forcing for this step
                     graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
                     continue
                 
                 # Forward pass with optional AMP
@@ -848,8 +869,25 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         timestep=t + step
                     )
                     
-                    # Compute loss against ground truth
-                    target = target_graph.y.to(pred.dtype)
+                    # Compute correct target for autoregressive training
+                    # source_graph.y contains displacement from GT position[source_t] to GT position[target_t]
+                    # If using predicted positions, we need displacement from pred_pos to GT position[target_t]
+                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                        # Check if position sizes match (agents may have appeared/disappeared)
+                        if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
+                            # Target = (GT next position - current predicted position) / POSITION_SCALE
+                            gt_next_pos = target_graph.pos  # GT position at target_t
+                            current_pred_pos = graph_for_prediction.pos  # Current predicted position
+                            target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                            target = target.to(pred.dtype)
+                        else:
+                            # Size mismatch - fall back to GT displacement
+                            target = source_graph.y.to(pred.dtype)
+                            is_using_predicted_positions = False  # Reset flag
+                    else:
+                        # Using GT positions - use displacement stored in source_graph.y
+                        # This is displacement from GT pos[source_t] to GT pos[target_t]
+                        target = source_graph.y.to(pred.dtype)
                     
                     # MSE loss
                     mse_loss = F.mse_loss(pred, target)
@@ -880,9 +918,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred.detach(), device
                         )
+                        is_using_predicted_positions = True
                     else:
                         # Teacher forcing: use ground truth
                         graph_for_prediction = batched_graph_sequence[target_t]
+                        is_using_predicted_positions = False
             
             accumulated_loss += rollout_loss
             valid_steps += 1
@@ -905,8 +945,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         
         if batch_idx % 20 == 0:
             loss_val = accumulated_loss.item() if hasattr(accumulated_loss, 'item') else accumulated_loss
+            avg_mse_so_far = total_mse / max(1, count)
+            avg_cos_so_far = total_cosine / max(1, count)
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
             print(f"  Batch {batch_idx}: Loss={loss_val/max(1,valid_steps):.4f}, "
                   f"Sampling prob={sampling_prob:.2f}")
+            print(f"    [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
+    
+    # Print epoch summary
+    final_mse = total_mse / max(1, count)
+    final_rmse = (final_mse ** 0.5) * 100.0
+    print(f"\n[TRAIN EPOCH SUMMARY]")
+    print(f"  Loss: {total_loss / max(1, steps):.6f} | MSE: {final_mse:.6f} | RMSE: {final_rmse:.2f}m")
+    print(f"  CosSim: {total_cosine / max(1, count):.4f}")
     
     return {
         'loss': total_loss / max(1, steps),
@@ -916,13 +967,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
 
 
 def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel):
-    """Evaluate model with full autoregressive rollout (no teacher forcing)."""
+    """Evaluate model with full autoregressive rollout (no teacher forcing).
+    
+    IMPORTANT: Target displacement is computed relative to current predicted position,
+    not the original GT position. This correctly measures autoregressive performance.
+    """
     model.eval()
     total_loss = 0.0
     total_mse = 0.0
     total_cosine = 0.0
     steps = 0
     count = 0
+    
+    POSITION_SCALE = 100.0  # Must match graph_creation_functions.py
     
     # Per-horizon metrics
     horizon_mse = [0.0] * num_rollout_steps
@@ -958,20 +1015,28 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Full autoregressive rollout
                 graph_for_prediction = current_graph
                 rollout_loss = 0.0
+                is_using_predicted_positions = False
                 
                 for step in range(effective_rollout):
                     target_t = t + step + 1
                     if target_t >= T:
                         break
                     
+                    # source_graph is at time (t + step) - where we predict FROM
+                    # target_graph is at time target_t - where we predict TO
+                    source_t = t + step
+                    source_graph = batched_graph_sequence[source_t]
                     target_graph = batched_graph_sequence[target_t]
-                    if target_graph.y is None:
+                    
+                    # The GT displacement is in source_graph.y
+                    if source_graph.y is None:
                         break
                     
                     # Check if node counts match - skip if they don't
-                    if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
+                    if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
                         # Node count changed - switch to ground truth graph
                         graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
                         continue
                     
                     edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
@@ -985,7 +1050,24 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         timestep=t + step
                     )
                     
-                    target = target_graph.y.to(pred.dtype)
+                    # Compute correct target for autoregressive evaluation
+                    # source_graph.y contains displacement from GT position[source_t] to GT position[target_t]
+                    # If using predicted positions, we need displacement from pred_pos to GT position[target_t]
+                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                        # Check if position sizes match (agents may have appeared/disappeared)
+                        if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
+                            gt_next_pos = target_graph.pos
+                            current_pred_pos = graph_for_prediction.pos
+                            target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                            target = target.to(pred.dtype)
+                        else:
+                            # Size mismatch - fall back to GT displacement
+                            target = source_graph.y.to(pred.dtype)
+                            is_using_predicted_positions = False  # Reset flag
+                    else:
+                        # Using GT positions - use displacement stored in source_graph.y
+                        target = source_graph.y.to(pred.dtype)
+                    
                     mse = F.mse_loss(pred, target)
                     
                     pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
@@ -1007,6 +1089,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred, device
                         )
+                        is_using_predicted_positions = True
                 
                 total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
                 steps += 1
@@ -1014,6 +1097,19 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     # Compute per-horizon averages
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
+    
+    # Print validation summary with RMSE in meters
+    final_mse = total_mse / max(1, count)
+    final_rmse = (final_mse ** 0.5) * 100.0
+    print(f"\n[VALIDATION SUMMARY]")
+    print(f"  Loss: {total_loss / max(1, steps):.6f} | MSE: {final_mse:.6f} | RMSE: {final_rmse:.2f}m")
+    print(f"  CosSim: {total_cosine / max(1, count):.4f}")
+    
+    # Print per-horizon RMSE
+    print(f"  Per-horizon RMSE (meters):")
+    for h in range(min(5, num_rollout_steps)):  # Show first 5 horizons
+        h_rmse = (horizon_avg_mse[h] ** 0.5) * 100.0
+        print(f"    H{h+1}: {h_rmse:.2f}m")
     
     return {
         'loss': total_loss / max(1, steps),
@@ -1067,7 +1163,7 @@ def run_autoregressive_finetuning(
     run = wandb.init(
         project=project_name,
         config={
-            "model": "SpatioTemporalGNN_Autoregressive",
+            "model": "SpatioTemporalGNNBatched_Autoregressive",
             "pretrained_from": pretrained_checkpoint,
             "batch_size": batch_size,
             "learning_rate": learning_rate * 0.1,  # Lower LR for fine-tuning
@@ -1076,9 +1172,10 @@ def run_autoregressive_finetuning(
             "prediction_horizon": f"{num_rollout_steps * 0.1}s",
             "sampling_strategy": sampling_strategy,
             "epochs": num_epochs,
-            "early_stopping_patience": early_stopping_patience
+            "early_stopping_patience": early_stopping_patience,
+            "use_gradient_checkpointing": use_gradient_checkpointing
         },
-        name=f"Autoregressive_finetune_{num_rollout_steps}steps",
+        name=f"Autoregressive_finetune_batched_{num_rollout_steps}steps",
         dir="../wandb"
     )
     
@@ -1149,11 +1246,13 @@ def run_autoregressive_finetuning(
         )
     
     print(f"\n{'='*80}")
-    print(f"AUTOREGRESSIVE FINE-TUNING (BATCHED)")
+    print(f"AUTOREGRESSIVE FINE-TUNING (BATCHED - SpatioTemporalGNNBatched)")
     print(f"{'='*80}")
     print(f"Device: {device}")
     print(f"Pre-trained model: {pretrained_checkpoint}")
+    print(f"Model: SpatioTemporalGNNBatched (supports batch_size > 1)")
     print(f"Model uses GAT: {model_uses_gat}")
+    print(f"Gradient checkpointing: {'Enabled' if use_gradient_checkpointing else 'Disabled'}")
     print(f"Batch size: {batch_size} scenarios processed in parallel")
     print(f"Rollout steps: {num_rollout_steps} ({num_rollout_steps * 0.1}s horizon)")
     print(f"Sampling strategy: {sampling_strategy}")
