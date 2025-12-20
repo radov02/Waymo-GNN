@@ -3,9 +3,9 @@
 # Based on NVIDIA CUDA 12.4 with cuDNN 9 for Ada Lovelace architecture
 
 # =============================================================================
-# BASE IMAGE: NVIDIA PyTorch NGC Container (includes CUDA, cuDNN, NCCL)
+# BASE IMAGE: Official PyTorch with CUDA 12.4 and cuDNN 9 (much smaller than NGC)
 # =============================================================================
-FROM nvcr.io/nvidia/pytorch:24.10-py3
+FROM pytorch/pytorch:2.5.0-cuda12.4-cudnn9-runtime
 
 # =============================================================================
 # ENVIRONMENT CONFIGURATION
