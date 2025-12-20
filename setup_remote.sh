@@ -119,7 +119,8 @@ pip install --no-cache-dir \
     scipy>=1.11.0 \
     protobuf>=4.25.0 \
     Pillow>=10.0.0 \
-    pyyaml>=6.0
+    pyyaml>=6.0 \
+    google-cloud-storage>=2.14.0
 
 # Install TensorFlow CPU (for Waymo data parsing only)
 pip install --no-cache-dir tensorflow-cpu>=2.15.0

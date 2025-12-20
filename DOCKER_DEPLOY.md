@@ -2,7 +2,7 @@
 
 This guide covers deploying the Waymo GNN Trajectory Prediction project on a **PrimeIntellect RTX Pro 6000 96GB** GPU instance.
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Clone and Navigate
 ```bash
