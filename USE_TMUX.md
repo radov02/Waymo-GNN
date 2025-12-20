@@ -7,5 +7,5 @@ run:
 then if VSCode or internet cuts out (only client is killed), we can recover seamlessly by reattaching our view to already running session using:
 ```tmux attach -t [my_process_name]```
 
-to delete specific sessilon:
+to delete specific session:
 ```tmux kill-session -t [my_process_name]```
