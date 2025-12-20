@@ -1,0 +1,29 @@
+
+---------------- CONNECT TO PrimeIntellect Instance ----------------------
+local> ssh root@IP -p PORT -i PATH_TO_YOUR_PRIVATE_SSH_KEY_FILE
+> whoami
+> hostname
+> pwd
+> ls -la
+> git clone https://github.com/radov02/Waymo-GNN.git
+> cd Waymo-GNN
+> apt-get update
+> apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common
+
+------------------------ GRAPH CREATION ---------------------------
+> git pull
+> chmod +x setup_remote.sh
+> ./setup_remote.sh
+> export WANDB_API_KEY='your-key-here'
+> apt-get update
+> apt-get install -y apt-transport-https ca-certificates gnupg
+> echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
+  | tee /etc/apt/sources.list.d/google-cloud-sdk.list
+deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main
+> curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
+> apt-get update
+> apt-get install -y google-cloud-sdk
+> gcloud init
+> gcloud auth application-default login
+(make sure billing account is set for the downloader project on google cloud)
+> python src/graph_creation_and_saving.py
