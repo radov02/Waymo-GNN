@@ -30,7 +30,35 @@ pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
 echo ""
 echo "[3/7] Installing PyTorch with Blackwell (sm_120) support..."
 echo "Trying PyTorch nightly (required for Blackwell architecture)..."
-pip install --no-cache-dir --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
+
+# Try to install torch+torchvision from the nightly index.
+# Use --no-deps to avoid pip dependency resolution failures between dev wheels;
+# if that fails, attempt a safer two-step install.
+if pip install --no-cache-dir --no-deps --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu124; then
+    echo "Installed torch + torchvision (no-deps) from nightly index."
+else
+    echo "Initial no-deps install failed; trying two-step install (torch then torchvision)."
+    if pip install --no-cache-dir --pre torch --index-url https://download.pytorch.org/whl/nightly/cu124; then
+        if pip install --no-cache-dir --no-deps --pre torchvision --index-url https://download.pytorch.org/whl/nightly/cu124; then
+            echo "Installed torch and torchvision (torch full, torchvision no-deps)."
+        else
+            echo "Failed to install torchvision from nightly index. Will try PyPI fallback for torchvision."
+            pip install --no-cache-dir torchvision || echo "WARNING: torchvision install failed; continue and debug manually."
+        fi
+    else
+        echo "ERROR: Failed to install torch from nightly index."
+        exit 1
+    fi
+fi
+
+# Try torchaudio on the same index; fallback to PyPI; warn and continue if still not available
+if ! pip install --no-cache-dir --pre torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124; then
+    echo "torchaudio not found on nightly index; trying PyPI..."
+    if ! pip install --no-cache-dir torchaudio; then
+        echo "WARNING: torchaudio install failed. Continuing without torchaudio."
+        echo "If you need torchaudio, install manually: https://pytorch.org/audio/stable/installation.html"
+    fi
+fi
 
 # Verify PyTorch installation
 echo ""
