@@ -1,10 +1,9 @@
-
 ---------------- CONNECT TO PrimeIntellect Instance  (running pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime) ----------------------
 generate ssh certificate:
 local> ssh-keygen -t ed25519 -f C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 -C "yourPublicKeyName"
 this will create C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 (private key file) and C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519.pub (public key file)
 put public key for instance connetion, then:
-local> ssh root@IP -p PORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519
+local> ssh root@IP -p THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519
 > whoami
 > hostname
 > pwd
@@ -30,3 +29,17 @@ local> ssh root@IP -p PORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519
 > gcloud auth application-default login
 (make sure billing account is set for the downloader project on google cloud)
 > python src/graph_creation_and_saving.py
+
+------------------------ TRAINING ---------------------------
+(open more terminals using> ssh root@IP -p PORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519)
+ter1> python src/autoregressive_predictions/training_batched.py
+ter2> watch -n 1 nvidia-smi
+(or better with graph:
+ter2> apt-get update && apt-get install -y nvtop
+ter2> nvtop
+)
+
+to download file(s) from the host:
+local> scp -P THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 root@PORT:~/Waymo-GNN/visualizations/autoreg/epoch_001_progress.png C:\Users\radov\Downloads\
+or use script in PowerShell if you have correctly set the .env file:
+local> powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\radov\dev\waymo-project\download_visualizations.ps1' -EnvFile 'C:\Users\radov\dev\waymo-project\.env'

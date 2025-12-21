@@ -540,13 +540,16 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 all_batch_indices.append(graph.batch.cpu())
     
     # Create figure with B × T grid (rows = graphs, columns = timesteps)
+    # Limit to max 4 graphs for visualization
+    B_viz = min(B, 4)
+    
     # Larger figure size for better visibility
-    fig, axes = plt.subplots(B, T, figsize=(5*T, 5*B))
+    fig, axes = plt.subplots(B_viz, T, figsize=(5*T, 5*B_viz))
     
     # Make axes always 2D array
-    if B == 1 and T == 1:
+    if B_viz == 1 and T == 1:
         axes = np.array([[axes]])
-    elif B == 1:
+    elif B_viz == 1:
         axes = axes.reshape(1, -1)
     elif T == 1:
         axes = axes.reshape(-1, 1)
@@ -562,7 +565,8 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     from config import viz_vehicles_only, max_nodes_per_graph_viz
     
     # Process each graph (row) and timestep (column)
-    for graph_idx in range(B):
+    # Limit to first 4 graphs for visualization
+    for graph_idx in range(B_viz):
         # Get agent_ids from first timestep to track same agents across time
         first_graph = batched_graph_sequence[0]
         batch_mask_first = first_graph.batch == graph_idx
@@ -1069,7 +1073,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     plt.close(fig)
     
     print(f"  Saved training progress visualization: {filepath}")
-    print(f"    Grid: {B} graphs x {T} timesteps | Avg Error: {avg_error:.2f}m | {max_nodes_per_graph_viz} agents per graph")
+    print(f"    Grid: {B_viz}/{B} graphs x {T} timesteps | Avg Error: {avg_error:.2f}m | {max_nodes_per_graph_viz} agents per graph")
     
     model.train()
     return filepath, avg_error
