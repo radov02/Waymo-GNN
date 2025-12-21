@@ -650,14 +650,15 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         print(f"\n[Train] Loss: {train_loss:.4f} | MSE: {train_mse:.4f} | "
               f"Cos: {train_cos:.4f} | Angle: {train_angle:.4f}")
         
-        wandb.log({
+        # Prepare logging dict with epoch and training metrics
+        log_dict = {
             "epoch": epoch + 1,
             "train/loss": train_loss,
             "train/mse": train_mse,
             "train/cosine_similarity": train_cos,
             "train/angle_error": train_angle,
             "learning_rate": optimizer.param_groups[0]['lr']
-        })
+        }
         
         # Validation
         if val_dataloader is not None:
@@ -669,14 +670,20 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             print(f"[Valid] Loss: {val_loss:.4f} | MSE: {val_mse:.4f} | "
                   f"Cos: {val_cos:.4f} | Angle: {val_angle:.4f}")
             
-            wandb.log({
+            # Add validation metrics to same log_dict
+            log_dict.update({
                 "val/loss": val_loss,
                 "val/mse": val_mse,
                 "val/cosine_similarity": val_cos,
                 "val/angle_error": val_angle,
-                "train_val_gap": train_loss - val_loss  # Track overfitting gap
+                "train_val_gap": train_loss - val_loss  # Track overfitting (positive = overfitting)
             })
-            
+        
+        # Single wandb.log call with all metrics for this epoch
+        wandb.log(log_dict)
+        
+        # Continue with scheduler and checkpoint saving
+        if val_dataloader is not None:
             scheduler.step(val_loss)
             
             # Check for overfitting with both train and val loss
