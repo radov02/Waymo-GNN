@@ -922,9 +922,11 @@ def run_autoregressive_finetuning(
     # Epoch-based metrics (plotted vs epoch)
     wandb.define_metric("train_loss", step_metric="epoch")
     wandb.define_metric("train_mse", step_metric="epoch")
+    wandb.define_metric("train_rmse_meters", step_metric="epoch")
     wandb.define_metric("train_cosine_sim", step_metric="epoch")
     wandb.define_metric("val_loss", step_metric="epoch")
     wandb.define_metric("val_mse", step_metric="epoch")
+    wandb.define_metric("val_rmse_meters", step_metric="epoch")
     wandb.define_metric("val_cosine_sim", step_metric="epoch")
     wandb.define_metric("learning_rate", step_metric="epoch")
     wandb.define_metric("sampling_probability", step_metric="epoch")
@@ -995,12 +997,26 @@ def run_autoregressive_finetuning(
     
     val_loader = None
     if val_dataset:
+        # Use smaller batch size for validation if dataset is smaller than batch_size
+        # to avoid drop_last=True dropping all samples
+        val_batch_size = min(batch_size, len(val_dataset))
         val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False,
+            val_dataset, batch_size=val_batch_size, shuffle=False,
             num_workers=0, collate_fn=collate_graph_sequences_to_batch,
-            drop_last=True, persistent_workers=False,
+            drop_last=False,  # Don't drop last for validation to use all samples
+            persistent_workers=False,
             pin_memory=pin_memory, prefetch_factor=None
         )
+        if val_batch_size < batch_size:
+            print(f"  [Note] Validation batch size adjusted to {val_batch_size} (dataset has {len(val_dataset)} scenarios)")
+        
+        # Verify loader is not empty
+        try:
+            test_batch = next(iter(val_loader))
+            print(f"  [Validation] Loader verified with {val_batch_size} scenarios per batch")
+        except StopIteration:
+            print(f"  [WARNING] Validation loader is empty! Disabling validation.")
+            val_loader = None
     
     print(f"\n{'='*80}")
     print(f"GAT AUTOREGRESSIVE FINE-TUNING (BATCHED)")
@@ -1038,43 +1054,66 @@ def run_autoregressive_finetuning(
         )
         
         val_metrics = None
-        if val_loader:
+        if val_loader is not None:
+            print(f"  Running validation...")
             val_metrics = evaluate_autoregressive(
                 model, val_loader, device, num_rollout_steps, is_parallel
             )
             scheduler.step(val_metrics['loss'])
+            print(f"  Val Loss: {val_metrics['loss']:.4f} | Val MSE: {val_metrics['mse']:.6f} | Val Cos: {val_metrics['cosine_sim']:.4f}")
         else:
             scheduler.step(train_metrics['loss'])
         
         current_lr = optimizer.param_groups[0]['lr']
+        
+        # Calculate RMSE in meters for more interpretable logging
+        train_rmse_meters = (train_metrics['mse'] ** 0.5) * 100.0
         
         log_dict = {
             "epoch": epoch,
             "sampling_probability": sampling_prob,
             "train_loss": train_metrics['loss'],
             "train_mse": train_metrics['mse'],
+            "train_rmse_meters": train_rmse_meters,
             "train_cosine_sim": train_metrics['cosine_sim'],
             "learning_rate": current_lr
         }
         
         if val_metrics:
+            val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
             log_dict.update({
                 "val_loss": val_metrics['loss'],
                 "val_mse": val_metrics['mse'],
+                "val_rmse_meters": val_rmse_meters,
                 "val_cosine_sim": val_metrics['cosine_sim']
             })
             for h in range(num_rollout_steps):
                 log_dict[f"val_mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
                 log_dict[f"val_cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
         
-        wandb.log(log_dict)
+        # Log epoch-level metrics explicitly with step=epoch for proper x-axis
+        wandb.log(log_dict, step=epoch)
         
         if val_metrics:
-            horizon_str = " | ".join([f"H{h+1}:{val_metrics['horizon_mse'][h]:.4f}" 
-                                      for h in range(num_rollout_steps)])
-            print(f"  Train Loss: {train_metrics['loss']:.4f} | Val Loss: {val_metrics['loss']:.4f}")
-            print(f"  Train Cos: {train_metrics['cosine_sim']:.4f} | Val Cos: {val_metrics['cosine_sim']:.4f}")
-            print(f"  Per-horizon MSE: {horizon_str}")
+            # Visualize 4 scenarios after every epoch (using validation data)
+            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
+                try:
+                    print(f"\n  Creating visualizations for epoch {epoch+1}...")
+                    # Create visualizations for up to 4 scenarios
+                    viz_count = 0
+                    for viz_batch in val_loader:
+                        if viz_count >= 4:
+                            break
+                        visualize_autoregressive_rollout(
+                            model, viz_batch, epoch, num_rollout_steps, 
+                            device, is_parallel, save_dir=VIZ_DIR
+                        )
+                        viz_count += 1
+                    print(f"  Created {viz_count} visualizations\n")
+                except Exception as e:
+                    import traceback
+                    print(f"  Warning: Visualization failed: {e}")
+                    traceback.print_exc()
             
             # Early stopping check
             early_stopper(val_metrics['loss'])
@@ -1116,6 +1155,26 @@ def run_autoregressive_finetuning(
                 break
         else:
             print(f"  Train Loss: {train_metrics['loss']:.4f} | Train Cos: {train_metrics['cosine_sim']:.4f}")
+            
+            # Visualize even without validation - use training data (4 scenarios)
+            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
+                try:
+                    print(f"\n  Creating visualizations for epoch {epoch+1}...")
+                    viz_count = 0
+                    for viz_batch in train_loader:
+                        if viz_count >= 4:
+                            break
+                        visualize_autoregressive_rollout(
+                            model, viz_batch, epoch, num_rollout_steps, 
+                            device, is_parallel, save_dir=VIZ_DIR
+                        )
+                        viz_count += 1
+                    print(f"  Created {viz_count} visualizations\n")
+                except Exception as e:
+                    import traceback
+                    print(f"  Warning: Visualization failed: {e}")
+                    traceback.print_exc()
+            
             # Early stopping on train loss if no validation
             early_stopper(train_metrics['loss'])
             if early_stopper.early_stop:
