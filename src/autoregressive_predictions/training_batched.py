@@ -642,6 +642,11 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             print("[AMP] Using FP16 with GradScaler")
     
     best_val_loss = float('inf')
+    best_model_state = None
+    best_optimizer_state = None
+    best_epoch = 0
+    checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
     
     for epoch in range(epochs):
@@ -737,27 +742,12 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_epoch = epoch + 1
                 save_model = get_model_for_saving(model, is_parallel)
-                checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
-                checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': save_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_loss,
-                    'train_loss': train_loss,
-                    'batch_size': batch_size,
-                    'config': {
-                        'batch_size': batch_size,
-                        'hidden_channels': hidden_channels,
-                        'learning_rate': learning_rate,
-                        'num_layers': num_layers,
-                        'num_gru_layers': num_gru_layers,
-                        'dropout': dropout,
-                        'use_edge_weights': use_edge_weights
-                    }
-                }, checkpoint_path)
-                print(f"   Best model saved to {checkpoint_filename} (val_loss: {val_loss:.4f})")
+                # Store best model state in memory (will save to disk at end)
+                best_model_state = save_model.state_dict().copy()
+                best_optimizer_state = optimizer.state_dict().copy()
+                print(f"   New best validation loss: {val_loss:.4f} at epoch {epoch+1}")
         else:
             scheduler.step(train_loss)
             print("   No validation data - cannot detect overfitting")
@@ -768,6 +758,32 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             print(f"Best validation loss: {best_val_loss:.4f}")
             print(f"{'='*60}")
             break
+    
+    # Save best model checkpoint after training completes
+    if best_model_state is not None:
+        print(f"\n{'='*60}")
+        print(f"Saving best model from epoch {best_epoch}...")
+        torch.save({
+            'epoch': best_epoch,
+            'model_state_dict': best_model_state,
+            'optimizer_state_dict': best_optimizer_state,
+            'val_loss': best_val_loss,
+            'batch_size': batch_size,
+            'config': {
+                'batch_size': batch_size,
+                'hidden_channels': hidden_channels,
+                'learning_rate': learning_rate,
+                'num_layers': num_layers,
+                'num_gru_layers': num_gru_layers,
+                'dropout': dropout,
+                'use_edge_weights': use_edge_weights
+            }
+        }, checkpoint_path)
+        print(f"Best GCN model saved to {checkpoint_filename}")
+        print(f"Epoch: {best_epoch} | Val Loss: {best_val_loss:.4f}")
+        print(f"{'='*60}\n")
+    else:
+        print("\nNo checkpoint saved (no validation data or no improvement)\n")
     
     if should_finish_wandb:
         wandb_run.finish()

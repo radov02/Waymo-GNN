@@ -926,7 +926,7 @@ def run_autoregressive_finetuning(
     finetune_lr = learning_rate * 0.1
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
-                                   verbose=True, min_lr=1e-7)
+                                   min_lr=1e-7)
     
     # Initialize early stopping
     early_stopper = EarlyStopping(
