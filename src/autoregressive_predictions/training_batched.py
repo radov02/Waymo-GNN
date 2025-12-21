@@ -24,7 +24,18 @@ import torch.nn.functional as F
 from concurrent.futures import ProcessPoolExecutor
 import threading
 import warnings
-warnings.filterwarnings("ignore", message=r"skipping cudagraphs due to graph with symbolic shapes*")
+import logging
+
+# Suppress CUDA graph compilation warnings (non-critical, expected with dynamic shapes)
+warnings.filterwarnings("ignore", message=".*skipping cudagraphs.*")
+warnings.filterwarnings("ignore", message=".*_maybe_guard_rel.*")
+warnings.filterwarnings("ignore", message=".*cudagraph.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.*")
+
+# Also suppress at logging level
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch.fx").setLevel(logging.ERROR)
 
 
 # Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
