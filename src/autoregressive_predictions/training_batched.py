@@ -303,6 +303,7 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
     print(f"  Loss: {avg_loss_epoch:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
     print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
     
+    # Call visualization AFTER epoch completes (model is still in train mode but no backward pending)
     if visualize_callback is not None and last_batch_dict is not None:
         visualize_callback(epoch, last_batch_dict, model, device, wandb)
     
@@ -568,21 +569,31 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
-        # Visualization callback (async, non-blocking)
+        # Visualization callback (runs AFTER epoch, still async but safe)
         def viz_callback(ep, batch_dict, mdl, dev, wb):
             nonlocal last_viz_batch
             if ep % visualize_every_n_epochs == 0:
-                # Run visualization in background thread to not block training
+                # Run visualization in background thread (safe now - after epoch completes)
                 def _viz_task():
                     try:
-                        filepath, avg_error = visualize_training_progress(
-                            mdl, batch_dict, epoch=ep+1,
-                            scenario_id=None,
-                            save_dir=VIZ_DIR,
-                            device=dev,
-                            max_nodes_per_graph=config.max_nodes_per_graph_viz,
-                            show_timesteps=config.show_timesteps_viz
-                        )
+                        # Ensure model is in eval mode for visualization
+                        was_training = mdl.training
+                        mdl.eval()
+                        
+                        with torch.no_grad():
+                            filepath, avg_error = visualize_training_progress(
+                                mdl, batch_dict, epoch=ep+1,
+                                scenario_id=None,
+                                save_dir=VIZ_DIR,
+                                device=dev,
+                                max_nodes_per_graph=config.max_nodes_per_graph_viz,
+                                show_timesteps=config.show_timesteps_viz
+                            )
+                        
+                        # Restore original training state
+                        if was_training:
+                            mdl.train()
+                        
                         wb.log({"epoch": ep, "viz_avg_error": avg_error})
                         print(f"  [VIZ] Saved: {filepath} | Avg Error: {avg_error:.2f}m")
                     except Exception as e:
