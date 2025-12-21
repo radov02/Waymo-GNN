@@ -646,6 +646,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         if effective_rollout < 1:
             continue
         
+        # Position scale for computing targets
+        POSITION_SCALE = 100.0
+        
         for t in range(max(1, T - effective_rollout)):
             current_graph = batched_graph_sequence[t]
             if current_graph.y is None:
@@ -653,6 +656,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             
             rollout_loss = None
             graph_for_prediction = current_graph
+            is_using_predicted_positions = False  # Track if we're using our predictions
             
             for step in range(effective_rollout):
                 target_t = t + step + 1
@@ -665,6 +669,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 
                 if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
                     graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
                     continue
                 
                 # GAT forward pass with optional AMP - no edge weights
@@ -678,7 +683,15 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         timestep=t + step
                     )
                     
-                    target = target_graph.y.to(pred.dtype)
+                    # CRITICAL: Compute correct target based on current position
+                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                        # When using predicted positions, target is displacement from current predicted pos to GT next pos
+                        gt_next_pos = target_graph.pos.to(pred.dtype)
+                        current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
+                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                    else:
+                        # When using GT positions (teacher forcing), use the pre-computed GT displacement
+                        target = target_graph.y.to(pred.dtype)
                     
                     mse_loss = F.mse_loss(pred, target)
                     pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
@@ -706,8 +719,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred.detach(), device
                         )
+                        is_using_predicted_positions = True  # Now we're using predicted positions
                     else:
                         graph_for_prediction = batched_graph_sequence[target_t]
+                        is_using_predicted_positions = False  # Back to GT positions
             
             if rollout_loss is not None:
                 if accumulated_loss is None:
@@ -797,6 +812,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             if effective_rollout < 1:
                 continue
             
+            # Position scale for computing targets
+            POSITION_SCALE = 100.0
+            
             for t in range(start_t, max(start_t + 1, T - effective_rollout)):
                 current_graph = batched_graph_sequence[t]
                 if current_graph.y is None:
@@ -804,6 +822,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 
                 graph_for_prediction = current_graph
                 rollout_loss = 0.0
+                is_using_predicted_positions = False  # Track if we're using our predictions
                 
                 for step in range(effective_rollout):
                     target_t = t + step + 1
@@ -816,6 +835,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     
                     if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
                         graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
                         continue
                     
                     # GAT forward - no edge weights
@@ -828,7 +848,16 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         timestep=t + step
                     )
                     
-                    target = target_graph.y.to(pred.dtype)
+                    # CRITICAL: Compute correct target based on current position
+                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                        # When using predicted positions, target is displacement from current predicted pos to GT next pos
+                        gt_next_pos = target_graph.pos.to(pred.dtype)
+                        current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
+                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                    else:
+                        # First step uses GT position
+                        target = target_graph.y.to(pred.dtype)
+                    
                     mse = F.mse_loss(pred, target)
                     
                     pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
@@ -848,6 +877,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred, device
                         )
+                        is_using_predicted_positions = True  # Now we're using predicted positions
                 
                 total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
                 steps += 1
