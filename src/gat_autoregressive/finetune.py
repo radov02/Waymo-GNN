@@ -603,7 +603,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
 
 
 def train_epoch_autoregressive(model, dataloader, optimizer, device, 
-                               sampling_prob, num_rollout_steps, is_parallel, scaler=None):
+                               sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0):
     """Train one epoch with scheduled sampling for autoregressive prediction (with optional AMP).
     
     Processes multiple scenarios in parallel using PyG's batching mechanism.
@@ -1018,7 +1018,7 @@ def run_autoregressive_finetuning(
         
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 
-            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler
+            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch
         )
         
         val_metrics = None
