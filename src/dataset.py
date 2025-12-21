@@ -50,14 +50,20 @@ class HDF5ScenarioDataset(Dataset):
         return len(self.scenario_ids)
 
     def __getstate__(self):
-        # Don't pickle file handle or thread-local storage when DataLoader spawns workers
+        # Don't pickle file handle, thread-local storage, or locks when DataLoader spawns workers
         state = self.__dict__.copy()
         state["_local"] = None
+        state["_cache_lock"] = None  # threading.Lock cannot be pickled
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._local = threading.local()
+        # Recreate lock if cache is enabled
+        if self._memory_cache is not None:
+            self._cache_lock = threading.Lock()
+        else:
+            self._cache_lock = None
 
     def _get_h5file(self):
         """Get thread-local HDF5 file handle, opening if necessary."""
