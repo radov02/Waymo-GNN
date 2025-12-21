@@ -35,7 +35,7 @@ from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, num_workers, num_layers, num_gru_layers, epochs,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
-                    gradient_clip_value, checkpoint_dir_autoreg, use_edge_weights,
+                    gradient_clip_value, checkpoint_dir_autoreg, checkpoint_dir, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
                     autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_viz_dir_finetune, autoreg_skip_map_features,
@@ -1222,14 +1222,32 @@ def run_autoregressive_finetuning(
         sampling_strategy: 'linear', 'exponential', or 'inverse_sigmoid'
     """
     
-    # Load pre-trained model
+    # Construct checkpoint filename based on training script's naming convention
+    # Format: best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt
+    checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+    pretrained_checkpoint_batched = os.path.join(checkpoint_dir, checkpoint_filename)
+    
+    # Load pre-trained model - try batched version first, then fallback to simple names
     checkpoint = None
-    if pretrained_checkpoint and os.path.exists(pretrained_checkpoint):
+    model = None
+    is_parallel = False
+    
+    if os.path.exists(pretrained_checkpoint_batched):
+        print(f"Found batched checkpoint: {pretrained_checkpoint_batched}")
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched, device)
+    elif pretrained_checkpoint and os.path.exists(pretrained_checkpoint):
+        print(f"Found checkpoint: {pretrained_checkpoint}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint, device)
     elif pretrained_checkpoint_2 and os.path.exists(pretrained_checkpoint_2):
+        print(f"Found checkpoint: {pretrained_checkpoint_2}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_2, device)
     else:
-        raise FileNotFoundError(f"No checkpoint found at {pretrained_checkpoint} or {pretrained_checkpoint_2}")
+        raise FileNotFoundError(
+            f"No valid checkpoint found. Checked:\n"
+            f"  - {pretrained_checkpoint_batched}\n"
+            f"  - {pretrained_checkpoint}\n"
+            f"  - {pretrained_checkpoint_2}"
+        )
     
     # Check if loaded model was trained with GAT (for backward compatibility)
     model_uses_gat = checkpoint.get('config', {}).get('use_gat', False) if checkpoint else False
