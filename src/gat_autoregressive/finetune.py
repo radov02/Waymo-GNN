@@ -25,7 +25,7 @@ import wandb
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
-from SpatioTemporalGAT import SpatioTemporalGAT
+from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     input_dim, output_dim, sequence_length, hidden_channels,
@@ -98,28 +98,32 @@ def load_pretrained_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Recreate model with saved config or use defaults
+    # SpatioTemporalGATBatched is architecture-compatible with SpatioTemporalGAT
+    # but supports batch_size > 1 properly
     if 'config' in checkpoint:
         config = checkpoint['config']
-        model = SpatioTemporalGAT(
+        model = SpatioTemporalGATBatched(
             input_dim=config['input_dim'],
             hidden_dim=config['hidden_channels'],
             output_dim=config.get('output_dim', output_dim),
             num_gat_layers=config['num_layers'],
             num_gru_layers=config.get('num_gru_layers', 1),
             dropout=config['dropout'],
-            num_heads=config.get('num_heads', 4)
+            num_heads=config.get('num_heads', 4),
+            max_agents_per_scenario=128
         )
     else:
         # Checkpoint doesn't have config - use default values from config.py
         print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
-        model = SpatioTemporalGAT(
+        model = SpatioTemporalGATBatched(
             input_dim=input_dim,
             hidden_dim=hidden_channels,
             output_dim=output_dim,
             num_gat_layers=num_layers,
             num_gru_layers=num_gru_layers,
             dropout=dropout,
-            num_heads=4  # Default value
+            num_heads=4,  # Default value
+            max_agents_per_scenario=128
         )
     
     # Setup multi-GPU if available
@@ -988,7 +992,7 @@ def run_autoregressive_finetuning(
     run = wandb.init(
         project=project_name,
         config={
-            "model": "SpatioTemporalGAT_Autoregressive",
+            "model": "SpatioTemporalGATBatched_Autoregressive",
             "pretrained_from": pretrained_checkpoint,
             "batch_size": batch_size,
             "learning_rate": learning_rate * 0.1,
@@ -1114,6 +1118,7 @@ def run_autoregressive_finetuning(
     print(f"{'='*80}")
     print(f"Device: {device}")
     print(f"Pre-trained model: {pretrained_checkpoint}")
+    print(f"Model: SpatioTemporalGATBatched (supports batch_size > 1)")
     print(f"Batch size: {batch_size} scenarios processed in parallel")
     print(f"Rollout steps: {num_rollout_steps} ({num_rollout_steps * 0.1}s horizon)")
     print(f"Sampling strategy: {sampling_strategy}")

@@ -42,3 +42,6 @@ ter2> watch -n 1 nvidia-smi
 	local> scp -P THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 root@PORT:~/Waymo-GNN/visualizations/autoreg/epoch_001_progress.png C:\Users\radov\Downloads\
 	- or use script in PowerShell if you have correctly set the .env file:
 		local> powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\radov\dev\waymo-project\download_visualizations.ps1' -EnvFile 'C:\Users\radov\dev\waymo-project\.env'
+
+- to upload file(s) to the host:
+    local> scp -P THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\best_model.pt root@IP:~/Waymo-GNN/checkpoints
