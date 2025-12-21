@@ -18,8 +18,37 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.multiprocessing as mp
 import wandb
 import torch.nn.functional as F
+import warnings
+warnings.filterwarnings("ignore", message=r"skipping cudagraphs due to graph with symbolic shapes*")
+
+
+# Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
+# Use file-system backed shared memory to avoid exhausting file descriptors
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    print("[mp] set_sharing_strategy('file_system')")
+except Exception:
+    pass
+
+# Configure torch.inductor for dynamic graph sizes (reduce cudagraph overhead)
+try:
+    if hasattr(torch, '_inductor'):
+        cfg = torch._inductor.config
+        if hasattr(cfg, 'triton'):
+            cfg.triton.cudagraph_skip_dynamic_graphs = True
+            cfg.triton.cudagraph_dynamic_shape_warn_limit = None
+            print("[inductor] configured cudagraph_skip_dynamic_graphs=True")
+except Exception:
+    pass
+
 from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
@@ -52,34 +81,80 @@ VIZ_DIR = 'visualizations/autoreg/gat'
 cfg.viz_training_dir = VIZ_DIR
 
 
-class EarlyStopping:
-    """Early stopping to stop training when validation loss doesn't improve."""
+class OverfittingDetector:
+    """Detect overfitting by tracking when train loss decreases but val loss increases.
     
-    def __init__(self, patience=10, min_delta=0.001, verbose=True):
+    Stops training after patience consecutive epochs of overfitting.
+    """
+    
+    def __init__(self, patience=4, min_delta=0.001, verbose=True):
         self.patience = patience
         self.min_delta = min_delta
         self.verbose = verbose
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+        self.overfit_counter = 0
+        self.best_val_loss = None
+        self.prev_train_loss = None
+        self.prev_val_loss = None
+        self.should_stop = False
         
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
+    def __call__(self, train_loss, val_loss):
+        """Check if we're overfitting: train loss decreasing but val loss increasing."""
+        
+        # Initialize on first call
+        if self.best_val_loss is None:
+            self.best_val_loss = val_loss
+            self.prev_train_loss = train_loss
+            self.prev_val_loss = val_loss
+            return
+        
+        # Track best validation loss
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+        
+        # Detect overfitting: train improves but val gets worse
+        train_improved = train_loss < (self.prev_train_loss - self.min_delta)
+        val_worsened = val_loss > (self.prev_val_loss + self.min_delta)
+        
+        if train_improved and val_worsened:
+            self.overfit_counter += 1
             if self.verbose:
-                print(f"  EarlyStopping counter: {self.counter}/{self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
+                print(f"  Overfitting detected: train↓ {self.prev_train_loss:.4f}→{train_loss:.4f}, "
+                      f"val↑ {self.prev_val_loss:.4f}→{val_loss:.4f} "
+                      f"({self.overfit_counter}/{self.patience})")
+            
+            if self.overfit_counter >= self.patience:
+                self.should_stop = True
+                if self.verbose:
+                    print(f"\n  STOPPING: Overfitting detected for {self.patience} consecutive epochs!")
         else:
-            self.best_loss = val_loss
-            self.counter = 0
+            # Reset counter if not overfitting
+            if self.overfit_counter > 0 and self.verbose:
+                print(f"  No overfitting this epoch, counter reset")
+            self.overfit_counter = 0
+        
+        self.prev_train_loss = train_loss
+        self.prev_val_loss = val_loss
             
     def reset(self):
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+        self.overfit_counter = 0
+        self.best_val_loss = None
+        self.prev_train_loss = None
+        self.prev_val_loss = None
+        self.should_stop = False
+
+
+# ============== WORKER INIT FUNCTION (MODULE LEVEL FOR PICKLING) ==============
+def worker_init_fn(worker_id):
+    """Initialize worker process with fresh HDF5 file handle.
+    Must be at module level to be pickleable for spawn multiprocessing.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    dataset_obj = worker_info.dataset
+    # Unwrap Subset if present
+    if hasattr(dataset_obj, 'dataset'):
+        dataset_obj = dataset_obj.dataset
+    if hasattr(dataset_obj, 'init_worker'):
+        dataset_obj.init_worker()
 
 
 def get_module(model):
@@ -124,12 +199,21 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         total_edges = batched_graph_sequence[0].edge_index.size(1)
         
         if batch_idx % log_every_n_batches == 0:
+            # Compute running averages for display
+            avg_mse_so_far = total_mse / max(1, metric_count)
+            avg_cos_so_far = total_cosine_sim / max(1, metric_count)
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
+            
             if torch.cuda.is_available():
                 print(f"\n[Epoch {epoch+1}] Batch {batch_idx}/{total_batches} | "
                       f"Scenarios: {B} | Total Nodes: {total_nodes} | Edges: {total_edges} | T={T}")
                 print(f"[PARALLEL] Processing {B} scenarios simultaneously on GPU")
+                if metric_count > 0:
+                    print(f"[METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             else:
                 print(f"Batch {batch_idx}/{total_batches}: B={B}, T={T}, Nodes={total_nodes}")
+                if metric_count > 0:
+                    print(f"  MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
 
         # Move all timesteps to device
         for t in range(T):
@@ -236,6 +320,13 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
     avg_mse = total_mse / max(1, metric_count)
     avg_angle_error = total_angular / max(1, metric_count)
     
+    # Print epoch summary with RMSE in meters
+    rmse_meters = (avg_mse ** 0.5) * 100.0
+    print(f"\n[TRAIN EPOCH {epoch+1} SUMMARY]")
+    print(f"  Loss: {avg_loss_epoch:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
+    
+    # Call visualization AFTER epoch completes (model is still in train mode but no backward pending)
     if visualize_callback is not None and last_batch_dict is not None:
         visualize_callback(epoch, last_batch_dict, model, device, wandb)
     
@@ -317,6 +408,12 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
     avg_mse = total_mse / max(1, metric_count)
     avg_angle_error = total_angular / max(1, metric_count)
     
+    # Print validation summary with RMSE in meters
+    rmse_meters = (avg_mse ** 0.5) * 100.0
+    print(f"\n[VALIDATION SUMMARY]")
+    print(f"  Loss: {avg_loss:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
+    
     return avg_loss, avg_mse, avg_cosine_sim, avg_angle_error
 
 
@@ -397,7 +494,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
-                                  patience=scheduler_patience, verbose=True, min_lr=min_lr)
+                                  patience=scheduler_patience, min_lr=min_lr)
     loss_fn = advanced_directional_loss
 
     # Load datasets
@@ -437,7 +534,8 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             drop_last=False,  # Don't drop last batch in validation
             pin_memory=pin_memory,
             prefetch_factor=prefetch_factor,
-            persistent_workers=True if num_workers > 0 else False
+            persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=worker_init_fn if num_workers > 0 else None
         )
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
@@ -452,11 +550,12 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         drop_last=True,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=True if num_workers > 0 else False,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None
     )
 
-    early_stopper = EarlyStopping(
-        patience=early_stopping_patience, 
+    overfit_detector = OverfittingDetector(
+        patience=4,  # Stop after 4 consecutive epochs of overfitting
         min_delta=early_stopping_min_delta, 
         verbose=True
     )
@@ -544,11 +643,14 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 "val/loss": val_loss,
                 "val/mse": val_mse,
                 "val/cosine_similarity": val_cos,
-                "val/angle_error": val_angle
+                "val/angle_error": val_angle,
+                "train_val_gap": train_loss - val_loss  # Track overfitting gap
             })
             
             scheduler.step(val_loss)
-            early_stopper(val_loss)
+            
+            # Check for overfitting with both train and val loss
+            overfit_detector(train_loss, val_loss)
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -562,13 +664,16 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                     'train_loss': train_loss,
                     'batch_size': batch_size
                 }, checkpoint_path)
-                print(f"  ✓ Best model saved (val_loss: {val_loss:.4f})")
+                print(f"   Best model saved (val_loss: {val_loss:.4f})")
         else:
             scheduler.step(train_loss)
-            early_stopper(train_loss)
+            print("   No validation data - cannot detect overfitting")
         
-        if early_stopper.early_stop:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+        if overfit_detector.should_stop:
+            print(f"\n{'='*60}")
+            print(f"Training stopped at epoch {epoch+1} due to overfitting")
+            print(f"Best validation loss: {best_val_loss:.4f}")
+            print(f"{'='*60}")
             break
     
     if should_finish_wandb:

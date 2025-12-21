@@ -106,34 +106,66 @@ def worker_init_fn(worker_id):
         dataset_obj.init_worker()
 
 
-class EarlyStopping:
-    """Early stopping to stop training when validation loss doesn't improve."""
+class OverfittingDetector:
+    """Detect overfitting by tracking when train loss decreases but val loss increases.
     
-    def __init__(self, patience=10, min_delta=0.001, verbose=True):
+    Stops training after patience consecutive epochs of overfitting.
+    """
+    
+    def __init__(self, patience=4, min_delta=0.001, verbose=True):
         self.patience = patience
         self.min_delta = min_delta
         self.verbose = verbose
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+        self.overfit_counter = 0
+        self.best_val_loss = None
+        self.prev_train_loss = None
+        self.prev_val_loss = None
+        self.should_stop = False
         
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
+    def __call__(self, train_loss, val_loss):
+        """Check if we're overfitting: train loss decreasing but val loss increasing."""
+        
+        # Initialize on first call
+        if self.best_val_loss is None:
+            self.best_val_loss = val_loss
+            self.prev_train_loss = train_loss
+            self.prev_val_loss = val_loss
+            return
+        
+        # Track best validation loss
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+        
+        # Detect overfitting: train improves but val gets worse
+        train_improved = train_loss < (self.prev_train_loss - self.min_delta)
+        val_worsened = val_loss > (self.prev_val_loss + self.min_delta)
+        
+        if train_improved and val_worsened:
+            self.overfit_counter += 1
             if self.verbose:
-                print(f"  EarlyStopping counter: {self.counter}/{self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
+                print(f"  Overfitting detected: train↓ {self.prev_train_loss:.4f}→{train_loss:.4f}, "
+                      f"val↑ {self.prev_val_loss:.4f}→{val_loss:.4f} "
+                      f"({self.overfit_counter}/{self.patience})")
+            
+            if self.overfit_counter >= self.patience:
+                self.should_stop = True
+                if self.verbose:
+                    print(f"\n  STOPPING: Overfitting detected for {self.patience} consecutive epochs!")
         else:
-            self.best_loss = val_loss
-            self.counter = 0
+            # Reset counter if not overfitting
+            if self.overfit_counter > 0 and self.verbose:
+                print(f"  No overfitting this epoch, counter reset")
+            self.overfit_counter = 0
+        
+        self.prev_train_loss = train_loss
+        self.prev_val_loss = val_loss
             
     def reset(self):
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
+        self.overfit_counter = 0
+        self.best_val_loss = None
+        self.prev_train_loss = None
+        self.prev_val_loss = None
+        self.should_stop = False
 
 
 def get_module(model):
@@ -537,8 +569,8 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         worker_init_fn=worker_init_fn if num_workers > 0 else None
     )
 
-    early_stopper = EarlyStopping(
-        patience=early_stopping_patience, 
+    overfit_detector = OverfittingDetector(
+        patience=4,  # Stop after 4 consecutive epochs of overfitting
         min_delta=early_stopping_min_delta, 
         verbose=True
     )
@@ -642,11 +674,14 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 "val/loss": val_loss,
                 "val/mse": val_mse,
                 "val/cosine_similarity": val_cos,
-                "val/angle_error": val_angle
+                "val/angle_error": val_angle,
+                "train_val_gap": train_loss - val_loss  # Track overfitting gap
             })
             
             scheduler.step(val_loss)
-            early_stopper(val_loss)
+            
+            # Check for overfitting with both train and val loss
+            overfit_detector(train_loss, val_loss)
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -663,10 +698,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 print(f"   Best model saved (val_loss: {val_loss:.4f})")
         else:
             scheduler.step(train_loss)
-            early_stopper(train_loss)
+            print("   No validation data - cannot detect overfitting")
         
-        if early_stopper.early_stop:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+        if overfit_detector.should_stop:
+            print(f"\n{'='*60}")
+            print(f"Training stopped at epoch {epoch+1} due to overfitting")
+            print(f"Best validation loss: {best_val_loss:.4f}")
+            print(f"{'='*60}")
             break
     
     if should_finish_wandb:
