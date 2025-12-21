@@ -175,14 +175,16 @@ def load_model_state(model, state_dict, is_parallel):
     """
     # Check if state_dict has 'module.' prefix
     has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
-        # Check if state_dict has '_orig_mod.' prefix from torch.compile()
+    
+    # Check if state_dict has '_orig_mod.' prefix from torch.compile()
     has_orig_mod_prefix = any(k.startswith('_orig_mod.') for k in state_dict.keys())
     
     # Strip _orig_mod. prefix if present (from torch.compile)
     if has_orig_mod_prefix:
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
         has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
-        if is_parallel and not has_module_prefix:
+    
+    if is_parallel and not has_module_prefix:
         # Model is parallel but checkpoint isn't - add prefix
         new_state_dict = {'module.' + k: v for k, v in state_dict.items()}
         model.load_state_dict(new_state_dict)
