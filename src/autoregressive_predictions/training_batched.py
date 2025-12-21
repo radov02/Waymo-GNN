@@ -18,8 +18,22 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.multiprocessing as mp
 import wandb
 import torch.nn.functional as F
+
+# Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
+# Use file-system backed shared memory to avoid exhausting file descriptors
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    print("[mp] set_sharing_strategy('file_system')")
+except Exception:
+    pass
 from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
@@ -453,6 +467,15 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             val_dataset = val_dataset_full
             print(f"Validation: {len(val_dataset)} scenarios")
         
+        def worker_init_fn(worker_id):
+            worker_info = torch.utils.data.get_worker_info()
+            dataset_obj = worker_info.dataset
+            # Unwrap Subset if present
+            if hasattr(dataset_obj, 'dataset'):
+                dataset_obj = dataset_obj.dataset
+            if hasattr(dataset_obj, 'init_worker'):
+                dataset_obj.init_worker()
+        
         val_dataloader = DataLoader(
             val_dataset, 
             batch_size=batch_size,
@@ -462,11 +485,19 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             drop_last=False,
             pin_memory=pin_memory,
             prefetch_factor=prefetch_factor,
-            persistent_workers=True if num_workers > 0 else False
+            persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=worker_init_fn if num_workers > 0 else None
         )
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
 
+    # Worker init function for safe per-worker HDF5 file handles
+    def worker_init_fn(worker_id):
+        worker_info = torch.utils.data.get_worker_info()
+        dataset_obj = worker_info.dataset
+        if hasattr(dataset_obj, 'init_worker'):
+            dataset_obj.init_worker()
+    
     # Training dataloader with batched scenarios
     dataloader = DataLoader(
         dataset, 
@@ -477,7 +508,8 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         drop_last=True,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=True if num_workers > 0 else False,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None
     )
 
     early_stopper = EarlyStopping(

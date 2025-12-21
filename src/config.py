@@ -8,8 +8,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # - Set to 0 on Windows if you get multiprocessing errors
 # - Set to 2-4 on Linux for parallel loading
 # - Higher values = more RAM usage but faster loading
-num_workers = min(4, max(0, torch.cuda.device_count() * 2)) if torch.cuda.is_available() else 0
-#num_workers = 0
+#num_workers = min(4, max(0, torch.cuda.device_count() * 2)) if torch.cuda.is_available() else 0
+num_workers = 2
 
 # pin_memory: Faster CPU→GPU transfer (only useful with CUDA)
 pin_memory = torch.cuda.is_available()

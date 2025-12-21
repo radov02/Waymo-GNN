@@ -65,6 +65,17 @@ class HDF5ScenarioDataset(Dataset):
             # Use swmr=True for concurrent read access
             self._local.h5file = h5py.File(self.hdf5_path, "r", swmr=True)
         return self._local.h5file
+    
+    def init_worker(self):
+        """Called from DataLoader worker_init_fn to ensure fresh handle per worker."""
+        # Close any existing handle (from parent process)
+        if hasattr(self._local, 'h5file') and self._local.h5file is not None:
+            try:
+                self._local.h5file.close()
+            except Exception:
+                pass
+            self._local.h5file = None
+        # Next __getitem__ call will open a new handle for this worker
 
     def _load_tensor_fast(self, dataset, dtype=torch.float32):
         """Optimized tensor loading using direct numpy buffer."""
