@@ -21,6 +21,8 @@ import torch
 import torch.multiprocessing as mp
 import wandb
 import torch.nn.functional as F
+from concurrent.futures import ProcessPoolExecutor
+import threading
 
 # Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
 try:
@@ -34,6 +36,27 @@ try:
     print("[mp] set_sharing_strategy('file_system')")
 except Exception:
     pass
+
+# Configure torch.inductor for dynamic graph sizes (reduce cudagraph overhead)
+try:
+    if hasattr(torch, '_inductor'):
+        cfg = torch._inductor.config
+        if hasattr(cfg, 'triton'):
+            cfg.triton.cudagraph_skip_dynamic_graphs = True
+            cfg.triton.cudagraph_dynamic_shape_warn_limit = None
+            print("[inductor] configured cudagraph_skip_dynamic_graphs=True")
+except Exception:
+    pass
+
+# Global visualization thread pool (reused across epochs)
+_viz_executor = None
+
+def get_viz_executor():
+    """Get or create a thread pool for async visualization."""
+    global _viz_executor
+    if _viz_executor is None:
+        _viz_executor = threading.Thread
+    return _viz_executor
 from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
@@ -545,25 +568,30 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
-        # Visualization callback
+        # Visualization callback (async, non-blocking)
         def viz_callback(ep, batch_dict, mdl, dev, wb):
             nonlocal last_viz_batch
             if ep % visualize_every_n_epochs == 0:
-                try:
-                    # Use visualize_training_progress directly with VIZ_DIR
-                    filepath, avg_error = visualize_training_progress(
-                        mdl, batch_dict, epoch=ep+1,
-                        scenario_id=None,
-                        save_dir=VIZ_DIR,  # Use GCN-specific directory
-                        device=dev,
-                        max_nodes_per_graph=config.max_nodes_per_graph_viz,
-                        show_timesteps=config.show_timesteps_viz
-                    )
-                    wb.log({"epoch": ep, "viz_avg_error": avg_error})
-                except Exception as e:
-                    print(f"  Visualization error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                # Run visualization in background thread to not block training
+                def _viz_task():
+                    try:
+                        filepath, avg_error = visualize_training_progress(
+                            mdl, batch_dict, epoch=ep+1,
+                            scenario_id=None,
+                            save_dir=VIZ_DIR,
+                            device=dev,
+                            max_nodes_per_graph=config.max_nodes_per_graph_viz,
+                            show_timesteps=config.show_timesteps_viz
+                        )
+                        wb.log({"epoch": ep, "viz_avg_error": avg_error})
+                        print(f"  [VIZ] Saved: {filepath} | Avg Error: {avg_error:.2f}m")
+                    except Exception as e:
+                        print(f"  [VIZ] Error: {e}")
+                
+                # Start background thread
+                viz_thread = threading.Thread(target=_viz_task, daemon=True)
+                viz_thread.start()
+                print(f"  [VIZ] Started background visualization for epoch {ep+1}")
             last_viz_batch = batch_dict
         
         # Training

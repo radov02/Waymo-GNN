@@ -74,7 +74,7 @@ use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >
 # - 'reduce-overhead': Lower kernel launch overhead (good for small batches)
 # - 'max-autotune': Maximum optimization (longer compile, best runtime)
 torch_compile_mode = "reduce-overhead"  # Best for batch_size=1 with many small kernels
-use_torch_compile = False
+use_torch_compile = True  # Enabled for 20-30% speedup on compatible GPUs
 
 # ============== Multi-GPU Configuration ==============
 # Automatically detect available GPUs
@@ -230,7 +230,7 @@ gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualiza
 # - For 16GB GPU: use 4-8
 # - For 24GB+ GPU: use 8-16
 # - For 48GB GPU (RTX 6000): use 32-64 for high GPU utilization
-batch_size = 32  # Increased from 16 to better utilize RTX 6000 48GB
+batch_size = 48  # Increased from 32 to maximize RTX 6000 48GB utilization
 learning_rate = 0.001
 epochs = 20
 gradient_clip_value = 1.0
