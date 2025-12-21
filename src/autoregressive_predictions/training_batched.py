@@ -23,6 +23,9 @@ import wandb
 import torch.nn.functional as F
 from concurrent.futures import ProcessPoolExecutor
 import threading
+import warnings
+warnings.filterwarnings("ignore", message=r"skipping cudagraphs due to graph with symbolic shapes.*")
+
 
 # Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
 try:
@@ -569,40 +572,40 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
-        # Visualization callback (runs AFTER epoch, still async but safe)
+        # Visualization callback (runs AFTER epoch, synchronously to avoid data corruption)
         def viz_callback(ep, batch_dict, mdl, dev, wb):
             nonlocal last_viz_batch
             if ep % visualize_every_n_epochs == 0:
-                # Run visualization in background thread (safe now - after epoch completes)
-                def _viz_task():
-                    try:
-                        # Ensure model is in eval mode for visualization
-                        was_training = mdl.training
-                        mdl.eval()
-                        
-                        with torch.no_grad():
-                            filepath, avg_error = visualize_training_progress(
-                                mdl, batch_dict, epoch=ep+1,
-                                scenario_id=None,
-                                save_dir=VIZ_DIR,
-                                device=dev,
-                                max_nodes_per_graph=config.max_nodes_per_graph_viz,
-                                show_timesteps=config.show_timesteps_viz
-                            )
-                        
-                        # Restore original training state
-                        if was_training:
-                            mdl.train()
-                        
-                        wb.log({"epoch": ep, "viz_avg_error": avg_error})
-                        print(f"  [VIZ] Saved: {filepath} | Avg Error: {avg_error:.2f}m")
-                    except Exception as e:
-                        print(f"  [VIZ] Error: {e}")
-                
-                # Start background thread
-                viz_thread = threading.Thread(target=_viz_task, daemon=True)
-                viz_thread.start()
-                print(f"  [VIZ] Started background visualization for epoch {ep+1}")
+                # Run visualization synchronously to avoid multiprocessing conflicts
+                # Background threads were causing data loader corruption due to
+                # concurrent TensorFlow dataset access during scenario loading
+                try:
+                    print(f"  [VIZ] Starting visualization for epoch {ep+1}...")
+                    
+                    # Ensure model is in eval mode for visualization
+                    was_training = mdl.training
+                    mdl.eval()
+                    
+                    with torch.no_grad():
+                        filepath, avg_error = visualize_training_progress(
+                            mdl, batch_dict, epoch=ep+1,
+                            scenario_id=None,
+                            save_dir=VIZ_DIR,
+                            device=dev,
+                            max_nodes_per_graph=config.max_nodes_per_graph_viz,
+                            show_timesteps=config.show_timesteps_viz
+                        )
+                    
+                    # Restore original training state
+                    if was_training:
+                        mdl.train()
+                    
+                    wb.log({"epoch": ep, "viz_avg_error": avg_error})
+                    print(f"  [VIZ] Saved: {filepath} | Avg Error: {avg_error:.2f}m")
+                except Exception as e:
+                    print(f"  [VIZ] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
             last_viz_batch = batch_dict
         
         # Training
