@@ -42,14 +42,20 @@ from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios,
-                    use_gradient_checkpointing)
+                    use_gradient_checkpointing, radius)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
+from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
 from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features,
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 from torch.nn.utils import clip_grad_norm_
 import random
+
+# ============== Autoregressive Edge Rebuilding ==============
+# When enabled, edges are recomputed at each autoregressive step based on updated positions.
+# This captures new spatial relationships as agents move (e.g., agents coming within/out of radius).
+# Slightly slower but more accurate for long rollouts where agents move significantly.
+AUTOREG_REBUILD_EDGES = True  # Set to False to keep original edge topology (faster but less accurate)
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/autoregressive_predictions/finetune_single_step_to_autoregressive.py
 
@@ -727,6 +733,54 @@ def update_graph_with_prediction(graph, pred_displacement, device):
                 updated_graph.x[batch_indices, 7] = rel_x_norm
                 updated_graph.x[batch_indices, 8] = rel_y_norm
                 updated_graph.x[batch_indices, 9] = dist_norm
+        
+        # ============== EDGE REBUILDING ==============
+        # Rebuild edges based on updated positions to capture new spatial relationships
+        # This is critical for long rollouts where agents move significantly
+        if AUTOREG_REBUILD_EDGES:
+            if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
+                # Batched graph: rebuild edges per scenario, then combine
+                batch_ids = updated_graph.batch.unique()
+                all_edge_indices = []
+                all_edge_weights = []
+                
+                for batch_id in batch_ids:
+                    batch_mask = (updated_graph.batch == batch_id)
+                    batch_positions = updated_graph.pos[batch_mask]
+                    batch_indices = torch.where(batch_mask)[0]
+                    
+                    # Get valid mask from feature 4 (validity flag)
+                    valid_mask = updated_graph.x[batch_mask, 4] > 0.5
+                    
+                    # Build new edges for this batch
+                    local_edge_index, local_edge_weight = build_edge_index_using_radius(
+                        batch_positions, radius=radius, self_loops=False, 
+                        valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
+                    )
+                    
+                    # Convert local indices to global indices
+                    if local_edge_index.size(1) > 0:
+                        global_edge_index = batch_indices[local_edge_index]
+                        all_edge_indices.append(global_edge_index)
+                        all_edge_weights.append(local_edge_weight.to(device))
+                
+                # Combine all edges
+                if all_edge_indices:
+                    updated_graph.edge_index = torch.cat(all_edge_indices, dim=1)
+                    updated_graph.edge_weight = torch.cat(all_edge_weights, dim=0)
+                else:
+                    # No edges - create empty tensors
+                    updated_graph.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                    updated_graph.edge_weight = torch.zeros(0, dtype=torch.float32, device=device)
+            else:
+                # Single graph (no batching)
+                valid_mask = updated_graph.x[:, 4] > 0.5
+                new_edge_index, new_edge_weight = build_edge_index_using_radius(
+                    updated_graph.pos, radius=radius, self_loops=False,
+                    valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
+                )
+                updated_graph.edge_index = new_edge_index.to(device)
+                updated_graph.edge_weight = new_edge_weight.to(device)
     
     return updated_graph
 
@@ -828,6 +882,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             current_graph = batched_graph_sequence[t]
             if current_graph.y is None:
                 continue
+            
+            # CRITICAL: Reset GRU hidden states for each new rollout starting point
+            # Without this, hidden states from previous rollouts corrupt predictions
+            base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
             
             # Autoregressive rollout from this starting point
             rollout_loss = None
@@ -1031,6 +1089,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 current_graph = batched_graph_sequence[t]
                 if current_graph.y is None:
                     continue
+                
+                # CRITICAL: Reset GRU hidden states for each new rollout starting point
+                base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
                 
                 # Full autoregressive rollout
                 graph_for_prediction = current_graph
@@ -1320,6 +1381,7 @@ def run_autoregressive_finetuning(
     print(f"Early stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
     print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
     print(f"Mixed Precision (AMP): {'Enabled' if use_amp and torch.cuda.is_available() else 'Disabled'}")
+    print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
     print(f"Visualizations: {viz_dir}")
     
     # Check if rollout fits in sequence length

@@ -1,5 +1,5 @@
 
------- CONNECT TO PrimeIntellect Instance  (running pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime) ---------
+------ CONNECT TO PrimeIntellect Instance  (Nvidia RTX Pro 6000 96GB instance, running pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime) ---------
 - generate ssh certificate:
 	local> ssh-keygen -t ed25519 -f C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 -C "yourPublicKeyName"
 	- this will create C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 (private key file) and C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519.pub (public key file)
