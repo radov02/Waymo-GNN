@@ -8,7 +8,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # - Set to 0 on Windows if you get multiprocessing errors
 # - Set to 2-4 on Linux for parallel loading
 # - Higher values = more RAM usage but faster loading
-num_workers = min(4, max(0, torch.cuda.device_count() * 2)) if torch.cuda.is_available() else 0
+#num_workers = min(4, max(0, torch.cuda.device_count() * 2)) if torch.cuda.is_available() else 0
+num_workers = 0
 
 # pin_memory: Faster CPU→GPU transfer (only useful with CUDA)
 pin_memory = torch.cuda.is_available()
@@ -228,9 +229,9 @@ gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualiza
 # - For 8GB GPU: use 2 (GAT uses more memory than GCN due to attention)
 # - For 16GB GPU: use 4-8
 # - For 24GB+ GPU: use 8-16
-batch_size = 2
+batch_size = 16
 learning_rate = 0.001
-epochs = 10
+epochs = 20
 gradient_clip_value = 1.0
 # Learning rate scheduler settings
 scheduler_patience = 5  # Wait 5 epochs before reducing LR
