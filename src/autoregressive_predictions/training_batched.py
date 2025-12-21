@@ -66,6 +66,20 @@ VIZ_DIR = 'visualizations/autoreg'
 config.viz_training_dir = VIZ_DIR
 
 
+# ============== WORKER INIT FUNCTION (MODULE LEVEL FOR PICKLING) ==============
+def worker_init_fn(worker_id):
+    """Initialize worker process with fresh HDF5 file handle.
+    Must be at module level to be pickleable for spawn multiprocessing.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    dataset_obj = worker_info.dataset
+    # Unwrap Subset if present
+    if hasattr(dataset_obj, 'dataset'):
+        dataset_obj = dataset_obj.dataset
+    if hasattr(dataset_obj, 'init_worker'):
+        dataset_obj.init_worker()
+
+
 class EarlyStopping:
     """Early stopping to stop training when validation loss doesn't improve."""
     
@@ -467,15 +481,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             val_dataset = val_dataset_full
             print(f"Validation: {len(val_dataset)} scenarios")
         
-        def worker_init_fn(worker_id):
-            worker_info = torch.utils.data.get_worker_info()
-            dataset_obj = worker_info.dataset
-            # Unwrap Subset if present
-            if hasattr(dataset_obj, 'dataset'):
-                dataset_obj = dataset_obj.dataset
-            if hasattr(dataset_obj, 'init_worker'):
-                dataset_obj.init_worker()
-        
         val_dataloader = DataLoader(
             val_dataset, 
             batch_size=batch_size,
@@ -491,13 +496,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
 
-    # Worker init function for safe per-worker HDF5 file handles
-    def worker_init_fn(worker_id):
-        worker_info = torch.utils.data.get_worker_info()
-        dataset_obj = worker_info.dataset
-        if hasattr(dataset_obj, 'init_worker'):
-            dataset_obj.init_worker()
-    
     # Training dataloader with batched scenarios
     dataloader = DataLoader(
         dataset, 
