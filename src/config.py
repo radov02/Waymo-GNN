@@ -240,7 +240,7 @@ gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualiza
 # - For 48GB GPU (RTX 6000): use 32-64 for high GPU utilization
 batch_size = 48  # Increased from 32 to maximize RTX 6000 48GB utilization
 learning_rate = 0.001
-epochs = 30
+epochs = 20
 gradient_clip_value = 1.0
 # Learning rate scheduler settings
 scheduler_patience = 5  # Wait 5 epochs before reducing LR
@@ -280,7 +280,7 @@ checkpoint_dir_autoreg = 'checkpoints/autoregressive'  # Autoregressive model ch
 
 # ============== Autoregressive Fine-tuning ==============
 autoreg_num_rollout_steps = 89       # Number of steps to roll out (20 = 2.0s horizon, max ~19 for T=29)
-autoreg_num_epochs = 10             # Number of fine-tuning epochs
+autoreg_num_epochs = 30             # Number of fine-tuning epochs
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 5  # Visualize every N epochs during fine-tuning
 autoreg_viz_dir = 'visualizations/autoreg'  # Directory for autoregressive visualizations (GCN model)
