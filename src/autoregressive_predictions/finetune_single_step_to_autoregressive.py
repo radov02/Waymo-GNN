@@ -108,12 +108,12 @@ def load_pretrained_model(checkpoint_path, device):
     if 'config' in checkpoint:
         config = checkpoint['config']
         model = SpatioTemporalGNNBatched(
-            input_dim=config['input_dim'],
-            hidden_dim=config['hidden_channels'],
+            input_dim=config.get('input_dim', input_dim),
+            hidden_dim=config.get('hidden_channels', hidden_channels),
             output_dim=config.get('output_dim', output_dim),
-            num_gcn_layers=config['num_layers'],
-            num_gru_layers=config.get('num_gru_layers', 1),
-            dropout=config['dropout'],
+            num_gcn_layers=config.get('num_layers', num_layers),
+            num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+            dropout=config.get('dropout', dropout),
             use_gat=config.get('use_gat', False),  # Backward compat with old checkpoints
             use_gradient_checkpointing=use_gradient_checkpointing,
             max_agents_per_scenario=128

@@ -103,13 +103,13 @@ def load_pretrained_model(checkpoint_path, device):
     if 'config' in checkpoint:
         config = checkpoint['config']
         model = SpatioTemporalGATBatched(
-            input_dim=config['input_dim'],
-            hidden_dim=config['hidden_channels'],
+            input_dim=config.get('input_dim', input_dim),
+            hidden_dim=config.get('hidden_channels', hidden_channels),
             output_dim=config.get('output_dim', output_dim),
-            num_gat_layers=config['num_layers'],
-            num_gru_layers=config.get('num_gru_layers', 1),
-            dropout=config['dropout'],
-            num_heads=config.get('num_heads', 4),
+            num_gat_layers=config.get('num_layers', num_layers),
+            num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+            dropout=config.get('dropout', dropout),
+            num_heads=config.get('num_heads', gat_num_heads),
             max_agents_per_scenario=128
         )
     else:
