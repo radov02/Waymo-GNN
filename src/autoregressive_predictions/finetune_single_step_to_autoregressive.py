@@ -38,7 +38,7 @@ from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     gradient_clip_value, checkpoint_dir_autoreg, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_skip_map_features,
+                    autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_viz_dir_finetune, autoreg_skip_map_features,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios,
@@ -815,7 +815,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
         
         optimizer.zero_grad()
-        accumulated_loss = torch.tensor(0.0, device=device)
+        accumulated_loss = None
         valid_steps = 0
         
         # Process sequence with autoregressive rollout
@@ -830,7 +830,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 continue
             
             # Autoregressive rollout from this starting point
-            rollout_loss = torch.tensor(0.0, device=device)
+            rollout_loss = None
             graph_for_prediction = current_graph
             is_using_predicted_positions = False  # Track if we've diverged from GT
             
@@ -902,7 +902,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     # Combined loss with temporal discount (later steps matter less)
                     discount = 0.95 ** step
                     step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
-                rollout_loss += step_loss
+                
+                if rollout_loss is None:
+                    rollout_loss = step_loss
+                else:
+                    rollout_loss = rollout_loss + step_loss
                 
                 # Track metrics
                 with torch.no_grad():
@@ -925,11 +929,15 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         graph_for_prediction = batched_graph_sequence[target_t]
                         is_using_predicted_positions = False
             
-            accumulated_loss += rollout_loss
-            valid_steps += 1
+            if rollout_loss is not None:
+                if accumulated_loss is None:
+                    accumulated_loss = rollout_loss
+                else:
+                    accumulated_loss = accumulated_loss + rollout_loss
+                valid_steps += 1
         
         # Backpropagate with optional AMP scaling
-        if valid_steps > 0:
+        if valid_steps > 0 and accumulated_loss is not None:
             avg_loss = accumulated_loss / valid_steps
             if use_amp_local:
                 scaler.scale(avg_loss).backward()
@@ -1167,8 +1175,8 @@ def run_autoregressive_finetuning(
     if model_uses_gat:
         print("Note: Loaded old GAT checkpoint - consider using gat_autoregressive/finetune.py")
     
-    # Set visualization directory (GCN model uses autoreg, not autoreg/gat)
-    viz_dir = 'visualizations/autoreg/finetune'
+    # Set visualization directory from config.py
+    viz_dir = autoreg_viz_dir_finetune
     
     # Initialize wandb
     wandb.login()

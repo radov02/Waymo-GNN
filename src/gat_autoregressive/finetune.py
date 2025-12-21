@@ -33,7 +33,7 @@ from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     gradient_clip_value,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs,
+                    autoreg_visualize_every_n_epochs, autoreg_viz_dir_finetune_gat,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios)
@@ -50,7 +50,7 @@ import random
 # GAT-specific directories
 CHECKPOINT_DIR = 'checkpoints/gat'
 CHECKPOINT_DIR_AUTOREG = 'checkpoints/gat/autoregressive'
-VIZ_DIR = 'visualizations/autoreg/gat/finetune'
+VIZ_DIR = autoreg_viz_dir_finetune_gat  # From config.py
 
 
 class EarlyStopping:
@@ -733,12 +733,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             steps += 1
         
         if batch_idx % 20 == 0:
-            loss_val = accumulated_loss.item() if hasattr(accumulated_loss, 'item') else accumulated_loss
+            loss_val = accumulated_loss.item() if accumulated_loss is not None and hasattr(accumulated_loss, 'item') else 0.0
             avg_mse_so_far = total_mse / max(1, count)
             avg_cos_so_far = total_cosine / max(1, count)
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             print(f"  Batch {batch_idx}: Loss={loss_val/max(1,valid_steps):.4f}, "
                   f"Sampling prob={sampling_prob:.2f}")
+            print(f"    [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             
             # Log per-step metrics to wandb
             wandb.log({
@@ -750,6 +751,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 "train/batch_cosine_sim": avg_cos_so_far,
                 "train/batch_sampling_prob": sampling_prob,
             })
+    
+    # Print epoch summary with RMSE in meters
+    final_mse = total_mse / max(1, count)
+    final_rmse = (final_mse ** 0.5) * 100.0
+    print(f"\n[TRAIN EPOCH SUMMARY]")
+    print(f"  Loss: {total_loss / max(1, steps):.6f} | MSE: {final_mse:.6f} | RMSE: {final_rmse:.2f}m")
+    print(f"  CosSim: {total_cosine / max(1, count):.4f}")
     
     return {
         'loss': total_loss / max(1, steps),

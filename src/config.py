@@ -284,4 +284,6 @@ autoreg_num_epochs = 10             # Number of fine-tuning epochs
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 1  # Visualize every N epochs during fine-tuning
 autoreg_viz_dir = 'visualizations/autoreg'  # Directory for autoregressive visualizations (GCN model)
+autoreg_viz_dir_finetune = 'visualizations/autoreg/finetune'  # GCN finetuning visualizations
+autoreg_viz_dir_finetune_gat = 'visualizations/autoreg/finetune/gat'  # GAT finetuning visualizations
 autoreg_skip_map_features = False    # Skip loading scenario map features for visualization (faster but no roads)
