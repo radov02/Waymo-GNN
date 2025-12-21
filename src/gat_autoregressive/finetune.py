@@ -972,18 +972,18 @@ def run_autoregressive_finetuning(
     
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, collate_fn=collate_graph_sequences_to_batch,
-        drop_last=True, persistent_workers=True if num_workers > 0 else False,
-        pin_memory=pin_memory, prefetch_factor=prefetch_factor
+        num_workers=0, collate_fn=collate_graph_sequences_to_batch,
+        drop_last=True, persistent_workers=False,
+        pin_memory=pin_memory, prefetch_factor=None
     )
     
     val_loader = None
     if val_dataset:
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, collate_fn=collate_graph_sequences_to_batch,
-            drop_last=True, persistent_workers=True if num_workers > 0 else False,
-            pin_memory=pin_memory, prefetch_factor=prefetch_factor
+            num_workers=0, collate_fn=collate_graph_sequences_to_batch,
+            drop_last=True, persistent_workers=False,
+            pin_memory=pin_memory, prefetch_factor=None
         )
     
     print(f"\n{'='*80}")
