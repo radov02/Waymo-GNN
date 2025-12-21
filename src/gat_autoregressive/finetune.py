@@ -639,7 +639,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
         
         optimizer.zero_grad()
-        accumulated_loss = torch.tensor(0.0, device=device)
+        accumulated_loss = None
         valid_steps = 0
         
         effective_rollout = min(num_rollout_steps, T - 1)
@@ -651,7 +651,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             if current_graph.y is None:
                 continue
             
-            rollout_loss = torch.tensor(0.0, device=device)
+            rollout_loss = None
             graph_for_prediction = current_graph
             
             for step in range(effective_rollout):
@@ -688,7 +688,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     discount = 0.95 ** step
                     step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
-                rollout_loss += step_loss
+                
+                if rollout_loss is None:
+                    rollout_loss = step_loss
+                else:
+                    rollout_loss = rollout_loss + step_loss
                 
                 with torch.no_grad():
                     total_mse += mse_loss.item()
@@ -705,10 +709,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     else:
                         graph_for_prediction = batched_graph_sequence[target_t]
             
-            accumulated_loss += rollout_loss
-            valid_steps += 1
+            if rollout_loss is not None:
+                if accumulated_loss is None:
+                    accumulated_loss = rollout_loss
+                else:
+                    accumulated_loss = accumulated_loss + rollout_loss
+                valid_steps += 1
         
-        if valid_steps > 0:
+        if valid_steps > 0 and accumulated_loss is not None:
             avg_loss = accumulated_loss / valid_steps
             # Backward pass with optional AMP scaling
             if use_amp_local:
