@@ -24,12 +24,8 @@ import torch.nn.functional as F
 from concurrent.futures import ProcessPoolExecutor
 import threading
 import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=r"skipping cudagraphs due to graph with symbolic shapes.*",
-    category=UserWarning,
-    module=r"torch_geometric.*"
-)
+warnings.filterwarnings("ignore", message=r"skipping cudagraphs due to graph with symbolic shapes*")
+
 
 # Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
 try:

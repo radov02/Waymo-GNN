@@ -508,5 +508,5 @@ if __name__ == '__main__':
         num_rollout_steps=20,
         max_scenarios=10,
         visualize=True,
-        visualize_max=5
+        visualize_max=4
     )

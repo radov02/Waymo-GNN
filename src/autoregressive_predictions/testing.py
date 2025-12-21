@@ -661,5 +661,5 @@ if __name__ == '__main__':
         num_rollout_steps=20,  # 2 seconds ahead (limited by sequence length)
         max_scenarios=10,       # Test on 10 scenarios first, set to None for all
         visualize=True,
-        visualize_max=5
+        visualize_max=4
     )

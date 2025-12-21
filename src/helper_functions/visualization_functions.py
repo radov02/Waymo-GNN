@@ -5,7 +5,9 @@ import torch
 import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
-from config import sequence_length, radius, graph_creation_method, viz_scenario_dir, viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, show_timesteps_viz
+from config import (sequence_length, radius, graph_creation_method, viz_scenario_dir, 
+                    viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, 
+                    show_timesteps_viz, max_scenario_files_for_viz)
 import matplotlib.pyplot as plt
 
 # Cache for loaded scenarios to avoid reloading the same scenario multiple times
@@ -269,8 +271,13 @@ _scenario_index = None
 _scenario_index_path = "./data/scenario/scenario_index.json"
 
 
-def _build_scenario_index(scenario_dirs=None):
-    """Build an index of scenario_id -> (file_path, record_index) for fast lookups."""
+def _build_scenario_index(scenario_dirs=None, max_files_per_dir=None):
+    """Build an index of scenario_id -> (file_path, record_index) for fast lookups.
+    
+    Args:
+        scenario_dirs: List of directories to search, or None for default
+        max_files_per_dir: Maximum number of tfrecord files to index per directory (None = all)
+    """
     global _scenario_index
     
     import json
@@ -288,6 +295,8 @@ def _build_scenario_index(scenario_dirs=None):
     
     # Build index from scratch
     print("  Building scenario index (this is a one-time operation)...")
+    if max_files_per_dir:
+        print(f"  Limiting to {max_files_per_dir} files per directory for faster indexing")
     
     if scenario_dirs is None:
         scenario_dirs = [
@@ -307,6 +316,10 @@ def _build_scenario_index(scenario_dirs=None):
                 continue
             
             tfrecord_files = sorted(scenario_path.glob("*.tfrecord"))
+            
+            # Limit number of files if specified
+            if max_files_per_dir:
+                tfrecord_files = tfrecord_files[:max_files_per_dir]
             
             for tfrecord_file in tfrecord_files:
                 print(f"    Indexing {tfrecord_file}...")
@@ -335,7 +348,7 @@ def _build_scenario_index(scenario_dirs=None):
         return {}
 
 
-def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True):
+def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True, max_files_for_index=None):
     """
     Load a Waymo scenario from tfrecord files by scenario_id.
     Uses caching and indexing for fast lookups.
@@ -344,11 +357,16 @@ def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True):
         scenario_id: The scenario ID to load
         scenario_dirs: List of directories to search, or None for default [training, validation]
         use_index: If True, use/build scenario index for fast lookups
+        max_files_for_index: Maximum tfrecord files to index per directory (None = use config value)
         
     Returns:
         Scenario object or None if not found
     """
     global _scenario_index
+    
+    # Use config value if not specified
+    if max_files_for_index is None:
+        max_files_for_index = max_scenario_files_for_viz
     
     # Check cache first
     if scenario_id in _scenario_cache:
@@ -371,7 +389,7 @@ def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True):
         # Try using index for fast lookup
         if use_index:
             if _scenario_index is None:
-                _build_scenario_index(scenario_dirs)
+                _build_scenario_index(scenario_dirs, max_files_per_dir=max_files_for_index)
             
             if _scenario_index and scenario_id in _scenario_index:
                 entry = _scenario_index[scenario_id]
@@ -446,10 +464,15 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
             if scenario_id:
                 print(f"  Found scenario_id from batch_dict: {scenario_id}")
     
-    # Load scenarios for each graph in the batch (needed for map features)
+    # Load scenarios only for the graphs that will be visualized (first 4)
+    # This avoids loading scenarios for all 48 graphs in the batch
+    B = batch_dict["B"]  # Total graphs in batch
+    B_viz = min(B, 4)    # Only visualize first 4 graphs
+    
     scenarios = {}
     scenario_ids_list = batch_dict.get('scenario_ids', [])
-    for idx, sid in enumerate(scenario_ids_list):
+    for idx in range(min(B_viz, len(scenario_ids_list))):
+        sid = scenario_ids_list[idx]
         if sid is not None and sid not in scenarios:
             print(f"  Loading scenario {sid} for graph {idx}...")
             scenarios[sid] = load_scenario_by_id(sid)
@@ -464,7 +487,6 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     
     model.eval()
     batched_graph_sequence = batch_dict["batch"]
-    B = batch_dict["B"]  # Number of graphs in batch
     total_T = batch_dict["T"]
     
     # Sample timesteps evenly across the sequence
@@ -540,8 +562,7 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 all_batch_indices.append(graph.batch.cpu())
     
     # Create figure with B × T grid (rows = graphs, columns = timesteps)
-    # Limit to max 4 graphs for visualization
-    B_viz = min(B, 4)
+    # Note: B_viz was already set earlier when loading scenarios
     
     # Larger figure size for better visibility
     fig, axes = plt.subplots(B_viz, T, figsize=(5*T, 5*B_viz))
