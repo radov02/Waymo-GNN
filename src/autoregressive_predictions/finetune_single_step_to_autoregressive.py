@@ -374,6 +374,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         completed_steps = 0
         
         # Build agent_id -> GT position mapping for all timesteps (for correct error calculation)
+        # IMPORTANT: Only include agents from batch 0 to avoid mixing up positions from different scenarios
         gt_positions_by_agent_and_time = {}
         for step in range(actual_rollout_steps + 1):
             t = start_t + step
@@ -382,12 +383,22 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             graph_at_t = batched_graph_sequence[t]
             if hasattr(graph_at_t, 'pos') and graph_at_t.pos is not None:
                 pos_at_t = graph_at_t.pos.cpu().numpy()
+                
+                # Filter to only first scenario (batch_idx=0) when B > 1
+                if B > 1 and hasattr(graph_at_t, 'batch'):
+                    batch0_mask = (graph_at_t.batch == 0)
+                    batch0_indices = torch.where(batch0_mask)[0].cpu().numpy()
+                else:
+                    batch0_indices = np.arange(graph_at_t.num_nodes)
+                
                 if hasattr(graph_at_t, 'agent_ids'):
-                    for idx, aid in enumerate(graph_at_t.agent_ids):
-                        if idx < pos_at_t.shape[0]:
+                    all_agent_ids = list(graph_at_t.agent_ids)
+                    for local_idx, global_idx in enumerate(batch0_indices):
+                        if global_idx < len(all_agent_ids) and global_idx < pos_at_t.shape[0]:
+                            aid = all_agent_ids[global_idx]
                             if aid not in gt_positions_by_agent_and_time:
                                 gt_positions_by_agent_and_time[aid] = {}
-                            gt_positions_by_agent_and_time[aid][t] = pos_at_t[idx].copy()
+                            gt_positions_by_agent_and_time[aid][t] = pos_at_t[global_idx].copy()
         
         for step in range(actual_rollout_steps):
             target_t = start_t + step + 1
@@ -416,10 +427,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             pred_disp = pred.cpu().numpy() * POSITION_SCALE
             
-            # DEBUG: Print prediction stats on first few steps
-            if step < 5:
+            # DEBUG: Print prediction stats on first step only
+            if step == 0:
                 pred_batch0 = pred_disp[pred_scenario_indices]
-                print(f"  [DEBUG VIZ] Step {step}: Pred disp (batch0) range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]")
+                print(f"  [DEBUG VIZ] Step 0 pred disp range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]m")
             
             # Map predictions to persistent agents using current graph's agent ordering (only first scenario)
             step_errors = []
@@ -434,19 +445,16 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         agent_pred_positions[agent_id] = new_pos
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
                         
-                        # DEBUG: Compare using CORRECT target - displacement from current pred pos to GT next pos
+                        # Calculate error if GT available
                         if agent_id in gt_positions_by_agent_and_time and target_t in gt_positions_by_agent_and_time[agent_id]:
                             gt_next_pos = gt_positions_by_agent_and_time[agent_id][target_t]
                             correct_target_disp = gt_next_pos - current_pred_pos
                             step_err = np.linalg.norm(pred_d - correct_target_disp)
                             step_errors.append(step_err)
-                            if step < 3 and local_idx < 3:
-                                print(f"    Agent {agent_id}: current_pos={current_pred_pos}, pred_disp={pred_d}")
-                                print(f"      gt_next_pos={gt_next_pos}, correct_target={correct_target_disp}, error={step_err:.2f}m")
             
-            # Print average step error
-            if step_errors and step < 5:
-                print(f"  [DEBUG VIZ] Step {step} average displacement error: {np.mean(step_errors):.2f}m")
+            # Print average step error on first step only
+            if step_errors and step == 0:
+                print(f"  [DEBUG VIZ] Step 0 avg displacement error: {np.mean(step_errors):.2f}m")
             
             completed_steps = step + 1
             

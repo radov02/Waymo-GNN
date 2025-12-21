@@ -1230,16 +1230,6 @@ def run_autoregressive_finetuning(
             # Early stopping check
             early_stopper(val_metrics['loss'])
             
-            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
-                try:
-                    viz_batch = next(iter(val_loader))
-                    visualize_autoregressive_rollout(
-                        model, viz_batch, epoch, num_rollout_steps, 
-                        device, is_parallel, save_dir=VIZ_DIR
-                    )
-                except Exception as e:
-                    print(f"  Warning: Visualization failed: {e}")
-            
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
