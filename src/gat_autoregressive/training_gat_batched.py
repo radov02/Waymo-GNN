@@ -22,7 +22,8 @@ import torch.multiprocessing as mp
 import wandb
 import torch.nn.functional as F
 import warnings
-warnings.filterwarnings("ignore", message=r"skipping cudagraphs due to graph with symbolic shapes*")
+warnings.filterwarnings("ignore", message=".*skipping cudagraphs.*")
+warnings.filterwarnings("ignore", message=".*_maybe_guard_rel.*")
 
 
 # Ensure safe start method (avoids inheriting open HDF5 handles on Linux)
@@ -498,6 +499,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     wandb.define_metric("train/batch_angle_error", step_metric="batch")
     wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
     # Initialize batched model
+    num_attention_heads = 4  # Number of attention heads for GAT
     model = SpatioTemporalGATBatched(
         input_dim=input_dim,
         hidden_dim=hidden_channels,
@@ -505,7 +507,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         num_gat_layers=num_layers,
         num_gru_layers=num_gru_layers,
         dropout=dropout,
-        num_heads=4,
+        num_heads=num_attention_heads,
         use_gradient_checkpointing=use_gradient_checkpointing,
         max_agents_per_scenario=128  # Adjust based on your data
     )
