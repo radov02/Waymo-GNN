@@ -685,16 +685,27 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_model = get_model_for_saving(model, is_parallel)
-                checkpoint_path = os.path.join(CHECKPOINT_DIR, 'best_model_batched.pt')
+                checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt'
+                checkpoint_path = os.path.join(CHECKPOINT_DIR, checkpoint_filename)
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': save_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': val_loss,
                     'train_loss': train_loss,
-                    'batch_size': batch_size
+                    'batch_size': batch_size,
+                    'config': {
+                        'batch_size': batch_size,
+                        'hidden_channels': hidden_channels,
+                        'learning_rate': learning_rate,
+                        'num_attention_heads': num_attention_heads,
+                        'num_layers': num_layers,
+                        'num_gru_layers': num_gru_layers,
+                        'dropout': dropout,
+                        'use_gat': True
+                    }
                 }, checkpoint_path)
-                print(f"   Best model saved (val_loss: {val_loss:.4f})")
+                print(f"   Best GAT model saved to {checkpoint_filename} (val_loss: {val_loss:.4f})")
         else:
             scheduler.step(train_loss)
             print("   No validation data - cannot detect overfitting")

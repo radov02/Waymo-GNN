@@ -1073,7 +1073,8 @@ def run_autoregressive_finetuning(
             
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
-                save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, f'best_autoregressive_{num_rollout_steps}step.pt')
+                save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+                save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, save_filename)
                 model_to_save = get_model_for_saving(model, is_parallel)
                 checkpoint_data = {
                     'epoch': epoch,
@@ -1104,7 +1105,8 @@ def run_autoregressive_finetuning(
                 break
     
     # Save final model
-    final_path = os.path.join(CHECKPOINT_DIR_AUTOREG, f'final_autoregressive_{num_rollout_steps}step.pt')
+    final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    final_path = os.path.join(CHECKPOINT_DIR_AUTOREG, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
         'epoch': epoch,
@@ -1121,7 +1123,8 @@ def run_autoregressive_finetuning(
     print(f"\n{'='*80}")
     print(f"GAT FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
-    print(f"Best model: {os.path.join(CHECKPOINT_DIR_AUTOREG, f'best_autoregressive_{num_rollout_steps}step.pt')}")
+    best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    print(f"Best model: {os.path.join(CHECKPOINT_DIR_AUTOREG, best_filename)}")
     print(f"Final model: {final_path}")
     if val_metrics:
         print(f"Best validation loss: {best_val_loss:.4f}")

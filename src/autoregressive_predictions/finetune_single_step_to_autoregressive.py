@@ -1388,7 +1388,8 @@ def run_autoregressive_finetuning(
             # Save best model
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
-                save_path = os.path.join(checkpoint_dir_autoreg, f'best_autoregressive_{num_rollout_steps}step.pt')
+                save_filename = f'best_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+                save_path = os.path.join(checkpoint_dir_autoreg, save_filename)
                 model_to_save = get_model_for_saving(model, is_parallel)
                 checkpoint_data = {
                     'epoch': epoch,
@@ -1420,7 +1421,8 @@ def run_autoregressive_finetuning(
     early_stopped = early_stopper.early_stop if val_loader else False
     
     # Save final model
-    final_path = os.path.join(checkpoint_dir_autoreg, f'final_autoregressive_{num_rollout_steps}step.pt')
+    final_filename = f'final_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    final_path = os.path.join(checkpoint_dir_autoreg, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
         'epoch': actual_final_epoch - 1,
@@ -1438,7 +1440,8 @@ def run_autoregressive_finetuning(
     print(f"FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
     print(f"Epochs completed: {actual_final_epoch}/{num_epochs}" + (" (early stopped)" if early_stopped else ""))
-    print(f"Best model: {os.path.join(checkpoint_dir_autoreg, f'best_autoregressive_{num_rollout_steps}step.pt')}")
+    best_filename = f'best_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    print(f"Best model: {os.path.join(checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
     if val_metrics:
         print(f"Best validation loss: {best_val_loss:.4f}")
