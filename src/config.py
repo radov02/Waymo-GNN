@@ -64,17 +64,17 @@ use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >
 # torch.compile() optimization (PyTorch 2.0+)
 # Requires Triton backend which needs CUDA Capability >= 7.0 (Volta+)
 # Auto-disabled on Pascal (GTX 10xx) and older GPUs
-use_torch_compile = (
-    torch.cuda.is_available() and 
-    torch.cuda.get_device_capability()[0] >= 7 and  # Volta or newer (Triton requirement)
-    hasattr(torch, 'compile')  # PyTorch 2.0+
-)
-
+#use_torch_compile = (
+#    torch.cuda.is_available() and 
+#    torch.cuda.get_device_capability()[0] >= 7 and  # Volta or newer (Triton requirement)
+#    hasattr(torch, 'compile')  # PyTorch 2.0+
+#)
 # Compile mode: 'default', 'reduce-overhead', 'max-autotune'
 # - 'default': Good balance of compile time and speedup
 # - 'reduce-overhead': Lower kernel launch overhead (good for small batches)
 # - 'max-autotune': Maximum optimization (longer compile, best runtime)
 torch_compile_mode = "reduce-overhead"  # Best for batch_size=1 with many small kernels
+use_torch_compile = False
 
 # ============== Multi-GPU Configuration ==============
 # Automatically detect available GPUs
@@ -114,7 +114,7 @@ def print_gpu_info():
         print(f"  TF32 cuDNN: {torch.backends.cudnn.allow_tf32 if hasattr(torch.backends.cudnn, 'allow_tf32') else 'N/A'}")
         print(f"  Mixed Precision (AMP): {use_amp}")
         print(f"  BF16 Mode: {use_bf16}")
-        print(f"  torch.compile: {use_torch_compile} (mode={torch_compile_mode})")
+        print(f"  torch.compile: {use_torch_compile} (mode={torch_compile_mode if use_torch_compile else 'N/A'})")
         print(f"{'='*60}\n")
     else:
         print("\nNo CUDA GPU available - running on CPU\n")

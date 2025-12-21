@@ -727,7 +727,7 @@ def collate_graph_sequences_to_batch(scenario_list):
         
         batched_graphs_at_timestep = Batch.from_data_list(graphs_at_timestep)
         
-        # manually preserve agent_ids (Batch.from_data_list doesn't preserve list attributes), concatenate all agent_ids from individual graphs:
+        # manually preserve agent_ids (Batch.from_data_list doesn't preserve list attributes)
         all_agent_ids = []
         for graph in graphs_at_timestep:
             if hasattr(graph, 'agent_ids'):
