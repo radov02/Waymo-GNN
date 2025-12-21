@@ -146,6 +146,10 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     The model predicts normalized displacement (dx/100, dy/100).
     Node features expect normalized velocity (vx/30, vy/30) and acceleration (ax/10, ay/10).
     Also updates position-dependent features (relative to SDC).
+    
+    IMPORTANT: We use a blended velocity update to prevent feedback loop instability.
+    Instead of completely replacing velocity with prediction-derived values, we blend
+    the old velocity with the new to create smoother transitions.
     """
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
@@ -156,15 +160,27 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
+    # BLENDING FACTOR: How much to trust the prediction-derived velocity vs keep old velocity
+    # 0.0 = keep old velocity entirely, 1.0 = use prediction-derived velocity entirely
+    # Lower values = more stable but slower adaptation, higher = faster but riskier
+    VELOCITY_BLEND_FACTOR = 0.3  # Conservative: mostly keep old velocity
+    
     # Convert normalized displacement to normalized velocity
+    # velocity = displacement / dt, then normalize
     velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
     
-    new_vx_norm = pred_displacement[:, 0] * velocity_scale
-    new_vy_norm = pred_displacement[:, 1] * velocity_scale
+    pred_vx_norm = pred_displacement[:, 0] * velocity_scale
+    pred_vy_norm = pred_displacement[:, 1] * velocity_scale
     
-    # Calculate normalized acceleration
-    old_vx_norm = updated_graph.x[:, 0]
-    old_vy_norm = updated_graph.x[:, 1]
+    # Get old velocity
+    old_vx_norm = updated_graph.x[:, 0].clone()
+    old_vy_norm = updated_graph.x[:, 1].clone()
+    
+    # Blend old and predicted velocities for stability
+    new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
+    new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
+    
+    # Calculate normalized acceleration (using blended velocities)
     accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
