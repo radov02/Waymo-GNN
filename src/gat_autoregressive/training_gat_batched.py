@@ -304,6 +304,16 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         total_loss_epoch += accumulated_loss.item()
         steps += 1
         
+        # Log per-step metrics to wandb for detailed monitoring
+        if steps % 10 == 0:  # Log every 10 steps to avoid too much data
+            wandb.log({
+                "step": epoch * len(dataloader) + batch_idx,
+                "train/step_loss": accumulated_loss.item(),
+                "train/step_mse": mse.item() if not torch.isnan(mse) else 0.0,
+                "train/step_cosine_similarity": cos_sim.item() if not torch.isnan(cos_sim) else 0.0,
+                "train/step_angle_error": mean_angle_error.item() if not torch.isnan(mean_angle_error) else 0.0,
+            })
+        
         last_batch_dict = {
             'batch': [b.cpu() for b in batch_dict['batch']],
             'B': batch_dict['B'],
@@ -463,8 +473,28 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}",
             dir="../wandb"
         )
-        should_finish_wandb = True
-
+        should_finish_wandb = True    
+    # Define custom x-axes for wandb metrics
+    wandb.define_metric("epoch")
+    wandb.define_metric("step")
+    
+    # Epoch-based metrics (plotted vs epoch)
+    wandb.define_metric("train/loss", step_metric="epoch")
+    wandb.define_metric("train/mse", step_metric="epoch")
+    wandb.define_metric("train/cosine_similarity", step_metric="epoch")
+    wandb.define_metric("train/angle_error", step_metric="epoch")
+    wandb.define_metric("val/loss", step_metric="epoch")
+    wandb.define_metric("val/mse", step_metric="epoch")
+    wandb.define_metric("val/cosine_similarity", step_metric="epoch")
+    wandb.define_metric("val/angle_error", step_metric="epoch")
+    wandb.define_metric("learning_rate", step_metric="epoch")
+    wandb.define_metric("train_val_gap", step_metric="epoch")
+    
+    # Step-based metrics (plotted vs step)
+    wandb.define_metric("train/step_loss", step_metric="step")
+    wandb.define_metric("train/step_mse", step_metric="step")
+    wandb.define_metric("train/step_cosine_similarity", step_metric="step")
+    wandb.define_metric("train/step_angle_error", step_metric="step")
     # Initialize batched model
     model = SpatioTemporalGATBatched(
         input_dim=input_dim,

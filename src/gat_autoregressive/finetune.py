@@ -726,8 +726,21 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         
         if batch_idx % 20 == 0:
             loss_val = accumulated_loss.item() if hasattr(accumulated_loss, 'item') else accumulated_loss
+            avg_mse_so_far = total_mse / max(1, count)
+            avg_cos_so_far = total_cosine / max(1, count)
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             print(f"  Batch {batch_idx}: Loss={loss_val/max(1,valid_steps):.4f}, "
                   f"Sampling prob={sampling_prob:.2f}")
+            
+            # Log per-step metrics to wandb
+            wandb.log({
+                "step": steps,
+                "train/step_loss": loss_val / max(1, valid_steps),
+                "train/step_mse": avg_mse_so_far,
+                "train/step_rmse_meters": rmse_meters,
+                "train/step_cosine_sim": avg_cos_so_far,
+                "train/step_sampling_prob": sampling_prob,
+            })
     
     return {
         'loss': total_loss / max(1, steps),
@@ -884,6 +897,29 @@ def run_autoregressive_finetuning(
     )
     
     wandb.watch(model, log='all', log_freq=10)
+    
+    # Define custom x-axes for wandb metrics
+    wandb.define_metric("epoch")
+    wandb.define_metric("step")
+    
+    # Epoch-based metrics (plotted vs epoch)
+    wandb.define_metric("train_loss", step_metric="epoch")
+    wandb.define_metric("train_mse", step_metric="epoch")
+    wandb.define_metric("train_cosine_sim", step_metric="epoch")
+    wandb.define_metric("val_loss", step_metric="epoch")
+    wandb.define_metric("val_mse", step_metric="epoch")
+    wandb.define_metric("val_cosine_sim", step_metric="epoch")
+    wandb.define_metric("learning_rate", step_metric="epoch")
+    wandb.define_metric("sampling_probability", step_metric="epoch")
+    wandb.define_metric("val_mse_horizon_*", step_metric="epoch")
+    wandb.define_metric("val_cosine_horizon_*", step_metric="epoch")
+    
+    # Step-based metrics (plotted vs step)
+    wandb.define_metric("train/step_loss", step_metric="step")
+    wandb.define_metric("train/step_mse", step_metric="step")
+    wandb.define_metric("train/step_rmse_meters", step_metric="step")
+    wandb.define_metric("train/step_cosine_sim", step_metric="step")
+    wandb.define_metric("train/step_sampling_prob", step_metric="step")
     
     finetune_lr = learning_rate * 0.1
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
