@@ -591,7 +591,7 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                     
                     # Save scenario_id as string (no compression for scalar strings)
                     if scenario_id is not None:
-                        snapshot_group.create_dataset("scenario_id", data=np.string_(scenario_id))
+                        snapshot_group.create_dataset("scenario_id", data=np.bytes_(scenario_id))
                 
                 total_scenarios += 1
             end = time.perf_counter()
