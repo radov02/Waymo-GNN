@@ -319,11 +319,12 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         # Log per-step metrics to wandb for detailed monitoring
         if steps % 10 == 0:  # Log every 10 steps to avoid too much data
             wandb.log({
-                "step": epoch * len(dataloader) + batch_idx,
-                "train/step_loss": accumulated_loss.item(),
-                "train/step_mse": mse.item() if not torch.isnan(mse) else 0.0,
-                "train/step_cosine_similarity": cos_sim.item() if not torch.isnan(cos_sim) else 0.0,
-                "train/step_angle_error": mean_angle_error.item() if not torch.isnan(mean_angle_error) else 0.0,
+                "batch": epoch * len(dataloader) + batch_idx,
+                "train/batch_epoch": epoch + 1,  # Which epoch this batch is from
+                "train/batch_loss": accumulated_loss.item(),
+                "train/batch_mse": mse.item() if not torch.isnan(mse) else 0.0,
+                "train/batch_cosine_similarity": cos_sim.item() if not torch.isnan(cos_sim) else 0.0,
+                "train/batch_angle_error": mean_angle_error.item() if not torch.isnan(mean_angle_error) else 0.0,
             })
         
         last_batch_dict = {
@@ -491,7 +492,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     
     # Define custom x-axes for wandb metrics
     wandb.define_metric("epoch")
-    wandb.define_metric("step")
+    wandb.define_metric("batch")  # Global batch counter across all epochs
     
     # Epoch-based metrics (plotted vs epoch)
     wandb.define_metric("train/loss", step_metric="epoch")
@@ -505,11 +506,12 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     wandb.define_metric("learning_rate", step_metric="epoch")
     wandb.define_metric("train_val_gap", step_metric="epoch")
     
-    # Step-based metrics (plotted vs step)
-    wandb.define_metric("train/step_loss", step_metric="step")
-    wandb.define_metric("train/step_mse", step_metric="step")
-    wandb.define_metric("train/step_cosine_similarity", step_metric="step")
-    wandb.define_metric("train/step_angle_error", step_metric="step")
+    # Batch-based metrics (plotted vs batch - fine-grained within-epoch progress)
+    wandb.define_metric("train/batch_loss", step_metric="batch")
+    wandb.define_metric("train/batch_mse", step_metric="batch")
+    wandb.define_metric("train/batch_cosine_similarity", step_metric="batch")
+    wandb.define_metric("train/batch_angle_error", step_metric="batch")
+    wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
 
     # Initialize batched model
     model = SpatioTemporalGNNBatched(

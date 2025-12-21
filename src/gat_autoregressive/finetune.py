@@ -734,12 +734,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             
             # Log per-step metrics to wandb
             wandb.log({
-                "step": steps,
-                "train/step_loss": loss_val / max(1, valid_steps),
-                "train/step_mse": avg_mse_so_far,
-                "train/step_rmse_meters": rmse_meters,
-                "train/step_cosine_sim": avg_cos_so_far,
-                "train/step_sampling_prob": sampling_prob,
+                "batch": steps,
+                "train/batch_epoch": epoch + 1,  # Which epoch this batch is from
+                "train/batch_loss": loss_val / max(1, valid_steps),
+                "train/batch_mse": avg_mse_so_far,
+                "train/batch_rmse_meters": rmse_meters,
+                "train/batch_cosine_sim": avg_cos_so_far,
+                "train/batch_sampling_prob": sampling_prob,
             })
     
     return {
@@ -900,7 +901,7 @@ def run_autoregressive_finetuning(
     
     # Define custom x-axes for wandb metrics
     wandb.define_metric("epoch")
-    wandb.define_metric("step")
+    wandb.define_metric("batch")  # Global batch counter across all epochs
     
     # Epoch-based metrics (plotted vs epoch)
     wandb.define_metric("train_loss", step_metric="epoch")
@@ -914,12 +915,13 @@ def run_autoregressive_finetuning(
     wandb.define_metric("val_mse_horizon_*", step_metric="epoch")
     wandb.define_metric("val_cosine_horizon_*", step_metric="epoch")
     
-    # Step-based metrics (plotted vs step)
-    wandb.define_metric("train/step_loss", step_metric="step")
-    wandb.define_metric("train/step_mse", step_metric="step")
-    wandb.define_metric("train/step_rmse_meters", step_metric="step")
-    wandb.define_metric("train/step_cosine_sim", step_metric="step")
-    wandb.define_metric("train/step_sampling_prob", step_metric="step")
+    # Batch-based metrics (plotted vs batch - fine-grained progress)
+    wandb.define_metric("train/batch_loss", step_metric="batch")
+    wandb.define_metric("train/batch_mse", step_metric="batch")
+    wandb.define_metric("train/batch_rmse_meters", step_metric="batch")
+    wandb.define_metric("train/batch_cosine_sim", step_metric="batch")
+    wandb.define_metric("train/batch_sampling_prob", step_metric="batch")
+    wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
     
     finetune_lr = learning_rate * 0.1
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
