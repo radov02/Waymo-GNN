@@ -282,7 +282,7 @@ checkpoint_dir_autoreg = 'checkpoints/autoregressive'  # Autoregressive model ch
 autoreg_num_rollout_steps = 89       # Number of steps to roll out (20 = 2.0s horizon)
 autoreg_num_epochs = 20             # Number of fine-tuning epochs
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
-autoreg_visualize_every_n_epochs = 5  # Visualize every N epochs during fine-tuning
+autoreg_visualize_every_n_epochs = 2  # Visualize every N epochs during fine-tuning
 autoreg_viz_dir = 'visualizations/autoreg'  # Directory for autoregressive visualizations (GCN model)
 autoreg_viz_dir_finetune = 'visualizations/autoreg/finetune'  # GCN finetuning visualizations
 autoreg_viz_dir_finetune_gat = 'visualizations/autoreg/finetune/gat'  # GAT finetuning visualizations

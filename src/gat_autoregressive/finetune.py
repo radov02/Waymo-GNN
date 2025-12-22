@@ -896,8 +896,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     final_mse = total_mse / max(1, count)
     final_rmse = (final_mse ** 0.5) * 100.0
     print(f"\n[TRAIN EPOCH SUMMARY]")
-    print(f"  Loss: {total_loss / max(1, steps):.6f} | MSE: {final_mse:.6f} | RMSE: {final_rmse:.2f}m")
+    print(f"  Loss: {total_loss / max(1, steps):.6f} | Per-step MSE: {final_mse:.6f} | Per-step RMSE: {final_rmse:.2f}m")
     print(f"  CosSim: {total_cosine / max(1, count):.4f}")
+    print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
     return {
         'loss': total_loss / max(1, steps),
@@ -921,8 +922,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     
     base_model = model.module if is_parallel else model
     
+    # Track position drift for debugging
+    debug_printed = False
+    
     with torch.no_grad():
-        for batch_dict in dataloader:
+        for batch_idx, batch_dict in enumerate(dataloader):
             batched_graph_sequence = batch_dict["batch"]
             B, T = batch_dict["B"], batch_dict["T"]
             
@@ -1006,6 +1010,16 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     
                     mse = F.mse_loss(pred, target)
                     
+                    # Debug: print position drift for first batch, first rollout start
+                    if batch_idx == 0 and t == start_t and not debug_printed:
+                        pos_drift = 0.0
+                        if hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                            pos_drift = torch.norm(graph_for_prediction.pos - target_graph.pos, dim=1).mean().item()
+                        if step in [0, 4, 9, 19, 49, 88]:
+                            print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, pos_drift={pos_drift:.1f}m, auto={is_using_predicted_positions}")
+                        if step == 88:
+                            debug_printed = True
+                    
                     pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
@@ -1030,6 +1044,17 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
+    
+    # Print horizon error progression (every 10th step)
+    final_mse = total_mse / max(1, count)
+    final_rmse_meters = (final_mse ** 0.5) * 100.0
+    print(f"  [VAL METRICS] Per-step MSE={final_mse:.6f} | Per-step RMSE={final_rmse_meters:.2f}m")
+    print(f"  [VAL HORIZON] Step-wise RMSE (meters): ", end="")
+    for h in [0, 9, 19, 29, 49, 69, 88]:
+        if h < len(horizon_avg_mse) and horizon_counts[h] > 0:
+            rmse_h = (horizon_avg_mse[h] ** 0.5) * 100.0
+            print(f"t{h+1}={rmse_h:.1f}m ", end="")
+    print()
     
     return {
         'loss': total_loss / max(1, steps),
@@ -1248,12 +1273,13 @@ def run_autoregressive_finetuning(
         
         val_metrics = None
         if val_loader is not None:
-            print(f"  Running validation...")
+            print(f"  Running validation (100% autoregressive)...")
             val_metrics = evaluate_autoregressive(
                 model, val_loader, device, num_rollout_steps, is_parallel
             )
             scheduler.step(val_metrics['loss'])
-            print(f"  Val Loss: {val_metrics['loss']:.4f} | Val MSE: {val_metrics['mse']:.6f} | Val Cos: {val_metrics['cosine_sim']:.4f}")
+            val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
+            print(f"  Val Loss: {val_metrics['loss']:.4f} | Val per-step RMSE: {val_rmse_meters:.2f}m | Val Cos: {val_metrics['cosine_sim']:.4f}")
         else:
             scheduler.step(train_metrics['loss'])
         
