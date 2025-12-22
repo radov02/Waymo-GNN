@@ -713,12 +713,13 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     old_vx_norm = updated_graph.x[:, 0].clone()
     old_vy_norm = updated_graph.x[:, 1].clone()
     
-    # VELOCITY BLENDING: Use moderate blend (0.7) between prediction-derived and old velocity
-    # - 1.0 = fully use prediction-derived (can cause instability if predictions have errors)
-    # - 0.0 = keep old velocity (ignores predictions, causes drift)
-    # - 0.7 = primarily use predictions but with some smoothing for stability
-    # This helps the model see more realistic velocity transitions during autoregressive rollout
-    VELOCITY_BLEND_FACTOR = 0.7
+    # VELOCITY BLENDING: Use MINIMAL blend to prevent error amplification
+    # - 1.0 = fully use prediction-derived (causes severe instability)
+    # - 0.0 = keep old velocity (most stable but ignores predictions)
+    # - 0.3 = mostly keep old velocity with small update from predictions
+    # REDUCED from 0.7 to 0.3 to prevent error amplification
+    # The position is still updated with FULL prediction, so trajectories diverge anyway
+    VELOCITY_BLEND_FACTOR = 0.3
     new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
     new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
     
@@ -728,12 +729,15 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
     
-    # Clamp to reasonable ranges - increased to handle highway speeds
-    # MAX_SPEED=30 m/s, so normalized 3.0 = 90 m/s (324 km/h) - allows for fast vehicles
-    new_vx_norm = torch.clamp(new_vx_norm, -3.0, 3.0)
-    new_vy_norm = torch.clamp(new_vy_norm, -3.0, 3.0)
-    ax_norm = torch.clamp(ax_norm, -3.0, 3.0)
-    ay_norm = torch.clamp(ay_norm, -3.0, 3.0)
+    # Clamp to reasonable ranges - TIGHTER clamping to prevent extreme values
+    # MAX_SPEED=30 m/s, so:
+    # - normalized 1.5 = 45 m/s (162 km/h) - max for highway
+    # - normalized 2.0 = 60 m/s (216 km/h) - absolute max
+    # Reduced from 3.0 to 1.5 to prevent runaway predictions
+    new_vx_norm = torch.clamp(new_vx_norm, -1.5, 1.5)
+    new_vy_norm = torch.clamp(new_vy_norm, -1.5, 1.5)
+    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
+    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
     
     # Update velocity/acceleration features
     updated_graph.x[:, 0] = new_vx_norm

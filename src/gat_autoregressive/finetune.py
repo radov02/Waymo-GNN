@@ -172,6 +172,7 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     
     if num_nodes_pred != num_nodes_graph:
         # Size mismatch - only update the overlapping nodes
+        print(f"  [WARNING] Size mismatch in update_graph_with_prediction: pred={num_nodes_pred}, graph={num_nodes_graph}")
         num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
         pred_displacement = pred_displacement[:num_nodes_to_update]
         # We'll only update the first num_nodes_to_update nodes
@@ -196,12 +197,13 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
     old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
     
-    # VELOCITY BLENDING: Use moderate blend (0.7) between prediction-derived and old velocity
-    # - 1.0 = fully use prediction-derived (can cause instability if predictions have errors)
-    # - 0.0 = keep old velocity (ignores predictions, causes drift)
-    # - 0.7 = primarily use predictions but with some smoothing for stability
-    # This helps the model see more realistic velocity transitions during autoregressive rollout
-    VELOCITY_BLEND_FACTOR = 0.7
+    # VELOCITY BLENDING: Use MINIMAL blend to prevent error amplification
+    # - 1.0 = fully use prediction-derived (causes severe instability)
+    # - 0.0 = keep old velocity (most stable but ignores predictions)
+    # - 0.3 = mostly keep old velocity with small update from predictions
+    # REDUCED from 0.7 to 0.3 to prevent error amplification
+    # The position is still updated with FULL prediction, so trajectories diverge anyway
+    VELOCITY_BLEND_FACTOR = 0.3
     new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
     new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
     
@@ -211,12 +213,15 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
     
-    # Clamp to reasonable ranges - increased to handle highway speeds
-    # MAX_SPEED=30 m/s, so normalized 3.0 = 90 m/s (324 km/h) - allows for fast vehicles
-    new_vx_norm = torch.clamp(new_vx_norm, -3.0, 3.0)
-    new_vy_norm = torch.clamp(new_vy_norm, -3.0, 3.0)
-    ax_norm = torch.clamp(ax_norm, -3.0, 3.0)
-    ay_norm = torch.clamp(ay_norm, -3.0, 3.0)
+    # Clamp to reasonable ranges - TIGHTER clamping to prevent extreme values
+    # MAX_SPEED=30 m/s, so:
+    # - normalized 1.5 = 45 m/s (162 km/h) - max for highway
+    # - normalized 2.0 = 60 m/s (216 km/h) - absolute max
+    # Reduced from 3.0 to 1.5 to prevent runaway predictions
+    new_vx_norm = torch.clamp(new_vx_norm, -1.5, 1.5)
+    new_vy_norm = torch.clamp(new_vy_norm, -1.5, 1.5)
+    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
+    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
     
     # Update velocity/acceleration features (only for nodes we have predictions for)
     updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
@@ -534,15 +539,22 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             pred_disp = pred.cpu().numpy() * POSITION_SCALE
             
-            # DEBUG: Print prediction stats on first step
-            if step == 0:
-                print(f"  [DEBUG VIZ] Raw pred (normalized): min={pred.min().item():.4f}, max={pred.max().item():.4f}, mean={pred.mean().item():.4f}")
-                print(f"  [DEBUG VIZ] Pred disp (meters): min={pred_disp.min():.2f}, max={pred_disp.max():.2f}, mean={pred_disp.mean():.2f}")
-                # Compare to ground truth if available
-                target_graph = batched_graph_sequence[target_t]
-                if target_graph.y is not None:
-                    gt = target_graph.y.cpu().numpy() * POSITION_SCALE
-                    print(f"  [DEBUG VIZ] GT disp (meters): min={gt.min():.2f}, max={gt.max():.2f}, mean={gt.mean():.2f}")
+            # DEBUG: Print prediction stats on first few steps
+            if step < 5:
+                print(f"  [DEBUG VIZ] Step {step}: Raw pred (norm): min={pred.min().item():.4f}, max={pred.max().item():.4f}, mean={pred.mean().item():.4f}")
+                # Print input features for scenario 0's first agent
+                if len(pred_scenario_indices) > 0:
+                    first_agent_idx = pred_scenario_indices[0]
+                    agent_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
+                    print(f"  [DEBUG VIZ] Step {step}: Agent 0 features: vx={agent_feats[0]:.3f}, vy={agent_feats[1]:.3f}, speed={agent_feats[2]:.3f}, heading={agent_feats[3]:.3f}")
+                    # Also print position for context
+                    if hasattr(graph_for_prediction, 'pos'):
+                        agent_pos = graph_for_prediction.pos[first_agent_idx].cpu().numpy()
+                        print(f"  [DEBUG VIZ] Step {step}: Agent 0 predicted pos: {agent_pos}")
+                # Show what the model predicts for this agent
+                if len(pred_scenario_indices) > 0:
+                    pred_disp_agent0 = pred_disp[pred_scenario_indices[0]]
+                    print(f"  [DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}")
             
             # Map predictions to persistent agents (only first scenario)
             for local_idx, agent_id in enumerate(current_agent_ids):
@@ -550,6 +562,12 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                     # Get global index in the full batched graph
                     global_idx = pred_scenario_indices[local_idx]
                     if global_idx < pred_disp.shape[0]:
+                        # Verify agent ID consistency
+                        if hasattr(graph_for_prediction, 'agent_ids') and global_idx < len(graph_for_prediction.agent_ids):
+                            actual_agent_id = graph_for_prediction.agent_ids[global_idx]
+                            if actual_agent_id != agent_id and step < 3 and local_idx < 3:
+                                print(f"  [WARNING] Agent ID mismatch at step {step}: expected {agent_id}, got {actual_agent_id} at global_idx {global_idx}")
+                        
                         new_pos = agent_pred_positions[agent_id] + pred_disp[global_idx]
                         agent_pred_positions[agent_id] = new_pos
                         
@@ -559,6 +577,13 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
             
             graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device)
+            
+            # DEBUG: Print feature changes after update for first few steps
+            if step < 3 and len(pred_scenario_indices) > 0:
+                first_agent_idx = pred_scenario_indices[0]
+                if first_agent_idx < graph_for_prediction.x.shape[0]:
+                    updated_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
+                    print(f"  [DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed={updated_feats[2]:.3f}")
     
     # Calculate errors
     horizon_errors = []
