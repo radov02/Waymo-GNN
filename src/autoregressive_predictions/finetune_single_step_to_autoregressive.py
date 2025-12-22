@@ -898,15 +898,31 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         num_nodes = batched_graph_sequence[0].num_nodes
         num_edges = batched_graph_sequence[0].edge_index.size(1)
         
+        # Compute agents per scenario for proper GRU hidden state sizing
+        # CRITICAL: The GRU hidden state must be sized as [layers, B * max_agents_per_scenario, hidden_dim]
+        # NOT [layers, total_nodes, hidden_dim] which treats all nodes as one scenario
+        first_graph = batched_graph_sequence[0]
+        if hasattr(first_graph, 'batch') and first_graph.batch is not None:
+            batch_counts = torch.bincount(first_graph.batch, minlength=B)
+            agents_per_scenario = batch_counts.tolist()
+        else:
+            agents_per_scenario = [num_nodes]  # Single scenario fallback
+        
         # Print parallel execution info for autoregressive rollout
         if batch_idx % 20 == 0:
             if torch.cuda.is_available():
                 print(f"\n[Batch {batch_idx}] Scenarios: {B} | Total Nodes: {num_nodes} | Edges: {num_edges}")
                 print(f"[PARALLEL] Processing {B} scenarios simultaneously | Rollout: {num_rollout_steps} steps")
+                print(f"  Agents per scenario: min={min(agents_per_scenario)}, max={max(agents_per_scenario)}, avg={sum(agents_per_scenario)/len(agents_per_scenario):.1f}")
             else:
                 print(f"Batch {batch_idx}: B={B}, Nodes={num_nodes}, Rollout={num_rollout_steps} steps")
         
-        base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+        # Reset GRU with proper batch info - NOT just num_agents!
+        base_model.reset_gru_hidden_states(
+            batch_size=B,
+            agents_per_scenario=agents_per_scenario,
+            device=device
+        )
         
         optimizer.zero_grad()
         accumulated_loss = None
@@ -924,8 +940,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 continue
             
             # CRITICAL: Reset GRU hidden states for each new rollout starting point
-            # Without this, hidden states from previous rollouts corrupt predictions
-            base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+            # Must use proper batch sizing, not just total num_agents!
+            base_model.reset_gru_hidden_states(
+                batch_size=B,
+                agents_per_scenario=agents_per_scenario,
+                device=device
+            )
             
             # Autoregressive rollout from this starting point
             rollout_loss = None
@@ -1115,7 +1135,21 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
             
             num_nodes = batched_graph_sequence[0].num_nodes
-            base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+            
+            # Compute agents per scenario for proper GRU hidden state sizing
+            first_graph = batched_graph_sequence[0]
+            if hasattr(first_graph, 'batch') and first_graph.batch is not None:
+                batch_counts = torch.bincount(first_graph.batch, minlength=B)
+                agents_per_scenario = batch_counts.tolist()
+            else:
+                agents_per_scenario = [num_nodes]
+            
+            # Reset GRU with proper batch info
+            base_model.reset_gru_hidden_states(
+                batch_size=B,
+                agents_per_scenario=agents_per_scenario,
+                device=device
+            )
             
             # Start from middle of sequence
             start_t = T // 3
@@ -1131,7 +1165,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     continue
                 
                 # CRITICAL: Reset GRU hidden states for each new rollout starting point
-                base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+                base_model.reset_gru_hidden_states(
+                    batch_size=B,
+                    agents_per_scenario=agents_per_scenario,
+                    device=device
+                )
                 
                 # Full autoregressive rollout
                 graph_for_prediction = current_graph
