@@ -141,25 +141,26 @@ def load_pretrained_model(checkpoint_path, device):
 
 def update_graph_with_prediction(graph, pred_displacement, device):
     """
-    Update node features based on predicted displacement for next autoregressive step.
+    Update graph for next autoregressive step - POSITION ONLY, preserve velocity features.
     
     The model predicts normalized displacement (dx/100, dy/100).
     
     Updates:
-    - Position (graph.pos): updated with FULL predicted displacement (* 100)
-    - Velocity (features 0-1): derived from prediction using simple formula (pred/dt)
-    - Speed (feature 2): magnitude of velocity
-    - Heading (feature 3): direction of velocity  
-    - Acceleration (features 5-6): change in velocity from previous step
+    - Position (graph.pos): updated with predicted displacement (* 100)
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    VELOCITY UPDATE RATIONALE:
-    - Uses simple formula: new_vx = pred / dt (matches testing_gat.py)
-    - This dampens velocity features compared to "mathematically correct" scaling
-    - Prevents positive feedback loop where prediction errors amplify exponentially
-    - The model is robust to this dampening as shown by testing_gat.py results
+    PRESERVED (not updated):
+    - Velocity (features 0-1): kept from original graph
+    - Speed (feature 2): kept from original graph
+    - Heading (feature 3): kept from original graph
+    - Acceleration (features 5-6): kept from original graph
+    
+    RATIONALE:
+    Updating velocity features from predictions causes mode collapse where all agents
+    converge to similar velocity features and thus similar predictions. By preserving
+    the original velocity context, each agent maintains its unique motion characteristics.
     """
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
@@ -184,45 +185,20 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
-    # ============== SIMPLIFIED VELOCITY UPDATE ==============
-    # Use the same approach as testing_gat.py which has been proven to work.
-    # The key insight is that the "mathematically correct" velocity scale (33.33x)
-    # creates a positive feedback loop where prediction errors amplify exponentially.
-    # 
-    # The testing code uses: new_vx = pred_displacement / dt
-    # This gives smaller values that don't cause runaway amplification.
-    # For example, pred=0.01 -> new_vx = 0.1 (vs 0.333 with correct scaling)
-    # 
-    # This "dampening" prevents the feedback loop and allows stable autoregressive rollout.
-    # ========================================================
+    # ============== POSITION-ONLY UPDATE (PRESERVE VELOCITY FEATURES) ==============
+    # Key insight: Updating velocity features from predictions causes mode collapse.
+    # The model was trained with GT velocity features, so it expects consistent velocities.
+    # When we update velocities from noisy predictions, all agents converge to similar
+    # velocity features, causing them to predict similar trajectories.
+    #
+    # Solution: Only update POSITION, keep velocity/acceleration features from GT.
+    # This preserves each agent's unique motion characteristics.
+    # ================================================================================
     
-    # Simple velocity update (matches testing_gat.py approach)
-    new_vx_norm = pred_displacement[:, 0] / dt  # pred/0.1 = pred*10
-    new_vy_norm = pred_displacement[:, 1] / dt
+    # DON'T update velocity/acceleration features - keep them from original graph
+    # The model should use the original velocity context to make predictions
     
-    # Get old velocity for acceleration calculation
-    old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
-    old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
-    
-    # Calculate acceleration (change in velocity features)
-    ax_norm = (new_vx_norm - old_vx_norm) / dt / MAX_ACCEL  # normalize by MAX_ACCEL=10
-    ay_norm = (new_vy_norm - old_vy_norm) / dt / MAX_ACCEL
-    
-    # Clamp to reasonable ranges
-    new_vx_norm = torch.clamp(new_vx_norm, -1.5, 1.5)
-    new_vy_norm = torch.clamp(new_vy_norm, -1.5, 1.5)
-    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)
-    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
-    
-    # Update velocity/acceleration features (only for nodes we have predictions for)
-    updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
-    updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
-    updated_graph.x[:num_nodes_to_update, 2] = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)  # normalized speed
-    updated_graph.x[:num_nodes_to_update, 3] = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # heading [-1, 1]
-    updated_graph.x[:num_nodes_to_update, 5] = ax_norm
-    updated_graph.x[:num_nodes_to_update, 6] = ay_norm
-    
-    # Update positions and position-dependent features
+    # Only update positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
         # pred_displacement is normalized, multiply by 100 to get actual displacement
         actual_displacement = pred_displacement * POSITION_SCALE
