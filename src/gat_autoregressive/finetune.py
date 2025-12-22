@@ -393,10 +393,9 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     agent_trajectories = {}
     
     with torch.no_grad():
-        # Warm up GRU
-        for t in range(start_t):
-            graph = batched_graph_sequence[t]
-            _ = model(graph.x, graph.edge_index, batch=graph.batch, batch_size=B, batch_num=0, timestep=t)
+        # REMOVED: Warm up GRU - this doesn't match training which uses cold-start
+        # The training loop resets GRU at each rollout start, so visualization should too.
+        # Previously: for t in range(start_t): model(...)
         
         start_graph = batched_graph_sequence[start_t]
         
@@ -546,6 +545,16 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 if len(pred_scenario_indices) > 0:
                     pred_disp_agent0 = pred_disp[pred_scenario_indices[0]]
                     print(f"  [DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}")
+                    
+                    # CRITICAL DEBUG: Compare with GT displacement at this step
+                    if target_graph.y is not None and first_agent_idx < target_graph.y.shape[0]:
+                        # For step 0, we're predicting from start_graph to target_graph
+                        # GT is in batched_graph_sequence[start_t].y (normalized displacement to next step)
+                        source_graph = batched_graph_sequence[start_t + step]
+                        if source_graph.y is not None and first_agent_idx < source_graph.y.shape[0]:
+                            gt_disp = source_graph.y[first_agent_idx].cpu().numpy() * POSITION_SCALE
+                            error = np.sqrt(((pred_disp_agent0 - gt_disp) ** 2).sum())
+                            print(f"  [DEBUG VIZ] Step {step}: Agent 0: gt_disp_m={gt_disp}, error={error:.2f}m")
             
             # Map predictions to persistent agents (only first scenario)
             for local_idx, agent_id in enumerate(current_agent_ids):
@@ -589,6 +598,25 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 errors_at_step.append(error)
         if errors_at_step:
             horizon_errors.append(np.mean(errors_at_step))
+    
+    # Print horizon error summary to help diagnose accumulation vs base model issues
+    if len(horizon_errors) >= 5:
+        print(f"  [VIZ SUMMARY] Horizon errors (accumulated position error):")
+        print(f"    Step 1 (0.1s): {horizon_errors[0]:.2f}m")
+        print(f"    Step 5 (0.5s): {horizon_errors[4]:.2f}m")
+        if len(horizon_errors) >= 10:
+            print(f"    Step 10 (1.0s): {horizon_errors[9]:.2f}m")
+        if len(horizon_errors) >= 30:
+            print(f"    Step 30 (3.0s): {horizon_errors[29]:.2f}m")
+        if len(horizon_errors) >= 50:
+            print(f"    Step 50 (5.0s): {horizon_errors[49]:.2f}m")
+        print(f"    Final ({len(horizon_errors)*0.1:.1f}s): {horizon_errors[-1]:.2f}m")
+        
+        # Calculate error growth rate to help diagnose
+        if horizon_errors[0] > 0:
+            growth_10 = horizon_errors[min(9, len(horizon_errors)-1)] / horizon_errors[0] if len(horizon_errors) > 9 else None
+            if growth_10:
+                print(f"    Error growth (step 1 → 10): {growth_10:.1f}x")
     
     # Select agents to visualize
     max_agents_viz = 10
