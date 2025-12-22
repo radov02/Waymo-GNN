@@ -1246,7 +1246,7 @@ def run_autoregressive_finetuning(
     print(f"Fine-tuning LR: {finetune_lr}")
     print(f"Epochs: {num_epochs}")
     print(f"Early stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
-    print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
+    print(f"Validation: Disabled (using training visualizations)")
     print(f"Mixed Precision (AMP): {'Enabled' if use_amp and torch.cuda.is_available() else 'Disabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
     print(f"Checkpoints: {CHECKPOINT_DIR_AUTOREG}")
@@ -1271,17 +1271,9 @@ def run_autoregressive_finetuning(
             sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch
         )
         
-        val_metrics = None
-        if val_loader is not None:
-            print(f"  Running validation (100% autoregressive)...")
-            val_metrics = evaluate_autoregressive(
-                model, val_loader, device, num_rollout_steps, is_parallel
-            )
-            scheduler.step(val_metrics['loss'])
-            val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
-            print(f"  Val Loss: {val_metrics['loss']:.4f} | Val per-step RMSE: {val_rmse_meters:.2f}m | Val Cos: {val_metrics['cosine_sim']:.4f}")
-        else:
-            scheduler.step(train_metrics['loss'])
+        # Skip validation - evaluate autoregressive performance via visualization on training data
+        # The per-step training metrics with teacher forcing don't reflect true autoregressive performance
+        scheduler.step(train_metrics['loss'])
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -1298,97 +1290,56 @@ def run_autoregressive_finetuning(
             "learning_rate": current_lr
         }
         
-        if val_metrics:
-            val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
-            log_dict.update({
-                "val_loss": val_metrics['loss'],
-                "val_mse": val_metrics['mse'],
-                "val_rmse_meters": val_rmse_meters,
-                "val_cosine_sim": val_metrics['cosine_sim']
-            })
-            for h in range(num_rollout_steps):
-                log_dict[f"val_mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
-                log_dict[f"val_cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
-        
         # Log epoch-level metrics explicitly with step=epoch for proper x-axis
         wandb.log(log_dict, step=epoch)
         
-        if val_metrics:
-            # Visualize 4 scenarios after every epoch (using validation data)
-            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
-                try:
-                    print(f"\n  Creating visualizations for epoch {epoch+1}...")
-                    # Create visualizations for up to 4 scenarios
-                    viz_count = 0
-                    for viz_batch in val_loader:
-                        if viz_count >= 4:
-                            break
-                        visualize_autoregressive_rollout(
-                            model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=VIZ_DIR
-                        )
-                        viz_count += 1
-                    print(f"  Created {viz_count} visualizations\n")
-                except Exception as e:
-                    import traceback
-                    print(f"  Warning: Visualization failed: {e}")
-                    traceback.print_exc()
-            
-            # Early stopping check
-            early_stopper(val_metrics['loss'])
-            
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
-                save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-                save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, save_filename)
-                model_to_save = get_model_for_saving(model, is_parallel)
-                checkpoint_data = {
-                    'epoch': epoch,
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'val_loss': val_metrics['loss'],
-                    'train_loss': train_metrics['loss'],
-                    'num_rollout_steps': num_rollout_steps,
-                    'sampling_strategy': sampling_strategy
-                }
-                # Preserve original config if it exists
-                if 'config' in checkpoint:
-                    checkpoint_data['config'] = checkpoint['config']
-                torch.save(checkpoint_data, save_path)
-                print(f"  → Saved best model (val_loss: {val_metrics['loss']:.4f})")
-            
-            # Check early stopping
-            if early_stopper.early_stop:
-                print(f"\n Early stopping triggered at epoch {epoch+1}!")
-                break
-        else:
-            print(f"  Train Loss: {train_metrics['loss']:.4f} | Train Cos: {train_metrics['cosine_sim']:.4f}")
-            
-            # Visualize even without validation - use training data (4 scenarios)
-            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
-                try:
-                    print(f"\n  Creating visualizations for epoch {epoch+1}...")
-                    viz_count = 0
-                    for viz_batch in train_loader:
-                        if viz_count >= 4:
-                            break
-                        visualize_autoregressive_rollout(
-                            model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=VIZ_DIR
-                        )
-                        viz_count += 1
-                    print(f"  Created {viz_count} visualizations\n")
-                except Exception as e:
-                    import traceback
-                    print(f"  Warning: Visualization failed: {e}")
-                    traceback.print_exc()
-            
-            # Early stopping on train loss if no validation
-            early_stopper(train_metrics['loss'])
-            if early_stopper.early_stop:
-                print(f"\n Early stopping triggered at epoch {epoch+1}!")
-                break
+        # Visualize using TRAINING data (more reliable than validation)
+        if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
+            try:
+                print(f"\n  Creating visualizations for epoch {epoch+1} (using training data)...")
+                # Create visualizations for up to 4 scenarios from training set
+                viz_count = 0
+                for viz_batch in train_loader:
+                    if viz_count >= 4:
+                        break
+                    visualize_autoregressive_rollout(
+                        model, viz_batch, epoch, num_rollout_steps, 
+                        device, is_parallel, save_dir=VIZ_DIR
+                    )
+                    viz_count += 1
+                print(f"  Created {viz_count} visualizations\n")
+            except Exception as e:
+                import traceback
+                print(f"  Warning: Visualization failed: {e}")
+                traceback.print_exc()
+        
+        # Early stopping based on training loss
+        early_stopper(train_metrics['loss'])
+        
+        if train_metrics['loss'] < best_val_loss:
+            best_val_loss = train_metrics['loss']
+            save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+            save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, save_filename)
+            model_to_save = get_model_for_saving(model, is_parallel)
+            checkpoint_data = {
+                'epoch': epoch,
+                'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss': train_metrics['loss'],
+                'num_rollout_steps': num_rollout_steps,
+                'sampling_strategy': sampling_strategy
+            }
+            # Preserve original config if it exists
+            if 'config' in checkpoint:
+                checkpoint_data['config'] = checkpoint['config']
+            torch.save(checkpoint_data, save_path)
+            print(f"  → Saved best model (train_loss: {train_metrics['loss']:.4f})")
+        
+        # Check early stopping
+        if early_stopper.early_stop:
+            print(f"\n Early stopping triggered at epoch {epoch+1}!")
+            break
     
     # Save final model
     final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
@@ -1412,8 +1363,7 @@ def run_autoregressive_finetuning(
     best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
     print(f"Best model: {os.path.join(CHECKPOINT_DIR_AUTOREG, best_filename)}")
     print(f"Final model: {final_path}")
-    if val_metrics:
-        print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Best training loss: {best_val_loss:.4f}")
     print(f"Early stopped: {early_stopper.early_stop}")
     print(f"{'='*80}\n")
     
