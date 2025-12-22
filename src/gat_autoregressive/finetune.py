@@ -147,18 +147,20 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     Node features expect normalized velocity (vx/30, vy/30) and acceleration (ax/10, ay/10).
     
     Updates:
-    - Position (graph.pos): updated with predicted displacement
-    - Velocity (features 0-1): derived directly from predicted displacement
-    - Speed (feature 2): magnitude of velocity
-    - Heading (feature 3): direction of movement
-    - Acceleration (features 5-6): change in velocity from previous step
+    - Position (graph.pos): updated with FULL predicted displacement
+    - Velocity (features 0-1): BLENDED between old and prediction-derived (0.7 factor)
+    - Speed (feature 2): magnitude of blended velocity
+    - Heading (feature 3): direction of blended velocity  
+    - Acceleration (features 5-6): change in blended velocity from previous step
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    IMPORTANT: Velocity features are derived directly from the predicted displacement
-    to maintain consistency between position and velocity. This prevents error accumulation
-    in autoregressive rollout.
+    VELOCITY BLENDING RATIONALE:
+    - Positions use 100% of predicted displacement (required for trajectory accuracy)
+    - Velocity features use 70% prediction + 30% old velocity for smoother transitions
+    - This helps the model handle its own prediction errors during autoregressive rollout
+    - Pure prediction-derived velocity can cause instability if predictions are noisy
     """
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
@@ -172,24 +174,26 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     # Convert normalized displacement to normalized velocity
     # The model predicts displacement, and we derive velocity from it.
     # velocity = displacement / dt, then normalize
-    # IMPORTANT: We must use the FULL prediction-derived velocity to keep features consistent
-    # with the position update. Blending causes velocity features to lag behind actual movement,
-    # leading to compounding errors in autoregressive rollout.
     velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
     
     pred_vx_norm = pred_displacement[:, 0] * velocity_scale
     pred_vy_norm = pred_displacement[:, 1] * velocity_scale
     
-    # Get old velocity for acceleration calculation
+    # Get old velocity for acceleration calculation and blending
     old_vx_norm = updated_graph.x[:, 0].clone()
     old_vy_norm = updated_graph.x[:, 1].clone()
     
-    # Use prediction-derived velocity directly (no blending)
-    # This keeps velocity features consistent with the position update
-    new_vx_norm = pred_vx_norm
-    new_vy_norm = pred_vy_norm
+    # VELOCITY BLENDING: Use moderate blend (0.7) between prediction-derived and old velocity
+    # - 1.0 = fully use prediction-derived (can cause instability if predictions have errors)
+    # - 0.0 = keep old velocity (ignores predictions, causes drift)
+    # - 0.7 = primarily use predictions but with some smoothing for stability
+    # This helps the model see more realistic velocity transitions during autoregressive rollout
+    VELOCITY_BLEND_FACTOR = 0.7
+    new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
+    new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
     
     # Calculate normalized acceleration (change from old to new velocity)
+    # Using the BLENDED velocities ensures acceleration is also smoothed
     accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
@@ -345,9 +349,22 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     for t in range(T):
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
     
-    # Reset GRU
-    num_nodes = batched_graph_sequence[0].num_nodes
-    base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+    # Reset GRU with proper batch info
+    # CRITICAL: Must compute agents_per_scenario from batch tensor to match forward pass sizing
+    first_graph = batched_graph_sequence[0]
+    if hasattr(first_graph, 'batch') and first_graph.batch is not None:
+        # Count agents per scenario in the batch
+        batch_counts = torch.bincount(first_graph.batch, minlength=B)
+        agents_per_scenario = batch_counts.tolist()
+        base_model.reset_gru_hidden_states(
+            batch_size=B, 
+            agents_per_scenario=agents_per_scenario, 
+            device=device
+        )
+    else:
+        # Single scenario fallback
+        num_nodes = first_graph.num_nodes
+        base_model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
     
     start_t = T // 3
     actual_rollout_steps = min(num_rollout_steps, T - start_t - 1)
