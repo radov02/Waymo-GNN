@@ -886,9 +886,32 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     # Apply alignment if needed
                     if pred_indices is not None:
+                        # Additional validation: check pred size matches expectations
+                        if pred_indices.max() >= pred.shape[0]:
+                            # Prediction tensor is smaller than expected - skip this step
+                            graph_for_prediction = target_graph
+                            is_using_predicted_positions = False
+                            continue
+                        
+                        # Validate target tensor sizes before indexing
+                        if is_using_predicted_positions:
+                            if (not hasattr(target_graph, 'pos') or target_graph.pos is None or
+                                target_indices.max() >= target_graph.pos.shape[0] or
+                                not hasattr(graph_for_prediction, 'pos') or graph_for_prediction.pos is None or
+                                pred_indices.max() >= graph_for_prediction.pos.shape[0]):
+                                # Position tensors invalid - fall back to GT displacement
+                                is_using_predicted_positions = False
+                        
+                        if not is_using_predicted_positions:
+                            # Validate target_graph.y exists and has correct size
+                            if target_graph.y is None or target_indices.max() >= target_graph.y.shape[0]:
+                                # Target invalid - skip this step
+                                graph_for_prediction = target_graph
+                                continue
+                        
                         pred_aligned = pred[pred_indices]
                         
-                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                        if is_using_predicted_positions:
                             gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
                             current_pred_pos = graph_for_prediction.pos[pred_indices].to(pred.dtype)
                             target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
