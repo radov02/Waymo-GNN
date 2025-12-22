@@ -144,23 +144,22 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     Update node features based on predicted displacement for next autoregressive step.
     
     The model predicts normalized displacement (dx/100, dy/100).
-    Node features expect normalized velocity (vx/30, vy/30) and acceleration (ax/10, ay/10).
     
     Updates:
-    - Position (graph.pos): updated with FULL predicted displacement
-    - Velocity (features 0-1): BLENDED between old and prediction-derived (0.7 factor)
-    - Speed (feature 2): magnitude of blended velocity
-    - Heading (feature 3): direction of blended velocity  
-    - Acceleration (features 5-6): change in blended velocity from previous step
+    - Position (graph.pos): updated with FULL predicted displacement (* 100)
+    - Velocity (features 0-1): derived from prediction using simple formula (pred/dt)
+    - Speed (feature 2): magnitude of velocity
+    - Heading (feature 3): direction of velocity  
+    - Acceleration (features 5-6): change in velocity from previous step
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    VELOCITY BLENDING RATIONALE:
-    - Positions use 100% of predicted displacement (required for trajectory accuracy)
-    - Velocity features use 70% prediction + 30% old velocity for smoother transitions
-    - This helps the model handle its own prediction errors during autoregressive rollout
-    - Pure prediction-derived velocity can cause instability if predictions are noisy
+    VELOCITY UPDATE RATIONALE:
+    - Uses simple formula: new_vx = pred / dt (matches testing_gat.py)
+    - This dampens velocity features compared to "mathematically correct" scaling
+    - Prevents positive feedback loop where prediction errors amplify exponentially
+    - The model is robust to this dampening as shown by testing_gat.py results
     """
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
@@ -185,42 +184,34 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
-    # Convert normalized displacement to normalized velocity
-    # The model predicts displacement, and we derive velocity from it.
-    # velocity = displacement / dt, then normalize
-    velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
+    # ============== SIMPLIFIED VELOCITY UPDATE ==============
+    # Use the same approach as testing_gat.py which has been proven to work.
+    # The key insight is that the "mathematically correct" velocity scale (33.33x)
+    # creates a positive feedback loop where prediction errors amplify exponentially.
+    # 
+    # The testing code uses: new_vx = pred_displacement / dt
+    # This gives smaller values that don't cause runaway amplification.
+    # For example, pred=0.01 -> new_vx = 0.1 (vs 0.333 with correct scaling)
+    # 
+    # This "dampening" prevents the feedback loop and allows stable autoregressive rollout.
+    # ========================================================
     
-    pred_vx_norm = pred_displacement[:, 0] * velocity_scale
-    pred_vy_norm = pred_displacement[:, 1] * velocity_scale
+    # Simple velocity update (matches testing_gat.py approach)
+    new_vx_norm = pred_displacement[:, 0] / dt  # pred/0.1 = pred*10
+    new_vy_norm = pred_displacement[:, 1] / dt
     
-    # Get old velocity for acceleration calculation and blending (only for nodes we'll update)
+    # Get old velocity for acceleration calculation
     old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
     old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
     
-    # VELOCITY BLENDING: Use MINIMAL blend to prevent error amplification
-    # - 1.0 = fully use prediction-derived (causes severe instability)
-    # - 0.0 = keep old velocity (most stable but ignores predictions)
-    # - 0.3 = mostly keep old velocity with small update from predictions
-    # REDUCED from 0.7 to 0.3 to prevent error amplification
-    # The position is still updated with FULL prediction, so trajectories diverge anyway
-    VELOCITY_BLEND_FACTOR = 0.3
-    new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
-    new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
+    # Calculate acceleration (change in velocity features)
+    ax_norm = (new_vx_norm - old_vx_norm) / dt / MAX_ACCEL  # normalize by MAX_ACCEL=10
+    ay_norm = (new_vy_norm - old_vy_norm) / dt / MAX_ACCEL
     
-    # Calculate normalized acceleration (change from old to new velocity)
-    # Using the BLENDED velocities ensures acceleration is also smoothed
-    accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
-    ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
-    ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-    
-    # Clamp to reasonable ranges - TIGHTER clamping to prevent extreme values
-    # MAX_SPEED=30 m/s, so:
-    # - normalized 1.5 = 45 m/s (162 km/h) - max for highway
-    # - normalized 2.0 = 60 m/s (216 km/h) - absolute max
-    # Reduced from 3.0 to 1.5 to prevent runaway predictions
+    # Clamp to reasonable ranges
     new_vx_norm = torch.clamp(new_vx_norm, -1.5, 1.5)
     new_vy_norm = torch.clamp(new_vy_norm, -1.5, 1.5)
-    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
+    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)
     ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
     
     # Update velocity/acceleration features (only for nodes we have predictions for)
