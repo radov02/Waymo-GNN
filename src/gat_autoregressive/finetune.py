@@ -165,6 +165,19 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
     
+    # CRITICAL: Handle size mismatch between prediction and graph
+    # This can happen when agents enter/leave between timesteps
+    num_nodes_graph = updated_graph.x.shape[0]
+    num_nodes_pred = pred_displacement.shape[0]
+    
+    if num_nodes_pred != num_nodes_graph:
+        # Size mismatch - only update the overlapping nodes
+        num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
+        pred_displacement = pred_displacement[:num_nodes_to_update]
+        # We'll only update the first num_nodes_to_update nodes
+    else:
+        num_nodes_to_update = num_nodes_graph
+    
     # Normalization constants (must match graph_creation_functions.py)
     POSITION_SCALE = 100.0  # displacement normalization
     MAX_SPEED = 30.0  # velocity normalization
@@ -179,9 +192,9 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_vx_norm = pred_displacement[:, 0] * velocity_scale
     pred_vy_norm = pred_displacement[:, 1] * velocity_scale
     
-    # Get old velocity for acceleration calculation and blending
-    old_vx_norm = updated_graph.x[:, 0].clone()
-    old_vy_norm = updated_graph.x[:, 1].clone()
+    # Get old velocity for acceleration calculation and blending (only for nodes we'll update)
+    old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
+    old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
     
     # VELOCITY BLENDING: Use moderate blend (0.7) between prediction-derived and old velocity
     # - 1.0 = fully use prediction-derived (can cause instability if predictions have errors)
@@ -205,19 +218,19 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     ax_norm = torch.clamp(ax_norm, -3.0, 3.0)
     ay_norm = torch.clamp(ay_norm, -3.0, 3.0)
     
-    # Update velocity/acceleration features
-    updated_graph.x[:, 0] = new_vx_norm
-    updated_graph.x[:, 1] = new_vy_norm
-    updated_graph.x[:, 2] = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)  # normalized speed
-    updated_graph.x[:, 3] = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # heading [-1, 1]
-    updated_graph.x[:, 5] = ax_norm
-    updated_graph.x[:, 6] = ay_norm
+    # Update velocity/acceleration features (only for nodes we have predictions for)
+    updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
+    updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
+    updated_graph.x[:num_nodes_to_update, 2] = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)  # normalized speed
+    updated_graph.x[:num_nodes_to_update, 3] = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # heading [-1, 1]
+    updated_graph.x[:num_nodes_to_update, 5] = ax_norm
+    updated_graph.x[:num_nodes_to_update, 6] = ay_norm
     
     # Update positions and position-dependent features
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
         # pred_displacement is normalized, multiply by 100 to get actual displacement
         actual_displacement = pred_displacement * POSITION_SCALE
-        updated_graph.pos = updated_graph.pos + actual_displacement
+        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
         
         # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
         if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
