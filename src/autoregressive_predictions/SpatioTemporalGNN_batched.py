@@ -116,8 +116,20 @@ class SpatioTemporalGNNBatched(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def reset_gru_hidden_states(self, num_agents=None, device=None):
-        """Reset GRU hidden states for new scenario(s)."""
+    def reset_gru_hidden_states(self, num_agents=None, device=None, 
+                                batch_size=None, agents_per_scenario=None):
+        """Reset GRU hidden states for new scenario(s).
+        
+        Supports two calling conventions:
+        1. Simple: reset_gru_hidden_states(num_agents=N) - treats as single flat tensor
+        2. Batched: reset_gru_hidden_states(batch_size=B, agents_per_scenario=[n1,...])
+        
+        The GCN model doesn't use to_dense_batch, so it just needs total node count.
+        """
+        # Handle batched call - just compute total nodes
+        if batch_size is not None and agents_per_scenario is not None:
+            num_agents = sum(agents_per_scenario)
+        
         if num_agents is None:
             self.gru_hidden = None
         else:

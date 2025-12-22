@@ -967,13 +967,44 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 if source_graph.y is None:
                     break
                 
-                # Check if node counts match - skip if they don't
-                # (agents can appear/disappear between timesteps)
-                if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
-                    # Node count changed - switch to teacher forcing for this step
-                    graph_for_prediction = target_graph
-                    is_using_predicted_positions = False
-                    continue
+                # ========== CRITICAL: AGENT ALIGNMENT ==========
+                # The graphs at different timesteps may have different agents (some enter/leave).
+                # We need to compute loss only for agents that exist in BOTH graphs,
+                # and align predictions with targets by agent ID, not by node index.
+                
+                pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
+                target_agent_ids = getattr(target_graph, 'agent_ids', None)
+                source_agent_ids = getattr(source_graph, 'agent_ids', None)
+                
+                # If agent IDs are available, use them for proper alignment
+                if pred_agent_ids is not None and target_agent_ids is not None and source_agent_ids is not None:
+                    pred_id_to_idx = {aid: idx for idx, aid in enumerate(pred_agent_ids)}
+                    target_id_to_idx = {aid: idx for idx, aid in enumerate(target_agent_ids)}
+                    source_id_to_idx = {aid: idx for idx, aid in enumerate(source_agent_ids)}
+                    
+                    # Find common agents across all three
+                    common_ids = set(pred_agent_ids) & set(target_agent_ids) & set(source_agent_ids)
+                    
+                    if len(common_ids) < 2:
+                        graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
+                        continue
+                    
+                    pred_indices = torch.tensor([pred_id_to_idx[aid] for aid in common_ids], 
+                                                device=device, dtype=torch.long)
+                    target_indices = torch.tensor([target_id_to_idx[aid] for aid in common_ids], 
+                                                  device=device, dtype=torch.long)
+                    source_indices = torch.tensor([source_id_to_idx[aid] for aid in common_ids], 
+                                                  device=device, dtype=torch.long)
+                else:
+                    # No agent IDs - fall back to node count check
+                    if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
+                        graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
+                        continue
+                    pred_indices = None
+                    target_indices = None
+                    source_indices = None
                 
                 # Forward pass with optional AMP
                 with torch.amp.autocast('cuda', enabled=use_amp_local):
@@ -988,31 +1019,36 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         timestep=t + step
                     )
                     
-                    # Compute correct target for autoregressive training
-                    # source_graph.y contains displacement from GT position[source_t] to GT position[target_t]
-                    # If using predicted positions, we need displacement from pred_pos to GT position[target_t]
-                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                        # Check if position sizes match (agents may have appeared/disappeared)
-                        if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
-                            # Target = (GT next position - current predicted position) / POSITION_SCALE
-                            gt_next_pos = target_graph.pos  # GT position at target_t
-                            current_pred_pos = graph_for_prediction.pos  # Current predicted position
+                    # Apply alignment if needed
+                    if pred_indices is not None:
+                        pred_aligned = pred[pred_indices]
+                        
+                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                            gt_next_pos = target_graph.pos[target_indices]
+                            current_pred_pos = graph_for_prediction.pos[pred_indices]
                             target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
                             target = target.to(pred.dtype)
                         else:
-                            # Size mismatch - fall back to GT displacement
-                            target = source_graph.y.to(pred.dtype)
-                            is_using_predicted_positions = False  # Reset flag
+                            target = source_graph.y[source_indices].to(pred.dtype)
                     else:
-                        # Using GT positions - use displacement stored in source_graph.y
-                        # This is displacement from GT pos[source_t] to GT pos[target_t]
-                        target = source_graph.y.to(pred.dtype)
+                        pred_aligned = pred
+                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                            if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
+                                gt_next_pos = target_graph.pos
+                                current_pred_pos = graph_for_prediction.pos
+                                target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                                target = target.to(pred.dtype)
+                            else:
+                                target = source_graph.y.to(pred.dtype)
+                                is_using_predicted_positions = False
+                        else:
+                            target = source_graph.y.to(pred.dtype)
                     
                     # MSE loss
-                    mse_loss = F.mse_loss(pred, target)
+                    mse_loss = F.mse_loss(pred_aligned, target)
                     
                     # Directional loss (cosine similarity)
-                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                    pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                     cosine_loss = (1 - cos_sim).mean()

@@ -792,10 +792,43 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 if target_graph.y is None:
                     break
                 
-                if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
-                    graph_for_prediction = target_graph
-                    is_using_predicted_positions = False
-                    continue
+                # ========== CRITICAL: AGENT ALIGNMENT ==========
+                # The graphs at different timesteps may have different agents (some enter/leave).
+                # We need to compute loss only for agents that exist in BOTH graphs,
+                # and align predictions with targets by agent ID, not by node index.
+                
+                # Get agent IDs from both graphs
+                pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
+                target_agent_ids = getattr(target_graph, 'agent_ids', None)
+                
+                # If agent IDs are available, use them for proper alignment
+                if pred_agent_ids is not None and target_agent_ids is not None:
+                    # Build mapping: pred_idx -> target_idx for matching agents
+                    pred_id_to_idx = {aid: idx for idx, aid in enumerate(pred_agent_ids)}
+                    target_id_to_idx = {aid: idx for idx, aid in enumerate(target_agent_ids)}
+                    
+                    # Find common agents
+                    common_ids = set(pred_agent_ids) & set(target_agent_ids)
+                    
+                    if len(common_ids) < 2:
+                        # Too few common agents, skip this step
+                        graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
+                        continue
+                    
+                    # Get aligned indices
+                    pred_indices = torch.tensor([pred_id_to_idx[aid] for aid in common_ids], 
+                                                device=device, dtype=torch.long)
+                    target_indices = torch.tensor([target_id_to_idx[aid] for aid in common_ids], 
+                                                  device=device, dtype=torch.long)
+                else:
+                    # No agent IDs - fall back to assuming same ordering (may be wrong!)
+                    if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
+                        graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
+                        continue
+                    pred_indices = None
+                    target_indices = None
                 
                 # GAT forward pass with optional AMP - no edge weights
                 with torch.amp.autocast('cuda', enabled=use_amp_local):
@@ -808,18 +841,27 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         timestep=t + step
                     )
                     
-                    # CRITICAL: Compute correct target based on current position
-                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        # When using predicted positions, target is displacement from current predicted pos to GT next pos
-                        gt_next_pos = target_graph.pos.to(pred.dtype)
-                        current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
-                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                    # Apply alignment if needed
+                    if pred_indices is not None:
+                        pred_aligned = pred[pred_indices]
+                        
+                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                            gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
+                            current_pred_pos = graph_for_prediction.pos[pred_indices].to(pred.dtype)
+                            target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                        else:
+                            target = target_graph.y[target_indices].to(pred.dtype)
                     else:
-                        # When using GT positions (teacher forcing), use the pre-computed GT displacement
-                        target = target_graph.y.to(pred.dtype)
+                        pred_aligned = pred
+                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                            gt_next_pos = target_graph.pos.to(pred.dtype)
+                            current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
+                            target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                        else:
+                            target = target_graph.y.to(pred.dtype)
                     
-                    mse_loss = F.mse_loss(pred, target)
-                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                    mse_loss = F.mse_loss(pred_aligned, target)
+                    pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                     cosine_loss = (1 - cos_sim).mean()

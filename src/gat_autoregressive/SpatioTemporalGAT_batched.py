@@ -104,6 +104,7 @@ class SpatioTemporalGATBatched(nn.Module):
         self.gru_hidden = None
         self.current_batch_size = 0
         self.current_agents_per_scenario = None  # Track actual agent counts
+        self.current_max_agents = None  # Track max agents for consistent dense batching
         
         self._init_weights()
     
@@ -153,6 +154,7 @@ class SpatioTemporalGATBatched(nn.Module):
         self.current_batch_size = batch_size
         self.current_agents_per_scenario = agents_per_scenario
         max_agents = max(agents_per_scenario)
+        self.current_max_agents = max_agents  # Store for forward pass to use
         
         # Hidden state: [num_layers, B * max_agents, hidden_dim]
         # We use max_agents padding so all scenarios have same shape
@@ -227,19 +229,26 @@ class SpatioTemporalGATBatched(nn.Module):
         spatial_features = self.spatial_encoding(x, edge_index)
         
         # 2. Convert to dense batch for GRU: [B, max_nodes, hidden_dim]
+        # CRITICAL: Use self.current_max_agents if available to ensure consistent sizing
+        # with the GRU hidden state initialized in reset_gru_hidden_states.
+        # If not available, compute dynamically (but this may cause hidden state resets)
+        use_max_nodes = self.current_max_agents if self.current_max_agents is not None else None
+        
         # to_dense_batch pads scenarios with fewer nodes
-        # Use None for max_num_nodes to dynamically use the actual max from this batch
-        # This prevents node truncation when scenarios have more agents than expected
-        dense_spatial, mask = to_dense_batch(spatial_features, batch, max_num_nodes=None)
+        dense_spatial, mask = to_dense_batch(spatial_features, batch, max_num_nodes=use_max_nodes)
         # dense_spatial: [B, max_nodes, hidden_dim]
         # mask: [B, max_nodes] - True for real nodes, False for padding
         
         B, max_nodes, hidden_dim = dense_spatial.shape
         
         # 3. Initialize or resize GRU hidden state if needed
+        # This should only trigger if reset_gru_hidden_states wasn't called properly
         if (self.gru_hidden is None or 
             self.gru_hidden.size(1) != B * max_nodes or
             self.gru_hidden.device != device):
+            # Log warning when this happens unexpectedly (indicates potential bug)
+            if self.gru_hidden is not None and self.gru_hidden.size(1) != B * max_nodes:
+                print(f"  [WARNING] GRU hidden state size mismatch: expected {B * max_nodes}, got {self.gru_hidden.size(1)}. Resetting.")
             self.gru_hidden = torch.zeros(
                 self.num_gru_layers,
                 B * max_nodes,
@@ -263,8 +272,8 @@ class SpatioTemporalGATBatched(nn.Module):
         temporal_features = temporal_features_dense[mask]  # [total_nodes, hidden_dim]
         
         # 8. Also need original x in dense format for skip connection
-        # Use same max_num_nodes=None to match the mask from step 2
-        dense_x, _ = to_dense_batch(x, batch, max_num_nodes=None)
+        # Use same max_num_nodes to match the mask from step 2
+        dense_x, _ = to_dense_batch(x, batch, max_num_nodes=use_max_nodes)
         x_sparse = dense_x[mask]  # Should equal original x
         
         # 9. Skip connection: concatenate temporal features with original node features
