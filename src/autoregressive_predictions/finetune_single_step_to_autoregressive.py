@@ -983,11 +983,29 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 target_batch = getattr(target_graph, 'batch', None)
                 source_batch = getattr(source_graph, 'batch', None)
                 
-                # If agent IDs and batch info are available, use them for proper alignment
-                if (pred_agent_ids is not None and target_agent_ids is not None and 
-                    source_agent_ids is not None and pred_batch is not None and 
-                    target_batch is not None and source_batch is not None):
-                    
+                # Validate that agent_ids and batch tensors have matching lengths
+                pred_num_nodes = graph_for_prediction.x.shape[0]
+                target_num_nodes = target_graph.x.shape[0]
+                source_num_nodes = source_graph.x.shape[0]
+                
+                # Check for length mismatches - if any, fall back to simple comparison
+                agent_ids_valid = (
+                    pred_agent_ids is not None and 
+                    target_agent_ids is not None and
+                    source_agent_ids is not None and
+                    pred_batch is not None and 
+                    target_batch is not None and
+                    source_batch is not None and
+                    len(pred_agent_ids) == pred_num_nodes and
+                    len(target_agent_ids) == target_num_nodes and
+                    len(source_agent_ids) == source_num_nodes and
+                    pred_batch.shape[0] == pred_num_nodes and
+                    target_batch.shape[0] == target_num_nodes and
+                    source_batch.shape[0] == source_num_nodes
+                )
+                
+                # If agent IDs and batch info are available and valid, use them for proper alignment
+                if agent_ids_valid:
                     # Create globally unique IDs by combining (batch_idx, agent_id)
                     pred_batch_np = pred_batch.cpu().numpy()
                     target_batch_np = target_batch.cpu().numpy()
@@ -995,16 +1013,22 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     # Build mapping: (batch_idx, agent_id) -> node_index
                     pred_id_to_idx = {}
-                    for idx, (bid, aid) in enumerate(zip(pred_batch_np, pred_agent_ids)):
-                        pred_id_to_idx[(int(bid), aid)] = idx
+                    for idx in range(pred_num_nodes):
+                        bid = int(pred_batch_np[idx])
+                        aid = pred_agent_ids[idx]
+                        pred_id_to_idx[(bid, aid)] = idx
                     
                     target_id_to_idx = {}
-                    for idx, (bid, aid) in enumerate(zip(target_batch_np, target_agent_ids)):
-                        target_id_to_idx[(int(bid), aid)] = idx
+                    for idx in range(target_num_nodes):
+                        bid = int(target_batch_np[idx])
+                        aid = target_agent_ids[idx]
+                        target_id_to_idx[(bid, aid)] = idx
                     
                     source_id_to_idx = {}
-                    for idx, (bid, aid) in enumerate(zip(source_batch_np, source_agent_ids)):
-                        source_id_to_idx[(int(bid), aid)] = idx
+                    for idx in range(source_num_nodes):
+                        bid = int(source_batch_np[idx])
+                        aid = source_agent_ids[idx]
+                        source_id_to_idx[(bid, aid)] = idx
                     
                     # Find common agents across all three (same batch AND same agent ID)
                     common_ids = set(pred_id_to_idx.keys()) & set(target_id_to_idx.keys()) & set(source_id_to_idx.keys())
@@ -1022,9 +1046,18 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                                                   device=device, dtype=torch.long)
                     source_indices = torch.tensor([source_id_to_idx[gid] for gid in common_ids_list], 
                                                   device=device, dtype=torch.long)
+                    
+                    # Validate indices are in bounds
+                    if (pred_indices.max() >= pred_num_nodes or 
+                        target_indices.max() >= target_num_nodes or
+                        source_indices.max() >= source_num_nodes):
+                        # Index out of bounds - fall back to skipping
+                        graph_for_prediction = target_graph
+                        is_using_predicted_positions = False
+                        continue
                 else:
-                    # No agent IDs or batch info - fall back to node count check
-                    if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
+                    # No valid agent IDs or batch info - fall back to node count check
+                    if pred_num_nodes != source_num_nodes:
                         graph_for_prediction = target_graph
                         is_using_predicted_positions = False
                         continue
