@@ -796,19 +796,36 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # The graphs at different timesteps may have different agents (some enter/leave).
                 # We need to compute loss only for agents that exist in BOTH graphs,
                 # and align predictions with targets by agent ID, not by node index.
+                #
+                # IMPORTANT: Agent IDs are NOT globally unique across scenarios in a batch!
+                # Two different scenarios can have agents with the same ID.
+                # We must combine agent_id with batch_id to create globally unique identifiers.
                 
-                # Get agent IDs from both graphs
+                # Get agent IDs and batch assignments from both graphs
                 pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
                 target_agent_ids = getattr(target_graph, 'agent_ids', None)
+                pred_batch = getattr(graph_for_prediction, 'batch', None)
+                target_batch = getattr(target_graph, 'batch', None)
                 
-                # If agent IDs are available, use them for proper alignment
-                if pred_agent_ids is not None and target_agent_ids is not None:
-                    # Build mapping: pred_idx -> target_idx for matching agents
-                    pred_id_to_idx = {aid: idx for idx, aid in enumerate(pred_agent_ids)}
-                    target_id_to_idx = {aid: idx for idx, aid in enumerate(target_agent_ids)}
+                # If agent IDs and batch info are available, use them for proper alignment
+                if (pred_agent_ids is not None and target_agent_ids is not None and 
+                    pred_batch is not None and target_batch is not None):
                     
-                    # Find common agents
-                    common_ids = set(pred_agent_ids) & set(target_agent_ids)
+                    # Create globally unique IDs by combining (batch_idx, agent_id)
+                    pred_batch_np = pred_batch.cpu().numpy()
+                    target_batch_np = target_batch.cpu().numpy()
+                    
+                    # Build mapping: (batch_idx, agent_id) -> node_index
+                    pred_id_to_idx = {}
+                    for idx, (bid, aid) in enumerate(zip(pred_batch_np, pred_agent_ids)):
+                        pred_id_to_idx[(int(bid), aid)] = idx
+                    
+                    target_id_to_idx = {}
+                    for idx, (bid, aid) in enumerate(zip(target_batch_np, target_agent_ids)):
+                        target_id_to_idx[(int(bid), aid)] = idx
+                    
+                    # Find common agents (same batch AND same agent ID)
+                    common_ids = set(pred_id_to_idx.keys()) & set(target_id_to_idx.keys())
                     
                     if len(common_ids) < 2:
                         # Too few common agents, skip this step
@@ -816,13 +833,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         is_using_predicted_positions = False
                         continue
                     
-                    # Get aligned indices
-                    pred_indices = torch.tensor([pred_id_to_idx[aid] for aid in common_ids], 
+                    # Get aligned indices - convert common_ids to list for deterministic ordering
+                    common_ids_list = sorted(common_ids)  # Sort for deterministic behavior
+                    pred_indices = torch.tensor([pred_id_to_idx[gid] for gid in common_ids_list], 
                                                 device=device, dtype=torch.long)
-                    target_indices = torch.tensor([target_id_to_idx[aid] for aid in common_ids], 
+                    target_indices = torch.tensor([target_id_to_idx[gid] for gid in common_ids_list], 
                                                   device=device, dtype=torch.long)
                 else:
-                    # No agent IDs - fall back to assuming same ordering (may be wrong!)
+                    # No agent IDs or batch info - fall back to assuming same ordering (may be wrong!)
                     if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
                         graph_for_prediction = target_graph
                         is_using_predicted_positions = False
