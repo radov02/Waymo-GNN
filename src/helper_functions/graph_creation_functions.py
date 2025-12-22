@@ -592,11 +592,10 @@ def save_scenarios_to_hdf5_streaming(files, h5_path, compression="lzf", max_num_
                     # Save scenario_id as string (no compression for scalar strings)
                     if scenario_id is not None:
                         snapshot_group.create_dataset("scenario_id", data=np.bytes_(scenario_id))
-                    
-                    # Save SDC track ID for GRIP preprocessing optimization
-                    if timestep == 0:  # Only save once per scenario, not per timestep
-                        sdc_track_id = scenario.tracks[scenario.sdc_track_index].id
-                        snapshot_group.create_dataset("sdc_track_id", data=np.int64(sdc_track_id))
+                
+                # Save SDC track ID at scenario level for GRIP preprocessing optimization
+                sdc_track_id = scenario.tracks[scenario.sdc_track_index].id
+                scenario_group.create_dataset("sdc_track_id", data=np.int64(sdc_track_id))
                 
                 total_scenarios += 1
             end = time.perf_counter()
