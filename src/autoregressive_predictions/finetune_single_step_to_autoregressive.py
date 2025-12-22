@@ -57,6 +57,9 @@ import random
 # Slightly slower but more accurate for long rollouts where agents move significantly.
 AUTOREG_REBUILD_EDGES = True  # Set to False to keep original edge topology (faster but less accurate)
 
+# Warning suppression - only print size mismatch warning once per epoch
+_size_mismatch_warned = False
+
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/autoregressive_predictions/finetune_single_step_to_autoregressive.py
 
 
@@ -662,7 +665,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     except:
         pass
     
-    print(f"  → Saved visualization to {filepath}")
+    print(f"  -> Saved visualization to {filepath}")
     return filepath
 
 
@@ -1159,9 +1162,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     use_prediction = np.random.random() < sampling_prob
                     
                     if use_prediction:
-                        # Use model's own prediction (autoregressive)
+                        # BPTT: Don't detach predictions to allow gradient flow through time
+                        # This lets the model learn to correct its own errors across multiple steps
+                        # Memory usage increases but learning is much faster
                         graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred.detach(), device
+                            graph_for_prediction, pred, device  # No .detach() - enables BPTT
                         )
                         is_using_predicted_positions = True
                     else:
@@ -1197,20 +1202,17 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             avg_mse_so_far = total_mse / max(1, count)
             avg_cos_so_far = total_cosine / max(1, count)
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
-            print(f"  Batch {batch_idx}: Loss={loss_val/max(1,valid_steps):.4f}, "
-                  f"Sampling prob={sampling_prob:.2f}")
-            print(f"    [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
+            print(f"  Loss={loss_val/max(1,valid_steps):.4f}, Sampling prob={sampling_prob:.2f}")
+            print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             
-            # Log per-step metrics to wandb
+            # Log per-step metrics to wandb (no explicit step - let wandb auto-increment)
             wandb.log({
-                "batch": steps,
-                "train/batch_epoch": epoch + 1,  # Which epoch this batch is from
                 "train/batch_loss": loss_val / max(1, valid_steps),
                 "train/batch_mse": avg_mse_so_far,
                 "train/batch_rmse_meters": rmse_meters,
                 "train/batch_cosine_sim": avg_cos_so_far,
                 "train/batch_sampling_prob": sampling_prob,
-            })
+            }, commit=True)
     
     # Print epoch summary
     final_mse = total_mse / max(1, count)
@@ -1480,31 +1482,9 @@ def run_autoregressive_finetuning(
     
     wandb.watch(model, log='all', log_freq=10)
     
-    # Define custom x-axes for wandb metrics
-    wandb.define_metric("epoch")
-    wandb.define_metric("batch")  # Global batch counter across all epochs
-    
-    # Epoch-based metrics (plotted vs epoch)
-    wandb.define_metric("train_loss", step_metric="epoch")
-    wandb.define_metric("train_mse", step_metric="epoch")
-    wandb.define_metric("train_rmse_meters", step_metric="epoch")
-    wandb.define_metric("train_cosine_sim", step_metric="epoch")
-    wandb.define_metric("val_loss", step_metric="epoch")
-    wandb.define_metric("val_mse", step_metric="epoch")
-    wandb.define_metric("val_rmse_meters", step_metric="epoch")
-    wandb.define_metric("val_cosine_sim", step_metric="epoch")
-    wandb.define_metric("learning_rate", step_metric="epoch")
-    wandb.define_metric("sampling_probability", step_metric="epoch")
-    wandb.define_metric("val_mse_horizon_*", step_metric="epoch")
-    wandb.define_metric("val_cosine_horizon_*", step_metric="epoch")
-    
-    # Batch-based metrics (plotted vs batch - fine-grained progress)
-    wandb.define_metric("train/batch_loss", step_metric="batch")
-    wandb.define_metric("train/batch_mse", step_metric="batch")
-    wandb.define_metric("train/batch_rmse_meters", step_metric="batch")
-    wandb.define_metric("train/batch_cosine_sim", step_metric="batch")
-    wandb.define_metric("train/batch_sampling_prob", step_metric="batch")
-    wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
+    # Use simple wandb logging - no custom step metrics to avoid step conflicts
+    # All metrics will be plotted against wandb's internal step counter
+    # Epoch is logged as a value, not as a step metric
     
     # Lower learning rate for fine-tuning
     finetune_lr = learning_rate * 0.1
@@ -1625,6 +1605,10 @@ def run_autoregressive_finetuning(
     last_val_batch = None
     
     for epoch in range(num_epochs):
+        # Reset warning flag at start of each epoch
+        global _size_mismatch_warned
+        _size_mismatch_warned = False
+        
         # Calculate scheduled sampling probability
         sampling_prob = scheduled_sampling_probability(epoch, num_epochs, sampling_strategy)
         
@@ -1655,11 +1639,13 @@ def run_autoregressive_finetuning(
         
         # Log to wandb
         log_dict = {
-            "epoch": epoch,
+            "epoch": epoch + 1,  # 1-indexed for readability
             "sampling_probability": sampling_prob,
             "train_loss": train_metrics['loss'],
+            "train_per_epoch_loss": train_metrics['loss'],  # Per-epoch loss for tracking
             "train_mse": train_metrics['mse'],
             "train_rmse_meters": train_rmse_meters,
+            "train_per_step_rmse": train_rmse_meters,  # Per-step RMSE for tracking
             "train_cosine_sim": train_metrics['cosine_sim'],
             "learning_rate": current_lr
         }
@@ -1677,8 +1663,8 @@ def run_autoregressive_finetuning(
                 log_dict[f"val_mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
                 log_dict[f"val_cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
         
-        # Log epoch-level metrics explicitly with step=epoch for proper x-axis
-        wandb.log(log_dict, step=epoch)
+        # Log epoch-level metrics (no explicit step to avoid conflicts with batch logging)
+        wandb.log(log_dict, commit=True)
         
         # Print summary
         if val_metrics:
@@ -1721,7 +1707,7 @@ def run_autoregressive_finetuning(
                 if 'config' in checkpoint:
                     checkpoint_data['config'] = checkpoint['config']
                 torch.save(checkpoint_data, save_path)
-                print(f"  → Saved best model (val_loss: {val_metrics['loss']:.4f})")
+                print(f"  -> Saved best model to {save_filename} (val_loss: {val_metrics['loss']:.4f})")
             
             # Early stopping check
             early_stopper(val_metrics['loss'])

@@ -514,12 +514,12 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             # DEBUG: Print prediction stats on first few steps
             if step < 5:
-                print(f"  [DEBUG VIZ] Step {step}: Raw pred (norm): min={pred.min().item():.4f}, max={pred.max().item():.4f}, mean={pred.mean().item():.4f}")
+                print(f"\t\t[DEBUG VIZ] Step {step}: Raw pred (norm): min={pred.min().item():.4f}, max={pred.max().item():.4f}, mean={pred.mean().item():.4f}")
                 # Print input features for scenario 0's first agent
                 if len(pred_scenario_indices) > 0:
                     first_agent_idx = pred_scenario_indices[0]
                     agent_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
-                    print(f"  [DEBUG VIZ] Step {step}: Agent 0 features: vx={agent_feats[0]:.3f}, vy={agent_feats[1]:.3f}, speed={agent_feats[2]:.3f}, heading={agent_feats[3]:.3f}")
+                    print(f"\t\t[DEBUG VIZ] Step {step}: Agent 0 features: vx={agent_feats[0]:.3f}, vy={agent_feats[1]:.3f}, speed={agent_feats[2]:.3f}, heading={agent_feats[3]:.3f}")
                     # Also print position for context
                     if hasattr(graph_for_prediction, 'pos'):
                         agent_pos = graph_for_prediction.pos[first_agent_idx].cpu().numpy()
@@ -527,7 +527,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 # Show what the model predicts for this agent
                 if len(pred_scenario_indices) > 0:
                     pred_disp_agent0 = pred_disp[pred_scenario_indices[0]]
-                    print(f"  [DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}")
+                    print(f"\t\t[DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}")
                     
                     # CRITICAL DEBUG: Compare with GT displacement at this step
                     if target_graph.y is not None and first_agent_idx < target_graph.y.shape[0]:
@@ -566,7 +566,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 first_agent_idx = pred_scenario_indices[0]
                 if first_agent_idx < graph_for_prediction.x.shape[0]:
                     updated_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
-                    print(f"  [DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed={updated_feats[2]:.3f}")
+                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed={updated_feats[2]:.3f}")
     
     # Calculate errors
     horizon_errors = []
@@ -739,7 +739,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     except:
         pass
     
-    print(f"  → Saved visualization to {filepath}")
+    print(f"  -> Saved visualization to {filepath}")
     return filepath
 
 
@@ -1028,9 +1028,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             avg_mse_so_far = total_mse / max(1, count)
             avg_cos_so_far = total_cosine / max(1, count)
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
-            print(f"  Batch {batch_idx}: Loss={loss_val/max(1,valid_steps):.4f}, "
-                  f"Sampling prob={sampling_prob:.2f}")
-            print(f"    [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
+            print(f"  Loss={loss_val/max(1,valid_steps):.4f}, Sampling prob={sampling_prob:.2f}")
+            print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             
             # Log per-step metrics to wandb (no explicit step - let wandb auto-increment)
             wandb.log({
@@ -1416,8 +1415,10 @@ def run_autoregressive_finetuning(
             "epoch": epoch + 1,  # 1-indexed for readability
             "sampling_probability": sampling_prob,
             "train_loss": train_metrics['loss'],
+            "train_per_epoch_loss": train_metrics['loss'],  # Per-epoch loss for tracking
             "train_mse": train_metrics['mse'],
             "train_rmse_meters": train_rmse_meters,
+            "train_per_step_rmse": train_rmse_meters,  # Per-step RMSE for tracking
             "train_cosine_sim": train_metrics['cosine_sim'],
             "learning_rate": current_lr
         }
@@ -1466,7 +1467,7 @@ def run_autoregressive_finetuning(
             if 'config' in checkpoint:
                 checkpoint_data['config'] = checkpoint['config']
             torch.save(checkpoint_data, save_path)
-            print(f"  → Saved best model (train_loss: {train_metrics['loss']:.4f})")
+            print(f"  -> Saved best model to {save_filename} (train_loss: {train_metrics['loss']:.4f})")
         
         # Check early stopping
         if early_stopper.early_stop:
