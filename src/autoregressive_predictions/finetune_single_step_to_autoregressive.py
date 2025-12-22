@@ -661,17 +661,18 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     Node features expect normalized velocity (vx/30, vy/30) and acceleration (ax/10, ay/10).
     
     Updates:
-    - Velocity (features 0-1): blended update from old velocity and prediction-derived velocity
-    - Speed (feature 2): magnitude of velocity, normalized
+    - Position (graph.pos): updated with predicted displacement
+    - Velocity (features 0-1): derived directly from predicted displacement
+    - Speed (feature 2): magnitude of velocity
     - Heading (feature 3): direction of movement
-    - Acceleration (features 5-6): change in velocity, normalized
-    - Position (graph.pos): updated for consistent state
-    - Relative position to SDC (features 7-8): updated
-    - Distance to SDC (feature 9): updated
+    - Acceleration (features 5-6): change in velocity from previous step
+    - Relative position to SDC (features 7-8): recalculated based on new positions
+    - Distance to SDC (feature 9): recalculated
+    - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    IMPORTANT: We use a blended velocity update to prevent feedback loop instability.
-    Instead of completely replacing velocity with prediction-derived values, we blend
-    the old velocity with the new to create smoother transitions.
+    IMPORTANT: Velocity features are derived directly from the predicted displacement
+    to maintain consistency between position and velocity. This prevents error accumulation
+    in autoregressive rollout.
     """
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
@@ -682,38 +683,41 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
-    # BLENDING FACTOR: How much to trust the prediction-derived velocity vs keep old velocity
-    # 0.0 = keep old velocity entirely, 1.0 = use prediction-derived velocity entirely
-    # Lower values = more stable but slower adaptation, higher = faster but riskier
-    VELOCITY_BLEND_FACTOR = 0.3  # Conservative: mostly keep old velocity
-    
+    # Convert normalized displacement to normalized velocity
+    # The model predicts displacement, and we derive velocity from it.
     # pred_displacement is normalized (actual_displacement / 100)
     # Convert to actual velocity: actual_disp = pred_disp * 100, velocity = actual_disp / dt
     # Then normalize velocity: vx_norm = velocity / MAX_SPEED
     # Combined: vx_norm = (pred_disp * 100 / 0.1) / 30 = pred_disp * 1000 / 30 = pred_disp * 33.33
+    #
+    # IMPORTANT: We must use the FULL prediction-derived velocity to keep features consistent
+    # with the position update. Blending causes velocity features to lag behind actual movement,
+    # leading to compounding errors in autoregressive rollout.
     velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
     
     pred_vx_norm = pred_displacement[:, 0] * velocity_scale
     pred_vy_norm = pred_displacement[:, 1] * velocity_scale
     
-    # Get old velocity
+    # Get old velocity for acceleration calculation
     old_vx_norm = updated_graph.x[:, 0].clone()
     old_vy_norm = updated_graph.x[:, 1].clone()
     
-    # Blend old and predicted velocities for stability
-    new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
-    new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
+    # Use prediction-derived velocity directly (no blending)
+    # This keeps velocity features consistent with the position update
+    new_vx_norm = pred_vx_norm
+    new_vy_norm = pred_vy_norm
     
-    # Calculate normalized acceleration (using blended velocities)
+    # Calculate normalized acceleration (change from old to new velocity)
     accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
     
-    # Clamp to reasonable ranges to prevent explosion
-    new_vx_norm = torch.clamp(new_vx_norm, -2.0, 2.0)
-    new_vy_norm = torch.clamp(new_vy_norm, -2.0, 2.0)
-    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)
-    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
+    # Clamp to reasonable ranges - increased to handle highway speeds
+    # MAX_SPEED=30 m/s, so normalized 3.0 = 90 m/s (324 km/h) - allows for fast vehicles
+    new_vx_norm = torch.clamp(new_vx_norm, -3.0, 3.0)
+    new_vy_norm = torch.clamp(new_vy_norm, -3.0, 3.0)
+    ax_norm = torch.clamp(ax_norm, -3.0, 3.0)
+    ay_norm = torch.clamp(ay_norm, -3.0, 3.0)
     
     # Update velocity/acceleration features
     updated_graph.x[:, 0] = new_vx_norm

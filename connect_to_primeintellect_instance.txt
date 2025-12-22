@@ -1,5 +1,5 @@
 
------- CONNECT TO PrimeIntellect Instance  (Nvidia RTX Pro 6000 96GB instance, running pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime) ---------
+------ CONNECT TO PrimeIntellect Instance (running pytorch/pytorch:2.4.0-cuda12.4.1-cudnn8-runtime, ex. Nvidia RTX Pro 6000 96GB instance) ---------
 - generate ssh certificate:
 	local> ssh-keygen -t ed25519 -f C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 -C "yourPublicKeyName"
 	- this will create C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 (private key file) and C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519.pub (public key file)
@@ -13,8 +13,6 @@ local> ssh root@IP -p THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed255
 > cd Waymo-GNN
 > apt-get update
 > apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https software-properties-common
-
------------------------- GRAPH CREATION ---------------------------
 > git pull
 > chmod +x setup_remote.sh
 > ./setup_remote.sh
@@ -27,7 +25,9 @@ local> ssh root@IP -p THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed255
 > apt-get install -y google-cloud-sdk
 > gcloud init
 > gcloud auth application-default login
-- make sure billing account is set for the downloader project on google cloud
+- make sure billing account is set for the downloader project on google cloud (check at your https://console.cloud.google.com/billing/projects)
+
+------------------------ GRAPH CREATION ---------------------------
 > python src/graph_creation_and_saving.py
 
 ------------------------ TRAINING ---------------------------
