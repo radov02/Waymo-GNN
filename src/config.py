@@ -240,14 +240,14 @@ gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualiza
 # - For 48GB GPU (RTX 6000): use 32-64 for high GPU utilization
 batch_size = 48  # Increased from 32 to maximize RTX 6000 48GB utilization
 learning_rate = 0.001
-epochs = 20
+epochs = 40
 gradient_clip_value = 1.0
 # Learning rate scheduler settings
 scheduler_patience = 5  # Wait 5 epochs before reducing LR
 scheduler_factor = 0.5  # Reduce LR by 50% when triggered
 min_lr = 1e-5  # Don't go below 0.00001 (previous min_lr=1e-7 was too small)
 # Early stopping settings
-early_stopping_patience = 15  # Stop if no improvement for N epochs
+early_stopping_patience = 20  # Stop if no improvement for N epochs
 early_stopping_min_delta = 0.001  # Minimum improvement to count as progress
 # Loss weights: Balance direction and magnitude for accurate trajectory prediction
 # Higher MSE weight ensures model learns correct displacement magnitudes

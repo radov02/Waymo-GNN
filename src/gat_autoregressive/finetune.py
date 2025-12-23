@@ -1453,15 +1453,27 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     # Print epoch summary with RMSE in meters
     final_mse = total_mse / max(1, count)
     final_rmse = (final_mse ** 0.5) * 100.0
+    final_loss = total_loss / max(1, steps)
+    final_cosine = total_cosine / max(1, count)
+    
     print(f"\n[TRAIN EPOCH SUMMARY]")
-    print(f"  Loss: {total_loss / max(1, steps):.6f} | Per-step MSE: {final_mse:.6f} | Per-step RMSE: {final_rmse:.2f}m")
-    print(f"  CosSim: {total_cosine / max(1, count):.4f}")
+    print(f"  Loss: {final_loss:.6f} | Per-step MSE: {final_mse:.6f} | Per-step RMSE: {final_rmse:.2f}m")
+    print(f"  CosSim: {final_cosine:.4f}")
     print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
+    # Log per-epoch metrics to wandb
+    wandb.log({
+        "train_epoch/loss": final_loss,
+        "train_epoch/mse": final_mse,
+        "train_epoch/rmse_meters": final_rmse,
+        "train_epoch/cosine_sim": final_cosine,
+        "train_epoch/sampling_prob": sampling_prob,
+    }, commit=True)
+    
     return {
-        'loss': total_loss / max(1, steps),
-        'mse': total_mse / max(1, count),
-        'cosine_sim': total_cosine / max(1, count)
+        'loss': final_loss,
+        'mse': final_mse,
+        'cosine_sim': final_cosine
     }
 
 

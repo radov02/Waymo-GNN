@@ -36,7 +36,9 @@ from torch.nn.utils import clip_grad_norm_
 # Import visualization functions
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'helper_functions'))
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from datetime import datetime as dt
+from helper_functions.visualization_functions import VIBRANT_COLORS, SDC_COLOR, MAP_FEATURE_GRAY
 
 # Suppress warnings
 warnings.filterwarnings("ignore", message=".*skipping cudagraphs.*")
@@ -342,28 +344,16 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
     
     # Map feature type colors (from one-hot encoding in map_vectors)
     # type_onehot is at indices 6:13 (7 types)
-    # All grey except stop signs (red)
+    # Using MAP_FEATURE_GRAY for most features, red for stop signs (same as finetune.py)
     MAP_COLORS = {
-        0: ('#A0A0A0', 'Lanes'),        # lane - gray
-        1: ('#A0A0A0', 'Road Lines'),   # road_line - gray
-        2: ('#A0A0A0', 'Road Edges'),   # road_edge - gray
-        3: ('#FF0000', 'Stop Signs'),   # stop_sign - red
-        4: ('#A0A0A0', 'Crosswalks'),   # crosswalk - gray
-        5: ('#A0A0A0', 'Speed Bumps'),  # speed_bump - gray
-        6: ('#A0A0A0', 'Driveways'),    # driveway - gray
+        0: (MAP_FEATURE_GRAY, 'Lanes'),        # lane - gray
+        1: (MAP_FEATURE_GRAY, 'Road Lines'),   # road_line - gray
+        2: (MAP_FEATURE_GRAY, 'Road Edges'),   # road_edge - gray
+        3: ('#FF0000', 'Stop Signs'),          # stop_sign - red
+        4: (MAP_FEATURE_GRAY, 'Crosswalks'),   # crosswalk - gray
+        5: (MAP_FEATURE_GRAY, 'Speed Bumps'),  # speed_bump - gray
+        6: (MAP_FEATURE_GRAY, 'Driveways'),    # driveway - gray
     }
-    
-    # Colors for multiple agent predictions
-    AGENT_PREDICTION_COLORS = [
-        '#E41A1C',  # Red
-        '#377EB8',  # Blue
-        '#4DAF4A',  # Green
-        '#984EA3',  # Purple
-        '#FF7F00',  # Orange
-        '#FFFF33',  # Yellow
-        '#A65628',  # Brown
-        '#F781BF',  # Pink
-    ]
     
     # Create figure with subplots
     fig, axes = plt.subplots(1, num_scenarios_to_viz, figsize=(10*num_scenarios_to_viz, 10))
@@ -446,6 +436,9 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         total_ade = 0.0
         total_fde = 0.0
         
+        # Build legend elements
+        agent_legend_elements = []
+        
         for t_idx in range(num_targets):
             pred = scenario_predictions[t_idx]  # [T, 2]
             tgt = scenario_targets[t_idx]       # [T, 2]
@@ -458,24 +451,44 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
             if len(pred_valid) == 0:
                 continue
             
-            # Color for this agent
-            color_idx = t_idx % len(AGENT_PREDICTION_COLORS)
-            pred_color = AGENT_PREDICTION_COLORS[color_idx]
+            # Color for this agent - use VIBRANT_COLORS (same as finetune.py)
+            # First agent (SDC) gets SDC_COLOR, others get VIBRANT_COLORS
+            if t_idx == 0:
+                agent_color = SDC_COLOR
+                agent_label = 'SDC (Pred)'
+            else:
+                color_idx = (t_idx - 1) % len(VIBRANT_COLORS)
+                agent_color = VIBRANT_COLORS[color_idx]
+                agent_label = f'Agent {t_idx+1} (Pred)'
             
-            # Plot Ground Truth (blue shades)
-            gt_alpha = 0.9 if t_idx == 0 else 0.6
-            ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], '-', color='blue', 
-                    linewidth=2, alpha=gt_alpha, zorder=10,
-                    label='GT Future' if t_idx == 0 else None)
-            ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='blue', s=80, 
-                       marker='s', zorder=15, alpha=gt_alpha)
+            # Plot Ground Truth (solid black line, same as finetune.py)
+            ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], '-', color='black', 
+                    linewidth=1.5, alpha=0.8, zorder=10,
+                    label='Ground Truth' if t_idx == 0 else None)
             
-            # Plot Prediction
-            ax.plot(pred_valid[:, 0], pred_valid[:, 1], '--', color=pred_color,
-                    linewidth=2, alpha=0.9, zorder=10,
-                    label=f'Pred Agent {t_idx+1}')
-            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=pred_color, s=100, 
-                       marker='x', zorder=15, linewidth=2)
+            # Plot start position (circle marker)
+            ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c=agent_color, s=60, 
+                       marker='o', zorder=15, edgecolors='black', linewidth=1,
+                       label=None)
+            
+            # Plot GT endpoint (x marker in black)
+            ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='black', s=60, 
+                       marker='x', zorder=15, linewidth=2,
+                       label=None)
+            
+            # Plot Prediction (dashed line with agent color)
+            ax.plot(pred_valid[:, 0], pred_valid[:, 1], '--', color=agent_color,
+                    linewidth=2, alpha=0.9, zorder=11)
+            
+            # Plot predicted endpoint (square marker)
+            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=agent_color, s=80, 
+                       marker='s', zorder=16, edgecolors='black', linewidth=1)
+            
+            # Add to legend
+            agent_legend_elements.append(
+                Line2D([0], [0], color=agent_color, linewidth=2, linestyle='--',
+                       marker='s', markersize=6, label=agent_label)
+            )
             
             # Compute metrics
             disp = np.linalg.norm(pred_valid - tgt_valid, axis=1)
@@ -492,11 +505,24 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         
         ax.set_title(f'Scenario: {sid[:25]}...\n{num_targets} agents | Avg ADE: {avg_ade:.2f}m | Avg FDE: {avg_fde:.2f}m', 
                     fontsize=12, fontweight='bold')
-        ax.set_xlabel('X (m)', fontsize=11)
-        ax.set_ylabel('Y (m)', fontsize=11)
+        ax.set_xlabel('X position (meters)', fontsize=11)
+        ax.set_ylabel('Y position (meters)', fontsize=11)
         ax.set_aspect('equal', adjustable='box')
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        
+        # Build complete legend with line type elements (same as finetune.py)
+        line_legend_elements = [
+            Line2D([0], [0], color='black', linewidth=1.5, linestyle='-', label='Ground Truth'),
+            Line2D([0], [0], marker='o', color='gray', markersize=6, linestyle='None', 
+                   markeredgecolor='black', label='Start position'),
+            Line2D([0], [0], marker='s', color='gray', markersize=6, linestyle='None', 
+                   markeredgecolor='black', label='Predicted endpoint'),
+            Line2D([0], [0], marker='x', color='black', markersize=6, linestyle='None', 
+                   label='GT endpoint'),
+        ]
+        
+        all_legend_elements = agent_legend_elements + line_legend_elements
+        ax.legend(handles=all_legend_elements, loc='upper left', fontsize=7, framealpha=0.9, ncol=2)
     
     plt.suptitle(f'VectorNet Multi-Agent Predictions - Epoch {epoch+1}', fontsize=16, fontweight='bold')
     plt.tight_layout()
@@ -958,7 +984,10 @@ def main():
         if config.scheduler_type == 'cosine':
             scheduler.step()
         
-        # Log to wandb
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Log per-epoch metrics to wandb
         wandb.log({
             "epoch": epoch + 1,
             "train/loss": train_metrics['loss'],
@@ -969,8 +998,18 @@ def main():
             "val/loss": val_metrics['loss'],
             "val/ade": val_metrics['ade'],
             "val/fde": val_metrics['fde'],
-            "lr": optimizer.param_groups[0]['lr'],
-        })
+            "lr": current_lr,
+            # Per-epoch aggregated metrics for better tracking
+            "train_epoch/loss": train_metrics['loss'],
+            "train_epoch/traj_loss": train_metrics['traj_loss'],
+            "train_epoch/node_loss": train_metrics['node_loss'],
+            "train_epoch/ade": train_metrics['ade'],
+            "train_epoch/fde": train_metrics['fde'],
+            "val_epoch/loss": val_metrics['loss'],
+            "val_epoch/ade": val_metrics['ade'],
+            "val_epoch/fde": val_metrics['fde'],
+            "learning_rate": current_lr,
+        }, commit=True)
         
         # Save best model
         if val_metrics['loss'] < best_val_loss:
