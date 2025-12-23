@@ -418,14 +418,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     # Compute adaptive velocity smoothing based on epoch
     # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
     # inputs at every timestep and converges to producing the same output for all agents.
-    # Smoothing = weight on OLD velocity: 0.7 means 70% old, 30% new
+    # Smoothing = weight on OLD velocity: 0.5 means 50% old, 50% new
+    # Use same schedule as training for consistency
     progress = epoch / max(1, total_epochs - 1)
-    if epoch < 3:
-        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
-    else:
-        later_progress = (epoch - 3) / max(1, total_epochs - 4)
-        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
-    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
+    velocity_smoothing = 0.5 - 0.4 * progress  # 0.5 → 0.1 over all epochs
+    velocity_smoothing = max(0.1, min(0.5, velocity_smoothing))
     
     # Always update velocity features - smoothing handles stability
     update_velocity = True
@@ -920,19 +917,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     # Compute adaptive velocity smoothing based on epoch
     # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
     # inputs at every timestep and converges to producing the same output for all agents.
-    # Smoothing = weight on OLD velocity: 0.8 means 80% old, 20% new
-    # Lower smoothing = faster adaptation to predictions
+    # Smoothing = weight on OLD velocity: 0.5 means 50% old, 50% new
+    # Lower smoothing = faster adaptation to predictions = more dynamic velocity updates
+    # Start at 0.5 (moderate smoothing) and decrease to 0.1 (fast adaptation)
     progress = epoch / max(1, total_epochs - 1)
-    if epoch < 3:
-        # Very early epochs: moderate smoothing to allow model to adapt
-        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
-    else:
-        # After epoch 3: transition from 0.55 → 0.2 over remaining epochs
-        later_progress = (epoch - 3) / max(1, total_epochs - 4)
-        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
-    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
+    velocity_smoothing = 0.5 - 0.4 * progress  # 0.5 → 0.1 over all epochs
+    velocity_smoothing = max(0.1, min(0.5, velocity_smoothing))
     
-    # Always update velocity features now - the smoothing handles stability
+    # Always update velocity features - the smoothing handles stability
     update_velocity = True
     
     if epoch == 0 or epoch % 5 == 0:
@@ -978,8 +970,6 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         )
         
         optimizer.zero_grad()
-        accumulated_loss = None
-        valid_steps = 0
         
         effective_rollout = min(num_rollout_steps, T - 1)
         if effective_rollout < 1:
@@ -988,40 +978,41 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         # Position scale for computing targets
         POSITION_SCALE = 100.0
         
-        for t in range(max(1, T - effective_rollout)):
-            current_graph = batched_graph_sequence[t]
-            if current_graph.y is None:
-                continue
+        # SIMPLIFIED: Do ONE rollout per batch starting from t=0
+        # This is cleaner and more effective than trying many starting points
+        # Each batch contains 48 scenarios, so we get plenty of diversity
+        t = 0  # Always start from beginning of scenario
+        current_graph = batched_graph_sequence[t]
+        if current_graph.y is None:
+            continue
+        
+        # GRU hidden states were reset at batch start (line ~973)
+        # No need to reset again here
+        
+        rollout_loss = None
+        graph_for_prediction = current_graph
+        is_using_predicted_positions = False  # Track if we're using our predictions
+        accumulated_mse = 0.0
+        accumulated_cosine = 0.0
+        num_steps_counted = 0
+        
+        for step in range(effective_rollout):
+            target_t = t + step + 1
+            if target_t >= T:
+                break
             
-            # CRITICAL: Reset GRU hidden states for each new rollout starting point
-            # Must use proper batch sizing, not just total num_agents!
-            base_model.reset_gru_hidden_states(
-                batch_size=B,
-                agents_per_scenario=agents_per_scenario,
-                device=device
-            )
+            target_graph = batched_graph_sequence[target_t]
+            if target_graph.y is None:
+                break
             
-            rollout_loss = None
-            graph_for_prediction = current_graph
-            is_using_predicted_positions = False  # Track if we're using our predictions
-            
-            for step in range(effective_rollout):
-                target_t = t + step + 1
-                if target_t >= T:
-                    break
-                
-                target_graph = batched_graph_sequence[target_t]
-                if target_graph.y is None:
-                    break
-                
-                # ========== CRITICAL: AGENT ALIGNMENT ==========
-                # The graphs at different timesteps may have different agents (some enter/leave).
-                # We need to compute loss only for agents that exist in BOTH graphs,
-                # and align predictions with targets by agent ID, not by node index.
-                #
-                # IMPORTANT: Agent IDs are NOT globally unique across scenarios in a batch!
-                # Two different scenarios can have agents with the same ID.
-                # We must combine agent_id with batch_id to create globally unique identifiers.
+            # ========== CRITICAL: AGENT ALIGNMENT ==========
+            # The graphs at different timesteps may have different agents (some enter/leave).
+            # We need to compute loss only for agents that exist in BOTH graphs,
+            # and align predictions with targets by agent ID, not by node index.
+            #
+            # IMPORTANT: Agent IDs are NOT globally unique across scenarios in a batch!
+            # Two different scenarios can have agents with the same ID.
+            # We must combine agent_id with batch_id to create globally unique identifiers.
                 
                 # Get agent IDs and batch assignments from both graphs
                 pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
@@ -1173,69 +1164,28 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         continue
                     
                     # ============== DISPLACEMENT LOSS ==============
-                    # MSE between predicted and target displacement
+                    # MSE between predicted and target displacement (per-agent)
                     mse_loss = F.mse_loss(pred_aligned, target)
                     
                     # Direction loss: cosine similarity between prediction and target
+                    # This helps with direction even when magnitude is off
                     pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                     cosine_loss = (1 - cos_sim).mean()
                     
-                    # ============== VELOCITY CONSISTENCY LOSS ==============
-                    # Penalize when predicted displacement doesn't match input velocity
-                    # This encourages the model to USE velocity features for predictions
-                    # velocity_expected = v * dt, where v is in node features (normalized)
-                    # pred_disp is normalized (actual / 100), velocity is normalized (actual / 30)
-                    # So: expected_disp_norm = vx_norm * (30 * 0.1 / 100) = vx_norm * 0.03
-                    dt = 0.1
-                    POSITION_SCALE_LOCAL = 100.0
-                    MAX_SPEED = 30.0
-                    vel_to_disp_scale = MAX_SPEED * dt / POSITION_SCALE_LOCAL  # = 0.03
-                    
-                    # Get velocity from current graph features (features 0 and 1)
-                    # Use the same alignment as for predictions
-                    num_graph_nodes = graph_for_prediction.x.shape[0]
-                    if pred_indices is not None:
-                        # Need to align - use pred_indices
-                        valid_pred_indices = pred_indices[pred_indices < num_graph_nodes]
-                        current_vx_norm = graph_for_prediction.x[valid_pred_indices, 0]
-                        current_vy_norm = graph_for_prediction.x[valid_pred_indices, 1]
-                        # Make sure sizes match pred_aligned
-                        if current_vx_norm.shape[0] != pred_aligned.shape[0]:
-                            # Size mismatch - skip velocity loss for this step
-                            vel_consistency_loss = torch.tensor(0.0, device=device, dtype=pred_aligned.dtype)
-                        else:
-                            # Expected displacement from velocity
-                            expected_disp_x = current_vx_norm * vel_to_disp_scale
-                            expected_disp_y = current_vy_norm * vel_to_disp_scale
-                            expected_disp = torch.stack([expected_disp_x, expected_disp_y], dim=1).to(pred_aligned.dtype)
-                            vel_consistency_loss = F.mse_loss(pred_aligned, expected_disp)
-                    else:
-                        # No alignment needed - direct indexing
-                        num_to_use = min(num_graph_nodes, pred_aligned.shape[0])
-                        current_vx_norm = graph_for_prediction.x[:num_to_use, 0]
-                        current_vy_norm = graph_for_prediction.x[:num_to_use, 1]
-                        expected_disp_x = current_vx_norm * vel_to_disp_scale
-                        expected_disp_y = current_vy_norm * vel_to_disp_scale
-                        expected_disp = torch.stack([expected_disp_x, expected_disp_y], dim=1).to(pred_aligned.dtype)
-                        vel_consistency_loss = F.mse_loss(pred_aligned[:num_to_use], expected_disp)
-                    
-                    # Clamp velocity consistency loss to prevent explosion
-                    vel_consistency_loss = torch.clamp(vel_consistency_loss, max=1.0)
-                    
                     # Final NaN check on loss values
-                    if torch.isnan(mse_loss) or torch.isnan(cosine_loss) or torch.isnan(vel_consistency_loss):
+                    if torch.isnan(mse_loss) or torch.isnan(cosine_loss):
                         print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                         continue
                     
                     # Clamp MSE loss to prevent gradient explosion from outliers
                     mse_loss = torch.clamp(mse_loss, max=10.0)
                     
-                    # Combined loss: displacement + direction + velocity consistency
-                    # Weights: 0.4 displacement MSE, 0.4 direction, 0.2 velocity consistency
+                    # Combined loss: displacement MSE (60%) + direction (40%)
+                    # Simple and effective - just learn to predict GT displacements
                     discount = 0.95 ** step
-                    step_loss = (0.4 * mse_loss + 0.4 * cosine_loss + 0.2 * vel_consistency_loss) * discount
+                    step_loss = (0.6 * mse_loss + 0.4 * cosine_loss) * discount
                 
                 if rollout_loss is None:
                     rollout_loss = step_loss
@@ -1263,21 +1213,17 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     else:
                         graph_for_prediction = batched_graph_sequence[target_t]
                         is_using_predicted_positions = False  # Back to GT positions
-            
-            if rollout_loss is not None:
-                if accumulated_loss is None:
-                    accumulated_loss = rollout_loss
-                else:
-                    accumulated_loss = accumulated_loss + rollout_loss
-                valid_steps += 1
         
-        if valid_steps > 0 and accumulated_loss is not None:
-            # Check for NaN in accumulated loss before backward
-            if torch.isnan(accumulated_loss):
-                print(f"  [ERROR] NaN in accumulated loss at batch {batch_idx}! Skipping backward pass.")
+        # End of single rollout - do backward pass immediately
+        if rollout_loss is not None:
+            # Check for NaN in loss before backward
+            if torch.isnan(rollout_loss):
+                print(f"  [ERROR] NaN in rollout loss at batch {batch_idx}! Skipping backward pass.")
                 continue
             
-            avg_loss = accumulated_loss / valid_steps
+            # Normalize by number of rollout steps for consistent gradient magnitudes
+            avg_loss = rollout_loss / max(1, count)
+            
             # Backward pass with optional AMP scaling
             if use_amp_local:
                 scaler.scale(avg_loss).backward()
@@ -1300,20 +1246,20 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     optimizer.zero_grad()
                     continue
                 optimizer.step()
-            total_loss += accumulated_loss.item()
+            total_loss += rollout_loss.item()
             steps += 1
         
         if batch_idx % 20 == 0:
-            loss_val = accumulated_loss.item() if accumulated_loss is not None and hasattr(accumulated_loss, 'item') else 0.0
+            loss_val = rollout_loss.item() if rollout_loss is not None and hasattr(rollout_loss, 'item') else 0.0
             avg_mse_so_far = total_mse / max(1, count)
             avg_cos_so_far = total_cosine / max(1, count)
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
-            print(f"  Loss={loss_val/max(1,valid_steps):.4f}, Sampling prob={sampling_prob:.2f}")
+            print(f"  Loss={loss_val/max(1,count):.4f}, Sampling prob={sampling_prob:.2f}")
             print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             
             # Log per-step metrics to wandb (no explicit step - let wandb auto-increment)
             wandb.log({
-                "train/batch_loss": loss_val / max(1, valid_steps),
+                "train/batch_loss": loss_val / max(1, count),
                 "train/batch_mse": avg_mse_so_far,
                 "train/batch_rmse_meters": rmse_meters,
                 "train/batch_cosine_sim": avg_cos_so_far,
@@ -1350,12 +1296,8 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     # Compute adaptive velocity smoothing based on epoch
     # Use same schedule as training for consistency
     progress = epoch / max(1, total_epochs - 1)
-    if epoch < 3:
-        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
-    else:
-        later_progress = (epoch - 3) / max(1, total_epochs - 4)
-        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
-    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
+    velocity_smoothing = 0.5 - 0.4 * progress  # 0.5 → 0.1 over all epochs
+    velocity_smoothing = max(0.1, min(0.5, velocity_smoothing))
     
     # Always update velocity features
     update_velocity = True
