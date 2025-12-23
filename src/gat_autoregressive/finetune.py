@@ -36,7 +36,7 @@ from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
                     autoreg_visualize_every_n_epochs, autoreg_viz_dir_finetune_gat,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
-                    cache_validation_data, max_validation_scenarios, radius)
+                    cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
@@ -418,13 +418,14 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     # Compute adaptive velocity smoothing based on epoch
     # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
     # inputs at every timestep and converges to producing the same output for all agents.
+    # Smoothing = weight on OLD velocity: 0.7 means 70% old, 30% new
     progress = epoch / max(1, total_epochs - 1)
-    if epoch < 5:
-        velocity_smoothing = 0.95 - 0.01 * epoch  # 0.95 → 0.91 over first 5 epochs
+    if epoch < 3:
+        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
     else:
-        later_progress = (epoch - 5) / max(1, total_epochs - 6)
-        velocity_smoothing = 0.85 - 0.55 * later_progress  # 0.85 → 0.3
-    velocity_smoothing = max(0.3, min(0.95, velocity_smoothing))
+        later_progress = (epoch - 3) / max(1, total_epochs - 4)
+        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
+    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
     
     # Always update velocity features - smoothing handles stability
     update_velocity = True
@@ -717,8 +718,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             horizon_errors.append(np.mean(errors_at_step))
     
     # Print horizon error summary to help diagnose accumulation vs base model issues
+    # HORIZON ERROR: Mean Euclidean distance between predicted and GT positions
+    # across all agents at each timestep. Shows how error accumulates over time.
     if len(horizon_errors) >= 5:
-        print(f"  [VIZ SUMMARY] Horizon errors (accumulated position error):")
+        print(f"  [VIZ SUMMARY] Horizon errors (mean |pred_pos - gt_pos| across all agents at each timestep):")
         print(f"    Step 1 (0.1s): {horizon_errors[0]:.2f}m")
         print(f"    Step 5 (0.5s): {horizon_errors[4]:.2f}m")
         if len(horizon_errors) >= 10:
@@ -736,6 +739,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 print(f"    Error growth (step 1 → 10): {growth_10:.1f}x")
     
     # Print per-agent final errors to identify outliers
+    # FINAL ERROR: Euclidean distance |pred_pos - gt_pos| for each agent at the last timestep.
+    # High variance indicates some agents are being predicted poorly.
     final_t = start_t + actual_rollout_steps
     agent_final_errors = []
     for agent_id, traj in agent_trajectories.items():
@@ -747,7 +752,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     if agent_final_errors:
         agent_final_errors.sort(key=lambda x: x[1], reverse=True)
-        print(f"  [PER-AGENT] Final errors (top 5 worst / total {len(agent_final_errors)} agents):")
+        print(f"  [PER-AGENT] Final position errors |pred - gt| at t={actual_rollout_steps*0.1:.1f}s (top 5 worst / total {len(agent_final_errors)} agents):")
         for i, (agent_id, error) in enumerate(agent_final_errors[:5]):
             print(f"    Agent {agent_id}: {error:.2f}m")
         if len(agent_final_errors) > 5:
@@ -915,18 +920,17 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     # Compute adaptive velocity smoothing based on epoch
     # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
     # inputs at every timestep and converges to producing the same output for all agents.
-    # Early epochs: very high smoothing (0.95) to prevent feedback loops
-    # Later epochs: lower smoothing (0.3) to allow model's predictions to drive dynamics
+    # Smoothing = weight on OLD velocity: 0.8 means 80% old, 20% new
+    # Lower smoothing = faster adaptation to predictions
     progress = epoch / max(1, total_epochs - 1)
-    if epoch < 5:
-        # Very early epochs: use extremely high smoothing (mostly keep original velocity)
-        # This allows small velocity updates so GRU sees changing inputs
-        velocity_smoothing = 0.95 - 0.01 * epoch  # 0.95 → 0.91 over first 5 epochs
+    if epoch < 3:
+        # Very early epochs: moderate smoothing to allow model to adapt
+        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
     else:
-        # After epoch 5: transition from 0.85 → 0.3 over remaining epochs
-        later_progress = (epoch - 5) / max(1, total_epochs - 6)
-        velocity_smoothing = 0.85 - 0.55 * later_progress  # 0.85 → 0.3
-    velocity_smoothing = max(0.3, min(0.95, velocity_smoothing))
+        # After epoch 3: transition from 0.55 → 0.2 over remaining epochs
+        later_progress = (epoch - 3) / max(1, total_epochs - 4)
+        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
+    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
     
     # Always update velocity features now - the smoothing handles stability
     update_velocity = True
@@ -1168,24 +1172,70 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         # Skip this step's loss
                         continue
                     
+                    # ============== DISPLACEMENT LOSS ==============
+                    # MSE between predicted and target displacement
                     mse_loss = F.mse_loss(pred_aligned, target)
+                    
+                    # Direction loss: cosine similarity between prediction and target
                     pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                     cosine_loss = (1 - cos_sim).mean()
                     
+                    # ============== VELOCITY CONSISTENCY LOSS ==============
+                    # Penalize when predicted displacement doesn't match input velocity
+                    # This encourages the model to USE velocity features for predictions
+                    # velocity_expected = v * dt, where v is in node features (normalized)
+                    # pred_disp is normalized (actual / 100), velocity is normalized (actual / 30)
+                    # So: expected_disp_norm = vx_norm * (30 * 0.1 / 100) = vx_norm * 0.03
+                    dt = 0.1
+                    POSITION_SCALE_LOCAL = 100.0
+                    MAX_SPEED = 30.0
+                    vel_to_disp_scale = MAX_SPEED * dt / POSITION_SCALE_LOCAL  # = 0.03
+                    
+                    # Get velocity from current graph features (features 0 and 1)
+                    # Use the same alignment as for predictions
+                    num_graph_nodes = graph_for_prediction.x.shape[0]
+                    if pred_indices is not None:
+                        # Need to align - use pred_indices
+                        valid_pred_indices = pred_indices[pred_indices < num_graph_nodes]
+                        current_vx_norm = graph_for_prediction.x[valid_pred_indices, 0]
+                        current_vy_norm = graph_for_prediction.x[valid_pred_indices, 1]
+                        # Make sure sizes match pred_aligned
+                        if current_vx_norm.shape[0] != pred_aligned.shape[0]:
+                            # Size mismatch - skip velocity loss for this step
+                            vel_consistency_loss = torch.tensor(0.0, device=device, dtype=pred_aligned.dtype)
+                        else:
+                            # Expected displacement from velocity
+                            expected_disp_x = current_vx_norm * vel_to_disp_scale
+                            expected_disp_y = current_vy_norm * vel_to_disp_scale
+                            expected_disp = torch.stack([expected_disp_x, expected_disp_y], dim=1).to(pred_aligned.dtype)
+                            vel_consistency_loss = F.mse_loss(pred_aligned, expected_disp)
+                    else:
+                        # No alignment needed - direct indexing
+                        num_to_use = min(num_graph_nodes, pred_aligned.shape[0])
+                        current_vx_norm = graph_for_prediction.x[:num_to_use, 0]
+                        current_vy_norm = graph_for_prediction.x[:num_to_use, 1]
+                        expected_disp_x = current_vx_norm * vel_to_disp_scale
+                        expected_disp_y = current_vy_norm * vel_to_disp_scale
+                        expected_disp = torch.stack([expected_disp_x, expected_disp_y], dim=1).to(pred_aligned.dtype)
+                        vel_consistency_loss = F.mse_loss(pred_aligned[:num_to_use], expected_disp)
+                    
+                    # Clamp velocity consistency loss to prevent explosion
+                    vel_consistency_loss = torch.clamp(vel_consistency_loss, max=1.0)
+                    
                     # Final NaN check on loss values
-                    if torch.isnan(mse_loss) or torch.isnan(cosine_loss):
+                    if torch.isnan(mse_loss) or torch.isnan(cosine_loss) or torch.isnan(vel_consistency_loss):
                         print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                         continue
                     
                     # Clamp MSE loss to prevent gradient explosion from outliers
-                    # Normalized displacement of 0.1 = 10m, squared = 100 → 1.0 after POSITION_SCALE
-                    # But we expect ~0.01 (1m) typically, so 1.0 is already very large
                     mse_loss = torch.clamp(mse_loss, max=10.0)
                     
+                    # Combined loss: displacement + direction + velocity consistency
+                    # Weights: 0.4 displacement MSE, 0.4 direction, 0.2 velocity consistency
                     discount = 0.95 ** step
-                    step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
+                    step_loss = (0.4 * mse_loss + 0.4 * cosine_loss + 0.2 * vel_consistency_loss) * discount
                 
                 if rollout_loss is None:
                     rollout_loss = step_loss
@@ -1298,12 +1348,17 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     count = 0
     
     # Compute adaptive velocity smoothing based on epoch
+    # Use same schedule as training for consistency
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
-    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
+    if epoch < 3:
+        velocity_smoothing = 0.7 - 0.05 * epoch  # 0.7 → 0.6 over first 3 epochs
+    else:
+        later_progress = (epoch - 3) / max(1, total_epochs - 4)
+        velocity_smoothing = 0.55 - 0.35 * later_progress  # 0.55 → 0.2
+    velocity_smoothing = max(0.2, min(0.7, velocity_smoothing))
     
-    # For very early epochs (first 5), don't update velocity features at all
-    update_velocity = epoch >= 5
+    # Always update velocity features
+    update_velocity = True
     
     horizon_mse = [0.0] * num_rollout_steps
     horizon_cosine = [0.0] * num_rollout_steps
@@ -1679,10 +1734,10 @@ def run_autoregressive_finetuning(
         if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
             try:
                 print(f"\n  Creating visualizations for epoch {epoch+1} (using training data)...")
-                # Create visualizations for up to 4 scenarios from training set
+                # Create visualizations for up to max_scenario_files_for_viz scenarios from training set
                 viz_count = 0
                 for viz_batch in train_loader:
-                    if viz_count >= 4:
+                    if viz_count >= max_scenario_files_for_viz:
                         break
                     result = visualize_autoregressive_rollout(
                         model, viz_batch, epoch, num_rollout_steps, 
