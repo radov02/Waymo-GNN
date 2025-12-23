@@ -226,6 +226,12 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
+    # ============== NaN DETECTION AND HANDLING ==============
+    # Check for NaN in predictions - if found, replace with zeros to prevent cascade
+    if torch.isnan(pred_displacement).any():
+        print(f"  [WARNING] NaN detected in predictions! Replacing with zeros to prevent cascade.")
+        pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
+    
     # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
     # Convert predicted displacement to velocity: velocity = displacement / dt
     # pred_displacement is normalized (actual_disp / 100)
@@ -257,6 +263,14 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     # Calculate speed and heading from smoothed velocity
     new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
     new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
+    
+    # Safety: Check for NaN after velocity calculations
+    if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
+        print(f"  [ERROR] NaN in velocity features after smoothing! Clamping to zero.")
+        new_vx_norm = torch.nan_to_num(new_vx_norm, nan=0.0)
+        new_vy_norm = torch.nan_to_num(new_vy_norm, nan=0.0)
+        new_speed_norm = torch.nan_to_num(new_speed_norm, nan=0.0)
+        new_heading = torch.nan_to_num(new_heading, nan=0.0)
     
     # Calculate acceleration from velocity change (using smoothed values)
     # acceleration = (new_v - old_v) / dt
@@ -1048,6 +1062,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     pred_indices = None
                     target_indices = None
                 
+                # Safety: Check input features for NaN before forward pass
+                if torch.isnan(graph_for_prediction.x).any():
+                    print(f"  [ERROR] NaN in input features at batch {batch_idx}, t={t}, step={step}! Skipping rollout.")
+                    # Skip this entire rollout
+                    break
+                
                 # GAT forward pass with optional AMP - no edge weights
                 with torch.amp.autocast('cuda', enabled=use_amp_local):
                     pred = model(
@@ -1058,6 +1078,18 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         batch_num=batch_idx,
                         timestep=t + step
                     )
+                    
+                    # Safety: Check for NaN in model output and reset GRU if needed
+                    if torch.isnan(pred).any():
+                        print(f"  [ERROR] NaN in model output at batch {batch_idx}, step {step}! Resetting GRU and skipping.")
+                        # Reset GRU to prevent NaN propagation
+                        base_model.reset_gru_hidden_states(
+                            batch_size=B,
+                            agents_per_scenario=agents_per_scenario,
+                            device=device
+                        )
+                        # Skip this rollout
+                        break
                     
                     # Apply alignment if needed
                     if pred_indices is not None:
@@ -1101,11 +1133,22 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         else:
                             target = target_graph.y.to(pred.dtype)
                     
+                    # Check for NaN in predictions or targets before computing loss
+                    if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
+                        print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
+                        # Skip this step's loss
+                        continue
+                    
                     mse_loss = F.mse_loss(pred_aligned, target)
                     pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                     cosine_loss = (1 - cos_sim).mean()
+                    
+                    # Final NaN check on loss values
+                    if torch.isnan(mse_loss) or torch.isnan(cosine_loss):
+                        print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
+                        continue
                     
                     discount = 0.95 ** step
                     step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
@@ -1144,17 +1187,31 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 valid_steps += 1
         
         if valid_steps > 0 and accumulated_loss is not None:
+            # Check for NaN in accumulated loss before backward
+            if torch.isnan(accumulated_loss):
+                print(f"  [ERROR] NaN in accumulated loss at batch {batch_idx}! Skipping backward pass.")
+                continue
+            
             avg_loss = accumulated_loss / valid_steps
             # Backward pass with optional AMP scaling
             if use_amp_local:
                 scaler.scale(avg_loss).backward()
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), gradient_clip_value)
+                # Check for NaN in gradients
+                grad_norm = clip_grad_norm_(model.parameters(), gradient_clip_value)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"  [ERROR] NaN/Inf in gradients (norm={grad_norm})! Skipping optimizer step.")
+                    optimizer.zero_grad()
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 avg_loss.backward()
-                clip_grad_norm_(model.parameters(), gradient_clip_value)
+                grad_norm = clip_grad_norm_(model.parameters(), gradient_clip_value)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"  [ERROR] NaN/Inf in gradients (norm={grad_norm})! Skipping optimizer step.")
+                    optimizer.zero_grad()
+                    continue
                 optimizer.step()
             total_loss += accumulated_loss.item()
             steps += 1
