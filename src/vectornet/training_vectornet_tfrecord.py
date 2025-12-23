@@ -35,7 +35,8 @@ from torch.nn.utils import clip_grad_norm_
 
 # Import visualization functions
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'helper_functions'))
-from visualization_functions import visualize_epoch
+import matplotlib.pyplot as plt
+from datetime import datetime as dt
 
 # Suppress warnings
 warnings.filterwarnings("ignore", message=".*skipping cudagraphs.*")
@@ -277,6 +278,85 @@ def compute_metrics(pred, target, valid_mask=None):
         fde = disp[:, -1].mean()
     
     return ade, fde
+
+
+def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_ids, 
+                                     epoch, output_dir, max_scenarios=5):
+    """Visualize VectorNet trajectory predictions.
+    
+    Args:
+        predictions: [B, T, 2] predicted positions
+        targets: [B, T, 2] ground truth positions  
+        valid_mask: [B, T] validity mask
+        scenario_ids: List of scenario IDs
+        epoch: Current epoch number
+        output_dir: Directory to save visualizations
+        max_scenarios: Maximum number of scenarios to visualize
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    B = min(predictions.shape[0], max_scenarios)
+    T = predictions.shape[1]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, B, figsize=(5*B, 5))
+    if B == 1:
+        axes = [axes]
+    
+    for i in range(B):
+        ax = axes[i]
+        pred = predictions[i].numpy()  # [T, 2]
+        tgt = targets[i].numpy()       # [T, 2]
+        mask = valid_mask[i].numpy() if valid_mask is not None else np.ones(T)
+        
+        # Filter by valid mask
+        valid_idx = mask > 0.5
+        pred_valid = pred[valid_idx]
+        tgt_valid = tgt[valid_idx]
+        
+        # Plot ground truth trajectory
+        ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], 'b-', linewidth=2, 
+                label='Ground Truth', alpha=0.8)
+        ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c='blue', s=100, 
+                   marker='o', zorder=5, label='Start')
+        ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='blue', s=100, 
+                   marker='s', zorder=5, label='GT End')
+        
+        # Plot predicted trajectory
+        ax.plot(pred_valid[:, 0], pred_valid[:, 1], 'r--', linewidth=2, 
+                label='Prediction', alpha=0.8)
+        ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c='red', s=100, 
+                   marker='x', zorder=5, label='Pred End')
+        
+        # Compute ADE/FDE for this scenario
+        disp = np.linalg.norm(pred_valid - tgt_valid, axis=1)
+        ade = disp.mean()
+        fde = disp[-1] if len(disp) > 0 else 0
+        
+        # Get scenario ID
+        sid = scenario_ids[i] if i < len(scenario_ids) else f"scenario_{i}"
+        if isinstance(sid, bytes):
+            sid = sid.decode('utf-8')
+        
+        ax.set_title(f'{sid[:20]}...\nADE: {ade:.2f}m | FDE: {fde:.2f}m', fontsize=10)
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper left', fontsize=8)
+    
+    plt.suptitle(f'VectorNet Predictions - Epoch {epoch+1}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    # Save
+    timestamp = dt.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'vectornet_epoch{epoch+1:03d}_{timestamp}.png'
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    
+    print(f"  Saved visualization: {filepath}")
+    return filepath
 
 
 def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_callback=None):
@@ -664,22 +744,14 @@ def main():
                     batch_gpu = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                     predictions = model(batch_gpu)
                     
-                    # Create visualization data structure
-                    viz_data = {
-                        'predictions': predictions.cpu(),
-                        'targets': batch['future_positions'].cpu(),
-                        'valid_mask': batch['future_valid'].cpu(),
-                        'scenario_ids': batch.get('scenario_ids', ['unknown'] * predictions.shape[0])
-                    }
-                    
-                    # Use visualize_epoch helper
-                    visualize_epoch(
+                    # Visualize predictions
+                    visualize_vectornet_predictions(
+                        predictions=predictions.cpu(),
+                        targets=batch['future_positions'],
+                        valid_mask=batch['future_valid'],
+                        scenario_ids=batch.get('scenario_ids', [f'scenario_{i}' for i in range(predictions.shape[0])]),
                         epoch=epoch,
-                        predictions=viz_data['predictions'],
-                        targets=viz_data['targets'],
-                        scenario_ids=viz_data['scenario_ids'],
                         output_dir=config.viz_dir,
-                        prefix='vectornet',
                         max_scenarios=5
                     )
                 model.train()
