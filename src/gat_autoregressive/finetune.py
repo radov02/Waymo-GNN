@@ -382,41 +382,44 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     return updated_graph
 
 
-def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=10):
+def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
     """Calculate probability of using model's own prediction vs ground truth.
     
     Args:
         epoch: Current epoch (0-indexed)
         total_epochs: Total number of training epochs
         strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
-        warmup_epochs: Number of epochs to use pure teacher forcing before scheduled sampling
+        warmup_epochs: Number of epochs before increasing scheduled sampling (reduced from 10)
     
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # EXTENDED WARMUP: Use pure teacher forcing for first warmup_epochs
-    # The model needs more time to learn basic predictions before handling errors
+    # IMPORTANT: Always use SOME scheduled sampling, even in warmup!
+    # This teaches the model to handle its own prediction errors from the start.
+    # A minimum of 10% autoregressive prevents the model from overfitting to perfect inputs.
+    min_sampling = 0.1  # Always use at least 10% model predictions
+    
     if epoch < warmup_epochs:
-        return 0.0
+        return min_sampling
     
     # Adjust progress to account for warmup period
     adjusted_epoch = epoch - warmup_epochs
     adjusted_total = total_epochs - warmup_epochs
     progress = adjusted_epoch / max(1, adjusted_total)
     
-    # CAP at 50% - never go full autoregressive during training
-    # The model needs some GT signal to learn from
-    max_sampling = 0.5
+    # Scale from min_sampling to max_sampling (0.6) over training
+    # Higher max allows model to learn error correction better
+    max_sampling = 0.6
     
     if strategy == 'linear' or strategy == 'delayed_linear':
-        return progress * max_sampling
+        return min_sampling + progress * (max_sampling - min_sampling)
     elif strategy == 'exponential':
-        return (1 - np.exp(-5 * progress)) * max_sampling
+        return min_sampling + (1 - np.exp(-5 * progress)) * (max_sampling - min_sampling)
     elif strategy == 'inverse_sigmoid':
         k = 10
-        return (1 / (1 + np.exp(-k * (progress - 0.5)))) * max_sampling
+        return min_sampling + (1 / (1 + np.exp(-k * (progress - 0.5)))) * (max_sampling - min_sampling)
     else:
-        return progress * max_sampling
+        return min_sampling + progress * (max_sampling - min_sampling)
 
 
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
@@ -459,11 +462,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
-    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
-    # Higher smoothing for more stable autoregressive rollout
-    velocity_smoothing = 0.9
+    # REDUCED velocity smoothing: 0.5 = balanced between old and predicted velocity
+    # Lower smoothing allows agents to diverge and follow their own trajectories
+    velocity_smoothing = 0.5
     
-    # Always update velocity features - smoothing handles stability
+    # Always update velocity features - required for agent differentiation
     update_velocity = True
     print(f"  [VIZ] Velocity update={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
     
@@ -964,11 +967,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     steps = 0
     count = 0
     
-    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
-    # Higher smoothing for more stable training - prevents velocity explosion
-    velocity_smoothing = 0.9
+    # REDUCED velocity smoothing: 0.5 = 50% old velocity, 50% new predicted velocity
+    # Lower smoothing allows agents to diverge and follow their own trajectories
+    # Previously 0.9 caused all agents to converge to similar mean predictions
+    velocity_smoothing = 0.5
     
-    # Always update velocity features - each agent needs differentiated inputs
+    # CRITICAL: Update velocity features so each agent maintains differentiated behavior
+    # Without this, all agents converge because they have identical input features
     update_velocity = True
     
     if epoch == 0 or epoch % 5 == 0:
@@ -1262,7 +1267,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     graph_for_prediction = update_graph_with_prediction(
                         graph_for_prediction, pred.detach(), device,  # DETACH for stability
                         velocity_smoothing=velocity_smoothing,
-                        update_velocity=False  # Don't update velocity - keep GT features
+                        update_velocity=True  # CRITICAL: Update velocity so agents differentiate!
                     )
                     is_using_predicted_positions = True  # Now we're using predicted positions
                 else:
@@ -1348,9 +1353,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     steps = 0
     count = 0
     
-    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
-    # Higher smoothing for stability
-    velocity_smoothing = 0.9
+    # REDUCED velocity smoothing: 0.5 = balanced between old and predicted velocity
+    # Lower smoothing allows agents to diverge and follow their own trajectories
+    velocity_smoothing = 0.5
     
     # Always update velocity features
     update_velocity = True
