@@ -62,15 +62,15 @@ except Exception:
 
 from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
+from config import (device, gat_num_workers, num_layers, num_gru_layers, epochs, 
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, debug_mode,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta,
-                    scheduler_patience, scheduler_factor, min_lr,
+                    scheduler_patience, scheduler_factor, min_lr, gat_prefetch_factor,
                     early_stopping_patience, early_stopping_min_delta,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
-                    print_gpu_info, pin_memory, prefetch_factor, use_amp, use_bf16,
+                    print_gpu_info, pin_memory, gat_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
                     cache_validation_data, max_validation_scenarios, batch_size)
 from torch.utils.data import DataLoader, Subset
@@ -573,13 +573,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             val_dataset, 
             batch_size=batch_size,  # Use same batch size for validation
             shuffle=False, 
-            num_workers=num_workers,
+            num_workers=gat_num_workers,
             collate_fn=collate_graph_sequences_to_batch, 
             drop_last=False,  # Don't drop last batch in validation
             pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True if num_workers > 0 else False,
-            worker_init_fn=worker_init_fn if num_workers > 0 else None
+            prefetch_factor=gat_prefetch_factor,
+            persistent_workers=True if gat_num_workers > 0 else False,
+            worker_init_fn=worker_init_fn if gat_num_workers > 0 else None
         )
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
@@ -589,13 +589,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         dataset, 
         batch_size=batch_size,  # KEY: Process multiple scenarios in parallel!
         shuffle=True, 
-        num_workers=num_workers,
+        num_workers=gat_num_workers,
         collate_fn=collate_graph_sequences_to_batch, 
         drop_last=True,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None
+        prefetch_factor=gat_prefetch_factor,
+        persistent_workers=True if gat_num_workers > 0 else False,
+        worker_init_fn=worker_init_fn if gat_num_workers > 0 else None
     )
 
     overfit_detector = OverfittingDetector(

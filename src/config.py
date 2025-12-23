@@ -4,21 +4,19 @@ import torch.nn as nn
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ============== DataLoader Configuration ==============
-# num_workers: Parallel data loading processes
-# - Set to 0 on Windows if you get multiprocessing errors
-# - Set to 2-4 on Linux for parallel loading
-# - Higher values = more RAM usage but faster loading
-#num_workers = min(4, max(0, torch.cuda.device_count() * 2)) if torch.cuda.is_available() else 0
-num_workers = 4  # Increased from 2 to reduce data loading bottleneck
-
-# pin_memory: Faster CPU→GPU transfer (only useful with CUDA)
-pin_memory = torch.cuda.is_available()
-
-# prefetch_factor: How many batches to prefetch per worker
-# Higher values improve GPU utilization but use more RAM
-prefetch_factor = 8 if num_workers > 0 else None  # Increased from 4 to keep GPU fed
-
+pin_memory = torch.cuda.is_available()  # Faster CPU→GPU transfer (CUDA only)
 debug_mode = False
+
+# GCN/GAT Model DataLoader Settings
+gcn_num_workers = 4  # Parallel data loading for GCN (0 on Windows if multiprocessing errors)
+gcn_prefetch_factor = 8 if gcn_num_workers > 0 else None  # Batches to prefetch per worker (higher = better GPU utilization)
+
+gat_num_workers = 4  # Parallel data loading for GAT (same as GCN, attention layers tolerate latency)
+gat_prefetch_factor = 8 if gat_num_workers > 0 else None  # Batches to prefetch per worker
+
+# VectorNet Model DataLoader Settings
+vectornet_num_workers = 6  # Higher for VectorNet (larger batches, more preprocessing per sample)
+vectornet_prefetch_factor = 10 if vectornet_num_workers > 0 else None  # More prefetch for polyline encoding overhead
 
 # ============== Memory Optimization ==============
 # Gradient checkpointing: Trade compute for memory (useful for large models/sequences)
@@ -232,16 +230,11 @@ gat_checkpoint_dir_autoreg = 'checkpoints/gat'  # GAT autoregressive checkpoints
 gat_viz_dir = 'visualizations/autoreg/gat'          # GAT training visualizations
 gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualizations
 
-# training:
-# batch_size: Number of scenarios processed in parallel
-# - For 8GB GPU: use 2 (GAT uses more memory than GCN due to attention)
-# - For 16GB GPU: use 4-8
-# - For 24GB+ GPU: use 8-16
-# - For 48GB GPU (RTX 6000): use 32-64 for high GPU utilization
-batch_size = 48  # Increased from 32 to maximize RTX 6000 48GB utilization
-learning_rate = 0.001
-epochs = 20
-gradient_clip_value = 1.0
+# ============== GCN/GAT Training Configuration ==============
+batch_size = 48  # GCN/GAT batch size (48 for RTX 6000 48GB)
+learning_rate = 0.001  # Initial learning rate
+epochs = 20  # Training epochs
+gradient_clip_value = 1.0  # Gradient clipping threshold (prevents exploding gradients)
 # Learning rate scheduler settings
 scheduler_patience = 5  # Wait 5 epochs before reducing LR
 scheduler_factor = 0.5  # Reduce LR by 50% when triggered
@@ -289,3 +282,62 @@ autoreg_viz_dir = 'visualizations/autoreg'  # Directory for autoregressive visua
 autoreg_viz_dir_finetune = 'visualizations/autoreg/finetune'  # GCN finetuning visualizations
 autoreg_viz_dir_finetune_gat = 'visualizations/autoreg/finetune/gat'  # GAT finetuning visualizations
 autoreg_skip_map_features = False    # Skip loading scenario map features for visualization (faster but no roads)
+
+# ============== VectorNet Model Configuration ==============
+# VectorNet predicts FULL trajectory at once (not autoregressive like GCN/GAT)
+# Uses polyline encoding of agent trajectories and map features
+
+# Model Architecture
+vectornet_input_dim = 15                    # Same as GCN/GAT: 15 features per node
+vectornet_hidden_dim = 128                  # Hidden dimension (paper uses 64, we use 128)
+vectornet_output_dim = 2                    # (dx, dy) displacement prediction
+vectornet_num_polyline_layers = 3           # Polyline Subgraph Network layers
+vectornet_num_global_layers = 1             # Global Interaction Graph layers
+vectornet_num_heads = 8                     # Attention heads in global graph
+vectornet_num_gru_layers = 1                # GRU layers for VectorNetTemporal variant
+vectornet_dropout = 0.1                     # Dropout rate
+vectornet_use_node_completion = True        # Auxiliary task (like BERT masking)
+vectornet_node_completion_ratio = 0.15      # Fraction of nodes to mask
+vectornet_node_completion_weight = 1.0      # Loss weight for auxiliary task
+
+# Prediction Settings
+vectornet_mode = 'multi_step'               # 'multi_step' (full trajectory at once)
+vectornet_prediction_horizon = 50           # Future timesteps to predict (5.0s)
+vectornet_history_length = 10               # Past timesteps to encode (1.0s)
+vectornet_num_agents_to_predict = 8         # Limit predictions per scenario (None = all)
+
+# Training Hyperparameters
+vectornet_batch_size = 48                   # Scenarios per batch
+vectornet_learning_rate = 0.001             # Initial learning rate
+vectornet_epochs = 30                       # Training epochs
+vectornet_gradient_clip = 1.0               # Gradient clipping threshold
+vectornet_scheduler_patience = 5            # LR scheduler patience
+vectornet_scheduler_factor = 0.5            # LR reduction factor
+vectornet_min_lr = 1e-6                     # Minimum learning rate
+vectornet_early_stopping_patience = 10      # Early stopping patience
+vectornet_early_stopping_min_delta = 0.001  # Minimum improvement threshold
+
+# Loss Weights
+vectornet_loss_alpha = 0.2                  # Angle loss weight
+vectornet_loss_beta = 0.5                   # MSE loss weight (primary)
+vectornet_loss_gamma = 0.1                  # Velocity consistency weight
+vectornet_loss_delta = 0.2                  # Cosine similarity weight
+
+# Dataset Settings
+vectornet_sequence_length = 90              # Max sequence length in dataset
+vectornet_max_validation_scenarios = 20     # Sample size for validation
+vectornet_cache_validation = True           # Cache validation data in RAM
+
+# Paths
+vectornet_checkpoint_dir = 'checkpoints/vectornet'
+vectornet_checkpoint_prefix = 'vectornet'
+vectornet_best_model = 'best_vectornet_model.pt'
+vectornet_final_model = 'final_vectornet_model.pt'
+vectornet_viz_dir = 'visualizations/autoreg/vectornet'
+vectornet_visualize_every_n_epochs = 5
+vectornet_viz_scenarios = 5
+
+# W&B Configuration
+vectornet_wandb_project = project_name
+vectornet_wandb_name = 'vectornet-training'
+vectornet_wandb_tags = ['vectornet', 'waymo', 'trajectory-prediction']

@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, num_workers, num_layers, num_gru_layers, epochs,
+from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_layers, epochs,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     gradient_clip_value, checkpoint_dir_autoreg, checkpoint_dir, use_edge_weights,

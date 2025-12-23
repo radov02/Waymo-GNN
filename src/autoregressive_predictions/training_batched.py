@@ -73,7 +73,7 @@ def get_viz_executor():
     return _viz_executor
 from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
+from config import (device, gcn_num_workers, num_layers, num_gru_layers, epochs, 
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, debug_mode,
@@ -81,7 +81,7 @@ from config import (device, num_workers, num_layers, num_gru_layers, epochs,
                     checkpoint_dir, scheduler_patience, scheduler_factor, min_lr,
                     early_stopping_patience, early_stopping_min_delta,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
-                    print_gpu_info, pin_memory, prefetch_factor, use_amp, use_bf16,
+                    print_gpu_info, pin_memory, gcn_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
                     max_validation_scenarios, cache_validation_data)
 from torch.utils.data import DataLoader, Subset
@@ -589,13 +589,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             val_dataset, 
             batch_size=batch_size,
             shuffle=False, 
-            num_workers=num_workers,
+            num_workers=gcn_num_workers,
             collate_fn=collate_graph_sequences_to_batch, 
             drop_last=False,
             pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True if num_workers > 0 else False,
-            worker_init_fn=worker_init_fn if num_workers > 0 else None
+            prefetch_factor=gcn_prefetch_factor,
+            persistent_workers=True if gcn_num_workers > 0 else False,
+            worker_init_fn=worker_init_fn if gcn_num_workers > 0 else None
         )
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
@@ -605,13 +605,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         dataset, 
         batch_size=batch_size,  # KEY: Process multiple scenarios in parallel!
         shuffle=True, 
-        num_workers=num_workers,
+        num_workers=gcn_num_workers,
         collate_fn=collate_graph_sequences_to_batch, 
         drop_last=True,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None
+        prefetch_factor=gcn_prefetch_factor,
+        persistent_workers=True if gcn_num_workers > 0 else False,
+        worker_init_fn=worker_init_fn if gcn_num_workers > 0 else None
     )
 
     overfit_detector = OverfittingDetector(

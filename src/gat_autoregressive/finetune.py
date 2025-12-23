@@ -27,14 +27,14 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
+from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name, epochs,
                     gradient_clip_value, gat_num_heads,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
                     autoreg_visualize_every_n_epochs, autoreg_viz_dir_finetune_gat,
-                    pin_memory, prefetch_factor, use_amp,
+                    pin_memory, gat_prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz)
 from torch.utils.data import DataLoader, Subset

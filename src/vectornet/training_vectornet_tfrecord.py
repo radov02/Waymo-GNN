@@ -61,73 +61,94 @@ from vectornet_tfrecord_dataset import (
     create_vectornet_dataloaders
 )
 
+# Import configuration from centralized config.py
+from config import (
+    device, vectornet_num_workers, pin_memory, vectornet_prefetch_factor,
+    use_amp, use_bf16, use_torch_compile, torch_compile_mode,
+    use_gradient_checkpointing, print_gpu_info, setup_model_parallel, get_model_for_saving,
+    project_name, dataset_name,
+    vectornet_input_dim, vectornet_hidden_dim, vectornet_output_dim,
+    vectornet_num_polyline_layers, vectornet_num_global_layers,
+    vectornet_num_heads, vectornet_dropout,
+    vectornet_use_node_completion, vectornet_node_completion_ratio, vectornet_node_completion_weight,
+    vectornet_mode, vectornet_prediction_horizon, vectornet_history_length,
+    vectornet_num_agents_to_predict,
+    vectornet_batch_size, vectornet_learning_rate, vectornet_epochs, vectornet_gradient_clip,
+    vectornet_scheduler_patience, vectornet_scheduler_factor, vectornet_min_lr,
+    vectornet_early_stopping_patience, vectornet_early_stopping_min_delta,
+    vectornet_loss_alpha, vectornet_loss_beta, vectornet_loss_gamma, vectornet_loss_delta,
+    vectornet_checkpoint_dir, vectornet_best_model, vectornet_final_model,
+    vectornet_viz_dir, vectornet_visualize_every_n_epochs, vectornet_viz_scenarios,
+    vectornet_wandb_project, vectornet_wandb_name, vectornet_wandb_tags
+)
+
 
 # ============== Configuration ==============
 class Config:
-    """Training configuration."""
+    """Training configuration - uses values from config.py."""
     
     # Data
     data_dir: str = os.path.join(os.path.dirname(__file__), 'data')
-    history_len: int = 10
-    future_len: int = 50
+    history_len: int = vectornet_history_length
+    future_len: int = vectornet_prediction_horizon
     max_train_scenarios: int = None  # None = all
-    max_val_scenarios: int = 1000
-    num_agents_to_predict: int = 8  # Number of agents per scenario to predict (None = all)
+    max_val_scenarios: int = vectornet_viz_scenarios * 20  # More scenarios for validation
+    num_agents_to_predict: int = vectornet_num_agents_to_predict
     
     # Model
-    hidden_dim: int = 128
-    num_polyline_layers: int = 3
-    num_global_layers: int = 1
-    num_heads: int = 8
-    dropout: float = 0.1
-    use_node_completion: bool = True
-    node_completion_ratio: float = 0.15
+    hidden_dim: int = vectornet_hidden_dim
+    num_polyline_layers: int = vectornet_num_polyline_layers
+    num_global_layers: int = vectornet_num_global_layers
+    num_heads: int = vectornet_num_heads
+    dropout: float = vectornet_dropout
+    use_node_completion: bool = vectornet_use_node_completion
+    node_completion_ratio: float = vectornet_node_completion_ratio
     
     # Training
-    batch_size: int = 32
-    num_workers: int = 8  # Increased for faster data loading
-    learning_rate: float = 1e-3
+    batch_size: int = vectornet_batch_size
+    num_workers: int = vectornet_num_workers
+    learning_rate: float = vectornet_learning_rate
     weight_decay: float = 1e-5
-    epochs: int = 100
-    gradient_clip: float = 1.0
+    epochs: int = vectornet_epochs
+    gradient_clip: float = vectornet_gradient_clip
     warmup_epochs: int = 5
     
     # Loss weights
-    loss_alpha: float = 0.2   # Angular error
-    loss_beta: float = 0.5    # MSE
-    loss_gamma: float = 0.1   # Velocity consistency  
-    loss_delta: float = 0.2   # Endpoint error
-    node_completion_weight: float = 1.0
+    loss_alpha: float = vectornet_loss_alpha
+    loss_beta: float = vectornet_loss_beta
+    loss_gamma: float = vectornet_loss_gamma
+    loss_delta: float = vectornet_loss_delta
+    node_completion_weight: float = vectornet_node_completion_weight
     
     # Scheduler
     scheduler_type: str = 'cosine'  # 'cosine' or 'onecycle'
-    scheduler_patience: int = 10
-    scheduler_factor: float = 0.5
-    min_lr: float = 1e-6
+    scheduler_patience: int = vectornet_scheduler_patience
+    scheduler_factor: float = vectornet_scheduler_factor
+    min_lr: float = vectornet_min_lr
     
     # Early stopping
-    early_stopping_patience: int = 15
-    early_stopping_min_delta: float = 0.001
+    early_stopping_patience: int = vectornet_early_stopping_patience
+    early_stopping_min_delta: float = vectornet_early_stopping_min_delta
     
     # Logging
-    wandb_project: str = 'waymo-vectornet-tfrecord'
-    wandb_name: str = None  # Auto-generated
+    wandb_project: str = vectornet_wandb_project
+    wandb_name: str = vectornet_wandb_name
     
     # Checkpoints
-    checkpoint_dir: str = 'checkpoints/vectornet'
+    checkpoint_dir: str = vectornet_checkpoint_dir
     save_every: int = 5
     
     # Visualization
-    viz_dir: str = 'visualizations/autoreg/vectornet'
-    visualize_every_n_epochs: int = 1  # Visualize every epoch
+    viz_dir: str = vectornet_viz_dir
+    visualize_every_n_epochs: int = vectornet_visualize_every_n_epochs
     
     # Device
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    use_amp: bool = True
-    amp_dtype: str = 'float16'  # 'float16' or 'bfloat16'
+    device: str = str(device)
+    use_amp: bool = use_amp
+    amp_dtype: str = 'bfloat16' if use_bf16 else 'float16'
     
     # Parallelization
-    use_torch_compile: bool = False  # Disabled - causes slowdown with dynamic shapes
+    use_torch_compile: bool = use_torch_compile
     gradient_accumulation_steps: int = 1  # Accumulate gradients for larger effective batch
     persistent_workers: bool = True  # Keep workers alive between epochs
 
@@ -843,7 +864,7 @@ def main():
         collate_fn=vectornet_collate_fn,
         pin_memory=True,
         persistent_workers=config.persistent_workers and config.num_workers > 0,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        prefetch_factor=vectornet_prefetch_factor if config.num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
@@ -854,7 +875,7 @@ def main():
         collate_fn=vectornet_collate_fn,
         pin_memory=True,
         persistent_workers=config.persistent_workers and config.num_workers > 0,
-        prefetch_factor=2 if config.num_workers > 0 else None,
+        prefetch_factor=vectornet_prefetch_factor if config.num_workers > 0 else None,
     )
     
     # Create model

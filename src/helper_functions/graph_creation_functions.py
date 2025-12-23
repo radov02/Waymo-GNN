@@ -6,7 +6,7 @@ import time
 import math
 import numpy as np
 import tensorflow as tf
-from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
+from config import batch_size, gcn_num_workers, sequence_length, radius, graph_creation_method
 from torch_geometric.data import Data, Batch
 from torch.utils.data import DataLoader
 
@@ -644,11 +644,11 @@ def test_hdf5_and_lazy_loading(path):
         dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers,
+        num_workers=gcn_num_workers,
         collate_fn=collate_graph_sequences_to_batch,
         drop_last=True
     )
-    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
+    print(f"DataLoader config: batch_size={batch_size}, num_workers={gcn_num_workers}, shuffle=False")
     print(f"Expected batches: ~{len(dataset) // batch_size}")
     print(f"Each batch contains {batch_size} different scenarios, each with {sequence_length} timesteps\n")
 

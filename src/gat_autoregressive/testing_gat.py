@@ -1,10 +1,20 @@
 """Testing script for GAT-based autoregressive trajectory prediction.
 
-This module evaluates trained GAT models using autoregressive multi-step prediction.
+This module evaluates trained GAT models using autoregressive multi-step prediction
+on the test set, logs metrics to wandb, and creates visualizations.
+
+Usage:
+    python src/gat_autoregressive/testing_gat.py
+    python src/gat_autoregressive/testing_gat.py --checkpoint path/to/model.pt
+    python src/gat_autoregressive/testing_gat.py --max_scenarios 50 --no_wandb
 """
 
 import sys
 import os
+import argparse
+from datetime import datetime
+import json
+
 # Add parent directory (src/) to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,12 +25,14 @@ matplotlib.use('Agg')
 import torch
 import numpy as np
 import torch.nn.functional as F
-from SpatioTemporalGAT import SpatioTemporalGAT
+import wandb
+from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, num_workers, num_layers, num_gru_layers,
+from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
-                    dropout,
-                    num_gpus, use_data_parallel, setup_model_parallel, load_model_state)
+                    dropout, gat_num_heads, project_name, print_gpu_info,
+                    num_gpus, use_data_parallel, setup_model_parallel, load_model_state,
+                    use_gradient_checkpointing)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from helper_functions.helpers import compute_metrics
@@ -28,9 +40,10 @@ from helper_functions.visualization_functions import (load_scenario_by_id, draw_
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 import matplotlib.pyplot as plt
 
-# PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing.py
+# PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing_gat.py
 
-# GAT-specific directories
+# ============== TESTING CONFIGURATION ==============
+TEST_HDF5_PATH = './data/graphs/testing/testing.hdf5'
 CHECKPOINT_DIR = 'checkpoints/gat'
 CHECKPOINT_DIR_AUTOREG = 'checkpoints/gat/autoregressive'
 VIZ_DIR = 'visualizations/autoreg/gat/testing'
@@ -47,22 +60,24 @@ def load_trained_model(checkpoint_path, device):
     print(f"Loading GAT model from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    config = checkpoint['config']
-    model = SpatioTemporalGAT(
-        input_dim=config['input_dim'],
-        hidden_dim=config['hidden_channels'],
-        output_dim=config.get('output_dim', 2),
-        num_gat_layers=config['num_layers'],
-        num_gru_layers=config.get('num_gru_layers', 1),
-        dropout=config['dropout'],
-        num_heads=config.get('num_heads', 4)
+    config = checkpoint.get('config', {})
+    model = SpatioTemporalGATBatched(
+        input_dim=config.get('input_dim', input_dim),
+        hidden_dim=config.get('hidden_channels', hidden_channels),
+        output_dim=config.get('output_dim', output_dim),
+        num_gat_layers=config.get('num_layers', num_layers),
+        num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+        dropout=config.get('dropout', dropout),
+        num_heads=config.get('num_heads', gat_num_heads),
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        max_agents_per_scenario=128
     )
     
     model, is_parallel = setup_model_parallel(model, device)
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     model.eval()
     
-    print(f"✓ GAT Model loaded from epoch {checkpoint['epoch']}")
+    print(f"✓ GAT Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_loss' in checkpoint:
         print(f"  Validation loss: {checkpoint['val_loss']:.6f}")
     if 'train_loss' in checkpoint:
@@ -409,13 +424,46 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     return avg_error
 
 
-def run_testing(test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
+def run_testing(test_dataset_path=TEST_HDF5_PATH,
                 checkpoint_path=None,
                 num_rollout_steps=20,
                 max_scenarios=None,
                 visualize=True,
-                visualize_max=10):
-    """Run testing with autoregressive multi-step prediction using GAT model."""
+                visualize_max=10,
+                use_wandb=True):
+    """Run testing with autoregressive multi-step prediction using GAT model.
+    
+    Args:
+        test_dataset_path: Path to test HDF5 file
+        checkpoint_path: Path to model checkpoint (default: auto-detect best)
+        num_rollout_steps: Number of autoregressive rollout steps
+        max_scenarios: Maximum scenarios to evaluate (None = all)
+        visualize: Whether to generate visualizations
+        visualize_max: Maximum scenarios to visualize
+        use_wandb: Whether to log results to wandb
+    """
+    print("\n" + "="*70)
+    print("GAT MODEL TESTING - Autoregressive Multi-Step Prediction")
+    print("="*70)
+    
+    # Print GPU info
+    print_gpu_info()
+    
+    # Initialize wandb
+    if use_wandb:
+        wandb.login()
+        run = wandb.init(
+            project=project_name,
+            name=f"gat-testing-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            config={
+                "model_type": "gat",
+                "task": "testing",
+                "num_rollout_steps": num_rollout_steps,
+                "max_scenarios": max_scenarios,
+                "test_dataset": test_dataset_path,
+            },
+            tags=["gat", "testing", "autoregressive"]
+        )
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
@@ -432,19 +480,26 @@ def run_testing(test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
             print(f"ERROR: No GAT checkpoint found!")
             print(f"  Checked: {autoreg_path}")
             print(f"  Checked: {base_path}")
-            exit(1)
+            if use_wandb:
+                wandb.finish(exit_code=1)
+            return None
     
     # Load model
     model, checkpoint = load_trained_model(checkpoint_path, device)
     
+    if use_wandb:
+        wandb.config.update({"checkpoint_path": checkpoint_path})
+    
     # Load test dataset
-    try:
-        test_dataset = HDF5ScenarioDataset(test_dataset_path, seq_len=sequence_length)
-        print(f"\n✓ Loaded test dataset: {len(test_dataset)} scenarios")
-    except FileNotFoundError:
+    if not os.path.exists(test_dataset_path):
         print(f"ERROR: {test_dataset_path} not found!")
         print("Please run graph_creation_and_saving.py to create test data.")
-        exit(1)
+        if use_wandb:
+            wandb.finish(exit_code=1)
+        return None
+    
+    test_dataset = HDF5ScenarioDataset(test_dataset_path, seq_len=sequence_length)
+    print(f"\n✓ Loaded test dataset: {len(test_dataset)} scenarios")
     
     test_dataloader = DataLoader(
         test_dataset,
@@ -462,11 +517,13 @@ def run_testing(test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Rollout steps: {effective_rollout} ({effective_rollout * 0.1:.1f}s)")
     print(f"  Max scenarios: {max_scenarios if max_scenarios else 'all'}")
+    print(f"  W&B logging: {use_wandb}")
     
     # Create visualization directory
     os.makedirs(VIZ_DIR, exist_ok=True)
     
     # Run evaluation with visualization
+    viz_images = []
     if visualize:
         print(f"\nGenerating visualizations (max {visualize_max} scenarios)...")
         viz_count = 0
@@ -480,33 +537,109 @@ def run_testing(test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
             if ade is not None:
                 total_ade += ade
                 viz_count += 1
+                
+                # Log visualization to wandb
+                if use_wandb:
+                    scenario_ids = batch_dict.get("scenario_ids", [])
+                    scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{batch_idx}"
+                    save_path = os.path.join(VIZ_DIR, f'gat_test_scenario_{batch_idx:04d}_{scenario_id}.png')
+                    if os.path.exists(save_path):
+                        viz_images.append(wandb.Image(save_path, caption=f"Scenario {scenario_id} (ADE: {ade:.2f}m)"))
         
         if viz_count > 0:
             print(f"\nVisualization Summary:")
             print(f"  Scenarios visualized: {viz_count}")
             print(f"  Average ADE: {total_ade / viz_count:.2f}m")
             print(f"  Saved to: {VIZ_DIR}")
+            
+            if use_wandb and viz_images:
+                wandb.log({"test_visualizations": viz_images})
     
     # Run full evaluation
     results = evaluate_autoregressive(
         model, test_dataloader, effective_rollout, device, max_scenarios
     )
     
+    # Log results to wandb
+    if use_wandb and results:
+        wandb_log = {"test/num_scenarios": len(results.get('scenarios', []))}
+        
+        for horizon_key, metrics in results.get('horizons', {}).items():
+            wandb_log[f"test/{horizon_key}/ade_mean"] = metrics['ade_mean']
+            wandb_log[f"test/{horizon_key}/ade_std"] = metrics['ade_std']
+            wandb_log[f"test/{horizon_key}/fde_mean"] = metrics['fde_mean']
+            wandb_log[f"test/{horizon_key}/fde_std"] = metrics['fde_std']
+            wandb_log[f"test/{horizon_key}/angle_error_mean"] = metrics['angle_error_mean']
+            wandb_log[f"test/{horizon_key}/cosine_sim_mean"] = metrics['cosine_sim_mean']
+        
+        wandb.log(wandb_log)
+        
+        # Log summary metrics
+        if '5.0s' in results.get('horizons', {}):
+            wandb.run.summary["final_ade_5s"] = results['horizons']['5.0s']['ade_mean']
+            wandb.run.summary["final_fde_5s"] = results['horizons']['5.0s']['fde_mean']
+        elif '2.0s' in results.get('horizons', {}):
+            wandb.run.summary["final_ade_2s"] = results['horizons']['2.0s']['ade_mean']
+            wandb.run.summary["final_fde_2s"] = results['horizons']['2.0s']['fde_mean']
+    
     # Save results
-    results_path = os.path.join(CHECKPOINT_DIR_AUTOREG, 'test_results.pt')
-    os.makedirs(CHECKPOINT_DIR_AUTOREG, exist_ok=True)
+    results_path = os.path.join(CHECKPOINT_DIR, 'gat_test_results.pt')
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     torch.save(results, results_path)
     print(f"\n✓ Results saved to {results_path}")
+    
+    # Also save as JSON for easy reading
+    json_results = {
+        'model_type': 'gat',
+        'checkpoint': checkpoint_path,
+        'test_dataset': test_dataset_path,
+        'num_scenarios': len(results.get('scenarios', [])),
+        'horizons': results.get('horizons', {}),
+        'timestamp': datetime.now().isoformat()
+    }
+    json_path = os.path.join(CHECKPOINT_DIR, 'gat_test_results.json')
+    with open(json_path, 'w') as f:
+        json.dump(json_results, f, indent=2)
+    print(f"✓ JSON results saved to {json_path}")
+    
+    if use_wandb:
+        wandb.finish()
+    
+    return results
+
+
+def main():
+    """Main entry point with argument parsing."""
+    parser = argparse.ArgumentParser(description='GAT Model Testing - Autoregressive Multi-Step Prediction')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint (default: auto-detect best)')
+    parser.add_argument('--test_data', type=str, default=TEST_HDF5_PATH,
+                        help='Path to test HDF5 file')
+    parser.add_argument('--num_rollout_steps', type=int, default=20,
+                        help='Number of autoregressive rollout steps (default: 20 = 2s)')
+    parser.add_argument('--max_scenarios', type=int, default=None,
+                        help='Maximum scenarios to evaluate (default: all)')
+    parser.add_argument('--visualize_max', type=int, default=10,
+                        help='Maximum scenarios to visualize (default: 10)')
+    parser.add_argument('--no_visualize', action='store_true',
+                        help='Disable visualization generation')
+    parser.add_argument('--no_wandb', action='store_true',
+                        help='Disable wandb logging')
+    
+    args = parser.parse_args()
+    
+    results = run_testing(
+        test_dataset_path=args.test_data,
+        checkpoint_path=args.checkpoint,
+        num_rollout_steps=args.num_rollout_steps,
+        max_scenarios=args.max_scenarios,
+        visualize=not args.no_visualize,
+        visualize_max=args.visualize_max,
+        use_wandb=not args.no_wandb
+    )
     
     return results
 
 
 if __name__ == '__main__':
-    results = run_testing(
-        test_dataset_path="./data/graphs/testing/testing_seqlen90.hdf5",
-        checkpoint_path=None,
-        num_rollout_steps=20,
-        max_scenarios=10,
-        visualize=True,
-        visualize_max=4
-    )
+    main()
