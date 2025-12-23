@@ -173,7 +173,7 @@ def load_pretrained_model(checkpoint_path, device):
     return model, is_parallel, checkpoint
 
 
-def update_graph_with_prediction(graph, pred_displacement, device):
+def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5):
     """
     Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
     
@@ -187,6 +187,13 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
+    
+    Args:
+        graph: PyG Data object with node features and positions
+        pred_displacement: Predicted normalized displacement [N, 2]
+        device: Torch device
+        velocity_smoothing: EMA smoothing factor for velocity updates (0=no smoothing, 1=full smoothing)
+                           Higher values = more conservative updates, helps stabilize early training
     
     NOTE: Previously we preserved velocity features, but this caused trajectory convergence
     because the model learned to ignore velocity and predict an "average" displacement.
@@ -231,24 +238,35 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
     
     # New velocity from predictions
-    new_vx_norm = pred_displacement[:, 0] * velocity_scale
-    new_vy_norm = pred_displacement[:, 1] * velocity_scale
+    new_vx_norm_raw = pred_displacement[:, 0] * velocity_scale
+    new_vy_norm_raw = pred_displacement[:, 1] * velocity_scale
     
     # Clamp to reasonable ranges (normalized values)
-    # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s, 2.0 = 60 m/s
-    new_vx_norm = torch.clamp(new_vx_norm, -2.0, 2.0)
-    new_vy_norm = torch.clamp(new_vy_norm, -2.0, 2.0)
+    # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
+    # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
+    max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
+    new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
+    new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
     
-    # Calculate speed and heading
+    # Apply EMA smoothing to prevent sudden velocity jumps
+    # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
+    # Higher smoothing = more conservative updates (better for early training)
+    new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
+    new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
+    
+    # Calculate speed and heading from smoothed velocity
     new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
     new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
     
-    # Calculate acceleration from velocity change
+    # Calculate acceleration from velocity change (using smoothed values)
+    # acceleration = (new_v - old_v) / dt
+    # But we need to be careful: if smoothing is high, acceleration should be low
     accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
     ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
     ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
-    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
+    # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
+    ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
+    ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
     
     # Update velocity/acceleration features
     updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
@@ -357,12 +375,31 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear'):
 
 
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
-                                     is_parallel, save_dir=None):
-    """Visualize autoregressive rollout predictions vs ground truth."""
+                                     is_parallel, save_dir=None, total_epochs=40):
+    """Visualize autoregressive rollout predictions vs ground truth.
+    
+    Args:
+        model: The GAT model
+        batch_dict: Batch dictionary with graph sequences
+        epoch: Current epoch (0-indexed)
+        num_rollout_steps: Number of autoregressive steps to roll out
+        device: Torch device
+        is_parallel: Whether model is DataParallel wrapped
+        save_dir: Directory to save visualizations
+        total_epochs: Total number of epochs (for computing velocity smoothing)
+    """
     if save_dir is None:
         save_dir = VIZ_DIR
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
+    
+    # Compute adaptive velocity smoothing based on epoch
+    # Early epochs: high smoothing (0.8) to prevent instability
+    # Later epochs: low smoothing (0.2) to allow model's predictions to drive dynamics
+    progress = epoch / max(1, total_epochs - 1)
+    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
+    print(f"  [VIZ] Velocity smoothing: {velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
     
     base_model = model.module if is_parallel else model
     
@@ -619,7 +656,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             print(f"  [DEBUG VIZ] Step {step}, Agent {agent_id}: disp={pred_disp[global_idx]}, new_pos={new_pos}")
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
             
-            graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device)
+            graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, velocity_smoothing=velocity_smoothing)
             
             # DEBUG: Print feature changes after update for first few steps
             if step < 5 and len(pred_scenario_indices) > 0:
@@ -666,6 +703,24 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             growth_10 = horizon_errors[min(9, len(horizon_errors)-1)] / horizon_errors[0] if len(horizon_errors) > 9 else None
             if growth_10:
                 print(f"    Error growth (step 1 → 10): {growth_10:.1f}x")
+    
+    # Print per-agent final errors to identify outliers
+    final_t = start_t + actual_rollout_steps
+    agent_final_errors = []
+    for agent_id, traj in agent_trajectories.items():
+        gt_at_final = [pos for t, pos in traj['gt'] if t == final_t]
+        pred_at_final = [pos for t, pos in traj['pred'] if t == final_t]
+        if gt_at_final and pred_at_final:
+            error = np.sqrt(((gt_at_final[0] - pred_at_final[0]) ** 2).sum())
+            agent_final_errors.append((agent_id, error))
+    
+    if agent_final_errors:
+        agent_final_errors.sort(key=lambda x: x[1], reverse=True)
+        print(f"  [PER-AGENT] Final errors (top 5 worst / total {len(agent_final_errors)} agents):")
+        for i, (agent_id, error) in enumerate(agent_final_errors[:5]):
+            print(f"    Agent {agent_id}: {error:.2f}m")
+        if len(agent_final_errors) > 5:
+            print(f"    ... best: {agent_final_errors[-1][1]:.2f}m, median: {agent_final_errors[len(agent_final_errors)//2][1]:.2f}m")
     
     # Select agents to visualize
     max_agents_viz = 10
@@ -813,10 +868,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
 
 
 def train_epoch_autoregressive(model, dataloader, optimizer, device, 
-                               sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0):
+                               sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0, total_epochs=40):
     """Train one epoch with scheduled sampling for autoregressive prediction (with optional AMP).
     
     Processes multiple scenarios in parallel using PyG's batching mechanism.
+    Uses adaptive velocity smoothing to stabilize early training.
     """
     model.train()
     total_loss = 0.0
@@ -824,6 +880,16 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_cosine = 0.0
     steps = 0
     count = 0
+    
+    # Compute adaptive velocity smoothing based on epoch
+    # Early epochs: high smoothing (0.8) to prevent instability
+    # Later epochs: low smoothing (0.2) to allow model's predictions to drive dynamics
+    progress = epoch / max(1, total_epochs - 1)
+    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
+    
+    if epoch == 0 or epoch % 10 == 0:
+        print(f"  [Velocity Smoothing] Using smoothing={velocity_smoothing:.2f} (progress={progress:.2f})")
     
     base_model = model.module if is_parallel else model
     use_amp_local = scaler is not None and torch.cuda.is_available()
@@ -1062,7 +1128,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         # This lets the model learn to correct its own errors across multiple steps
                         # Memory usage increases but learning is much faster
                         graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred, device  # No .detach() - enables BPTT
+                            graph_for_prediction, pred, device,  # No .detach() - enables BPTT
+                            velocity_smoothing=velocity_smoothing
                         )
                         is_using_predicted_positions = True  # Now we're using predicted positions
                     else:
@@ -1124,14 +1191,22 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     }
 
 
-def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel):
-    """Evaluate GAT model with full autoregressive rollout (no teacher forcing)."""
+def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel, epoch=0, total_epochs=40):
+    """Evaluate GAT model with full autoregressive rollout (no teacher forcing).
+    
+    Uses adaptive velocity smoothing based on training epoch.
+    """
     model.eval()
     total_loss = 0.0
     total_mse = 0.0
     total_cosine = 0.0
     steps = 0
     count = 0
+    
+    # Compute adaptive velocity smoothing based on epoch
+    progress = epoch / max(1, total_epochs - 1)
+    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
     
     horizon_mse = [0.0] * num_rollout_steps
     horizon_cosine = [0.0] * num_rollout_steps
@@ -1252,7 +1327,8 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     
                     if step < num_rollout_steps - 1:
                         graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred, device
+                            graph_for_prediction, pred, device,
+                            velocity_smoothing=velocity_smoothing
                         )
                         is_using_predicted_positions = True  # Now we're using predicted positions
                 
@@ -1469,7 +1545,7 @@ def run_autoregressive_finetuning(
         
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 
-            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch
+            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch, total_epochs=num_epochs
         )
         
         # Skip validation - evaluate autoregressive performance via visualization on training data
@@ -1510,7 +1586,7 @@ def run_autoregressive_finetuning(
                         break
                     result = visualize_autoregressive_rollout(
                         model, viz_batch, epoch, num_rollout_steps, 
-                        device, is_parallel, save_dir=VIZ_DIR
+                        device, is_parallel, save_dir=VIZ_DIR, total_epochs=num_epochs
                     )
                     if isinstance(result, tuple):
                         filepath, final_error = result
