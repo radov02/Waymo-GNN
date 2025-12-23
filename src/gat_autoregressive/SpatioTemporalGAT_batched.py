@@ -214,8 +214,11 @@ class SpatioTemporalGATBatched(nn.Module):
                 batch_size=None, batch_num=-1, timestep=-1, agent_ids=None):
         """Forward pass for one timestep with batched scenarios.
         
-        CRITICAL: Now tracks GRU hidden states PER AGENT using agent_ids.
-        Each agent maintains its own temporal memory regardless of order in batch.
+        EFFICIENT VECTORIZED VERSION with per-agent hidden state tracking.
+        
+        Key insight: We use to_dense_batch to group by scenario, then track hidden
+        states using a hash of (scenario_idx, agent_id) mapped to a contiguous index.
+        This allows vectorized GRU processing while maintaining per-agent memory.
         
         Args:
             x: Node features [total_nodes, input_dim] (concatenated from B scenarios)
@@ -235,64 +238,57 @@ class SpatioTemporalGATBatched(nn.Module):
         
         # Handle single-scenario case (backward compatible)
         if batch is None or batch_size is None or batch_size == 1:
-            return self._forward_single_scenario(x, edge_index, batch_num, timestep)
+            return self._forward_single_scenario(x, edge_index, batch_num, timestep, agent_ids)
         
-        # ===== BATCHED MULTI-SCENARIO PROCESSING WITH PER-AGENT GRU =====
+        # ===== EFFICIENT BATCHED PROCESSING WITH PER-AGENT GRU =====
         
         # 1. Spatial encoding (already batched via PyG)
         # GAT processes all agents together, using graph structure for attention
         spatial_features = self.spatial_encoding(x, edge_index)
         
-        # 2. Process each agent through GRU individually with per-agent hidden states
-        # This ensures each agent maintains its own temporal memory
+        # 2. Build agent key mapping for hidden state tracking
+        # Create unique keys: (scenario_idx, agent_id) for each node
         batch_np = batch.cpu().numpy()
         
-        # Get or create hidden states for each agent
-        temporal_features_list = []
-        new_hidden_states = {}
-        
+        # Build agent keys and gather existing hidden states
+        agent_keys = []
         for node_idx in range(total_nodes):
             scenario_idx = int(batch_np[node_idx])
-            
-            # Get agent ID - use node_idx as fallback if agent_ids not provided
             if agent_ids is not None and node_idx < len(agent_ids):
                 agent_id = agent_ids[node_idx]
             else:
-                agent_id = node_idx  # Fallback: use node index (less robust)
-            
-            # Create unique key for this agent in this scenario
-            agent_key = (scenario_idx, agent_id)
-            
-            # Get or initialize hidden state for this agent
-            if agent_key in self.agent_hidden_states:
-                h_agent = self.agent_hidden_states[agent_key]
-            else:
-                # New agent - initialize with zeros
-                h_agent = torch.zeros(
-                    self.num_gru_layers, 1, self.hidden_dim,
-                    device=device, dtype=spatial_features.dtype
-                )
-            
-            # GRU forward for this agent: input [1, 1, hidden_dim]
-            agent_spatial = spatial_features[node_idx:node_idx+1].unsqueeze(0)  # [1, 1, hidden_dim]
-            agent_output, new_h = self.gru(agent_spatial, h_agent)
-            
-            # Store new hidden state (detached to prevent memory growth)
-            new_hidden_states[agent_key] = new_h.detach()
-            
-            # Collect temporal features
-            temporal_features_list.append(agent_output.squeeze(0).squeeze(0))  # [hidden_dim]
+                agent_id = node_idx  # Fallback
+            agent_keys.append((scenario_idx, agent_id))
         
-        # Update hidden states dictionary
-        self.agent_hidden_states = new_hidden_states
+        # 3. Gather hidden states into a tensor [num_layers, total_nodes, hidden_dim]
+        # Initialize with zeros for new agents, use existing for known agents
+        h_gathered = torch.zeros(
+            self.num_gru_layers, total_nodes, self.hidden_dim,
+            device=device, dtype=spatial_features.dtype
+        )
         
-        # Stack temporal features: [total_nodes, hidden_dim]
-        temporal_features = torch.stack(temporal_features_list, dim=0)
+        for node_idx, key in enumerate(agent_keys):
+            if key in self.agent_hidden_states:
+                h_gathered[:, node_idx, :] = self.agent_hidden_states[key].squeeze(1)
         
-        # 3. Skip connection: concatenate temporal features with original node features
+        # 4. VECTORIZED GRU forward: process all agents in parallel
+        # Input: [1, total_nodes, hidden_dim], Hidden: [num_layers, total_nodes, hidden_dim]
+        gru_input = spatial_features.unsqueeze(0)  # [1, total_nodes, hidden_dim]
+        gru_output, new_hidden = self.gru(gru_input, h_gathered)
+        
+        # 5. Scatter new hidden states back to dictionary (detached)
+        new_hidden_detached = new_hidden.detach()
+        self.agent_hidden_states = {}
+        for node_idx, key in enumerate(agent_keys):
+            # Store as [num_layers, 1, hidden_dim] for consistency
+            self.agent_hidden_states[key] = new_hidden_detached[:, node_idx:node_idx+1, :]
+        
+        temporal_features = gru_output.squeeze(0)  # [total_nodes, hidden_dim]
+        
+        # 6. Skip connection: concatenate temporal features with original node features
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         
-        # 4. Decode predictions
+        # 7. Decode predictions
         predictions = self.decoder(decoder_input)
         
         # Clamp to prevent explosive predictions
@@ -306,30 +302,69 @@ class SpatioTemporalGATBatched(nn.Module):
         
         return predictions
     
-    def _forward_single_scenario(self, x, edge_index, batch_num=-1, timestep=-1):
-        """Original single-scenario forward pass for backward compatibility."""
+    def _forward_single_scenario(self, x, edge_index, batch_num=-1, timestep=-1, agent_ids=None):
+        """Single-scenario forward pass with per-agent hidden state tracking.
+        
+        This version tracks hidden states per agent_id to handle agents entering/leaving.
+        Falls back to position-based tracking if agent_ids not provided.
+        """
         device = x.device
         num_nodes = x.size(0)
         
-        if self.gru_hidden is None or self.gru_hidden.size(1) != num_nodes:
-            self.gru_hidden = torch.zeros(
-                self.num_gru_layers,
-                num_nodes,
-                self.hidden_dim,
-                device=device
-            )
-        
-        if self.gru_hidden.device != device:
-            self.gru_hidden = self.gru_hidden.to(device)
-        
         spatial_features = self.spatial_encoding(x, edge_index)
-        gru_input = spatial_features.unsqueeze(0)
-        gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
-        self.gru_hidden = new_hidden.detach()
-        temporal_features = gru_output.squeeze(0)
+        
+        # If agent_ids provided, use per-agent hidden state tracking
+        if agent_ids is not None:
+            # Build agent keys (scenario_idx=0 for single scenario)
+            agent_keys = []
+            for node_idx in range(num_nodes):
+                if node_idx < len(agent_ids):
+                    agent_id = agent_ids[node_idx]
+                else:
+                    agent_id = node_idx
+                agent_keys.append((0, agent_id))  # scenario_idx=0
+            
+            # Gather hidden states
+            h_gathered = torch.zeros(
+                self.num_gru_layers, num_nodes, self.hidden_dim,
+                device=device, dtype=spatial_features.dtype
+            )
+            
+            for node_idx, key in enumerate(agent_keys):
+                if key in self.agent_hidden_states:
+                    h_gathered[:, node_idx, :] = self.agent_hidden_states[key].squeeze(1)
+            
+            # Vectorized GRU forward
+            gru_input = spatial_features.unsqueeze(0)
+            gru_output, new_hidden = self.gru(gru_input, h_gathered)
+            
+            # Scatter back to dictionary
+            new_hidden_detached = new_hidden.detach()
+            self.agent_hidden_states = {}
+            for node_idx, key in enumerate(agent_keys):
+                self.agent_hidden_states[key] = new_hidden_detached[:, node_idx:node_idx+1, :]
+            
+            temporal_features = gru_output.squeeze(0)
+        else:
+            # Legacy position-based tracking (for backward compatibility)
+            if self.gru_hidden is None or self.gru_hidden.size(1) != num_nodes:
+                self.gru_hidden = torch.zeros(
+                    self.num_gru_layers,
+                    num_nodes,
+                    self.hidden_dim,
+                    device=device
+                )
+            
+            if self.gru_hidden.device != device:
+                self.gru_hidden = self.gru_hidden.to(device)
+            
+            gru_input = spatial_features.unsqueeze(0)
+            gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
+            self.gru_hidden = new_hidden.detach()
+            temporal_features = gru_output.squeeze(0)
+        
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
-        # Tighter clamping to prevent explosion: 0.5 = 50m per step (still very fast)
         predictions = torch.clamp(predictions, min=-0.5, max=0.5)
         
         return predictions
