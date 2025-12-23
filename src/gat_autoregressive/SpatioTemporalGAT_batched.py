@@ -284,7 +284,9 @@ class SpatioTemporalGATBatched(nn.Module):
         predictions = self.decoder(decoder_input)
         
         # Clamp to prevent explosive predictions
-        predictions = torch.clamp(predictions, min=-5.0, max=5.0)
+        # Normalized displacement of 0.1 = 10m per 0.1s = 100 m/s (way too fast)
+        # Reasonable max: 0.05 = 5m per 0.1s = 50 m/s (still very fast but prevents explosion)
+        predictions = torch.clamp(predictions, min=-0.5, max=0.5)
         
         if debug_mode:
             print(f"------ Batched GAT Forward (B={B}) at timestep {timestep}: ------")
@@ -319,7 +321,8 @@ class SpatioTemporalGATBatched(nn.Module):
         temporal_features = gru_output.squeeze(0)
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
-        predictions = torch.clamp(predictions, min=-5.0, max=5.0)
+        # Tighter clamping to prevent explosion: 0.5 = 50m per step (still very fast)
+        predictions = torch.clamp(predictions, min=-0.5, max=0.5)
         
         return predictions
     

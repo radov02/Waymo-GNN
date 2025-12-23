@@ -416,14 +416,18 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     model.eval()
     
     # Compute adaptive velocity smoothing based on epoch
-    # Early epochs: high smoothing (0.9) to prevent instability
-    # Later epochs: low smoothing (0.3) to allow model's predictions to drive dynamics
+    # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
+    # inputs at every timestep and converges to producing the same output for all agents.
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
-    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
+    if epoch < 5:
+        velocity_smoothing = 0.95 - 0.01 * epoch  # 0.95 → 0.91 over first 5 epochs
+    else:
+        later_progress = (epoch - 5) / max(1, total_epochs - 6)
+        velocity_smoothing = 0.85 - 0.55 * later_progress  # 0.85 → 0.3
+    velocity_smoothing = max(0.3, min(0.95, velocity_smoothing))
     
-    # For very early epochs (first 5), don't update velocity features at all
-    update_velocity = epoch >= 5
+    # Always update velocity features - smoothing handles stability
+    update_velocity = True
     print(f"  [VIZ] Velocity update={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
     
     base_model = model.module if is_parallel else model
@@ -909,17 +913,25 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     count = 0
     
     # Compute adaptive velocity smoothing based on epoch
-    # Early epochs: high smoothing (0.9) to prevent instability
-    # Later epochs: low smoothing (0.3) to allow model's predictions to drive dynamics
+    # CRITICAL: We must ALWAYS update velocity features, otherwise the GRU sees identical
+    # inputs at every timestep and converges to producing the same output for all agents.
+    # Early epochs: very high smoothing (0.95) to prevent feedback loops
+    # Later epochs: lower smoothing (0.3) to allow model's predictions to drive dynamics
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
-    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
+    if epoch < 5:
+        # Very early epochs: use extremely high smoothing (mostly keep original velocity)
+        # This allows small velocity updates so GRU sees changing inputs
+        velocity_smoothing = 0.95 - 0.01 * epoch  # 0.95 → 0.91 over first 5 epochs
+    else:
+        # After epoch 5: transition from 0.85 → 0.3 over remaining epochs
+        later_progress = (epoch - 5) / max(1, total_epochs - 6)
+        velocity_smoothing = 0.85 - 0.55 * later_progress  # 0.85 → 0.3
+    velocity_smoothing = max(0.3, min(0.95, velocity_smoothing))
     
-    # For very early epochs (first 5), don't update velocity features at all
-    # This helps the model adapt to autoregressive rollout without feedback loops
-    update_velocity = epoch >= 5
+    # Always update velocity features now - the smoothing handles stability
+    update_velocity = True
     
-    if epoch == 0 or epoch % 10 == 0 or epoch == 5:
+    if epoch == 0 or epoch % 5 == 0:
         print(f"  [Velocity Update] update_velocity={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1})")
     
     base_model = model.module if is_parallel else model
@@ -1166,6 +1178,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     if torch.isnan(mse_loss) or torch.isnan(cosine_loss):
                         print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                         continue
+                    
+                    # Clamp MSE loss to prevent gradient explosion from outliers
+                    # Normalized displacement of 0.1 = 10m, squared = 100 → 1.0 after POSITION_SCALE
+                    # But we expect ~0.01 (1m) typically, so 1.0 is already very large
+                    mse_loss = torch.clamp(mse_loss, max=10.0)
                     
                     discount = 0.95 ** step
                     step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
