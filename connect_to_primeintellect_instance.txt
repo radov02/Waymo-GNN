@@ -45,3 +45,10 @@ ter2> watch -n 1 nvidia-smi
 
 - to upload file(s) to the host:
     local> scp -P THEPORT -i C:\Users\YOURUSERNAME\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\best_model.pt root@IP:~/Waymo-GNN/checkpoints
+
+
+scp -P 1234 -i C:\Users\radov\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\best_model_batched_B48_h128_lr1e-03_L3x1_E20.pt root@31.22.104.34:~/Waymo-GNN/checkpoints
+scp -P 1234 -i C:\Users\radov\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\best_gat_batched_B48_h128_lr1e-03_heads4_E20.pt root@31.22.104.34:~/Waymo-GNN/checkpoints/gat
+scp -P 1234 -i C:\Users\radov\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\training_seqlen90.hdf5 root@31.22.104.34:~/Waymo-GNN/data/graphs/training
+scp -P 1234 -i C:\Users\radov\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\validation_seqlen90.hdf5 root@31.22.104.34:~/Waymo-GNN/data/graphs/validation
+scp -P 1234 -i C:\Users\radov\.ssh\primeintellect_ed25519 C:\Users\radov\Downloads\testing_seqlen90.hdf5 root@31.22.104.34:~/Waymo-GNN/data/graphs/testing

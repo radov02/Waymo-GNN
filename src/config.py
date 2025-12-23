@@ -272,7 +272,7 @@ viz_scenario_dir = 'visualizations/scenario_sequence'
 # Scenario loading for visualization map features:
 # Limit how many tfrecord files to index for scenario lookup (reduces initial loading time)
 # Set to None to index all files, or a small number (e.g., 4) to only index first N files per directory
-max_scenario_files_for_viz = 4  # Only index first 4 tfrecord files for faster scenario loading
+max_scenario_files_for_viz = 2  # Only index first n tfrecord files for faster scenario loading
 
 # model checkpoints:
 checkpoint_dir = 'checkpoints'

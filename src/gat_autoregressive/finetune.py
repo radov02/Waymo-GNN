@@ -316,25 +316,17 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     B, T = batch_dict["B"], batch_dict["T"]
     scenario_ids = batch_dict.get("scenario_ids", ["unknown"])
     
-    # Load scenario for map features (with timeout to avoid hanging)
+    # Load scenario for map features (cross-platform compatible)
     scenario = None
     if scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
         try:
             print(f"  Loading scenario {scenario_ids[0]} for map visualization...")
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Scenario loading timed out")
-            
-            # Set 10 second timeout
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)
-            
             scenario = load_scenario_by_id(scenario_ids[0])
-            signal.alarm(0)  # Cancel alarm
-            
-        except (TimeoutError, Exception) as e:
-            signal.alarm(0)  # Ensure alarm is cancelled
+            if scenario is not None:
+                print(f"  ✓ Loaded scenario for map visualization")
+            else:
+                print(f"  Warning: Scenario loaded as None. Proceeding without map features.")
+        except Exception as e:
             print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
     
     # Move to device

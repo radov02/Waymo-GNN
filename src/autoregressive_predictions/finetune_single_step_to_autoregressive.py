@@ -195,8 +195,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             print(f"  Loading scenario {scenario_ids[0]} for map visualization...")
             # Use indexed loading for speed (index is built once and cached)
             scenario = load_scenario_by_id(scenario_ids[0])
-            if scenario is None:
-                print(f"  Proceeding without map features.")
+            if scenario is not None:
+                print(f"  Loaded scenario for map visualization")
+            else:
+                print(f"  Warning: Scenario loaded as None. Proceeding without map features.")
         except Exception as e:
             print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
     elif autoreg_skip_map_features:
