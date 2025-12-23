@@ -30,6 +30,11 @@ import math
 from pathlib import Path
 from tqdm import tqdm
 
+# Add src directory to path for local waymo_open_dataset
+src_dir = Path(__file__).parent.parent
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+
 # Try to import TensorFlow for TFRecord
 try:
     import tensorflow as tf
@@ -38,13 +43,15 @@ except ImportError:
     print("ERROR: TensorFlow not available. Install with: pip install tensorflow")
     sys.exit(1)
 
-# Try to import Waymo SDK
+# Import local Waymo SDK
 try:
     from waymo_open_dataset.protos import scenario_pb2
     HAS_WAYMO_SDK = True
-except ImportError:
-    print("ERROR: Waymo Open Dataset SDK not available.")
-    print("Install with: pip install waymo-open-dataset-tf-2-11-0")
+    print(f"✓ Loaded Waymo SDK from: {src_dir / 'waymo_open_dataset'}")
+except ImportError as e:
+    print("ERROR: Could not import local Waymo Open Dataset SDK.")
+    print(f"Expected location: {src_dir / 'waymo_open_dataset'}")
+    print(f"Error: {e}")
     sys.exit(1)
 
 
