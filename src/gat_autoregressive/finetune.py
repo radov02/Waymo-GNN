@@ -173,7 +173,7 @@ def load_pretrained_model(checkpoint_path, device):
     return model, is_parallel, checkpoint
 
 
-def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5):
+def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
     """
     Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
     
@@ -181,9 +181,9 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     
     Updates:
     - Position (graph.pos): updated with predicted displacement (* 100)
-    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized
-    - Speed (feature 2): magnitude of new velocity, normalized
-    - Heading (feature 3): direction of new velocity
+    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized (if update_velocity=True)
+    - Speed (feature 2): magnitude of new velocity, normalized (if update_velocity=True)
+    - Heading (feature 3): direction of new velocity (if update_velocity=True)
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
@@ -194,6 +194,7 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
         device: Torch device
         velocity_smoothing: EMA smoothing factor for velocity updates (0=no smoothing, 1=full smoothing)
                            Higher values = more conservative updates, helps stabilize early training
+        update_velocity: If False, keep original velocity features (helps stabilize very early training)
     
     NOTE: Previously we preserved velocity features, but this caused trajectory convergence
     because the model learned to ignore velocity and predict an "average" displacement.
@@ -233,62 +234,69 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
         pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
     
     # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
-    # Convert predicted displacement to velocity: velocity = displacement / dt
-    # pred_displacement is normalized (actual_disp / 100)
-    # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
-    # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
-    velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
-    
-    # Get old velocity for acceleration calculation
-    old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
-    old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
-    
-    # New velocity from predictions
-    new_vx_norm_raw = pred_displacement[:, 0] * velocity_scale
-    new_vy_norm_raw = pred_displacement[:, 1] * velocity_scale
-    
-    # Clamp to reasonable ranges (normalized values)
-    # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
-    # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
-    max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
-    new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
-    new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
-    
-    # Apply EMA smoothing to prevent sudden velocity jumps
-    # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
-    # Higher smoothing = more conservative updates (better for early training)
-    new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
-    new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
-    
-    # Calculate speed and heading from smoothed velocity
-    new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
-    new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
-    
-    # Safety: Check for NaN after velocity calculations
-    if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
-        print(f"  [ERROR] NaN in velocity features after smoothing! Clamping to zero.")
-        new_vx_norm = torch.nan_to_num(new_vx_norm, nan=0.0)
-        new_vy_norm = torch.nan_to_num(new_vy_norm, nan=0.0)
-        new_speed_norm = torch.nan_to_num(new_speed_norm, nan=0.0)
-        new_heading = torch.nan_to_num(new_heading, nan=0.0)
-    
-    # Calculate acceleration from velocity change (using smoothed values)
-    # acceleration = (new_v - old_v) / dt
-    # But we need to be careful: if smoothing is high, acceleration should be low
-    accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
-    ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
-    ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-    # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
-    ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
-    ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
-    
-    # Update velocity/acceleration features
-    updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
-    updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
-    updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
-    updated_graph.x[:num_nodes_to_update, 3] = new_heading
-    updated_graph.x[:num_nodes_to_update, 5] = ax_norm
-    updated_graph.x[:num_nodes_to_update, 6] = ay_norm
+    if update_velocity:
+        # Convert predicted displacement to velocity: velocity = displacement / dt
+        # pred_displacement is normalized (actual_disp / 100)
+        # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
+        # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
+        velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
+        
+        # Get old velocity for acceleration calculation
+        old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
+        old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
+        
+        # New velocity from predictions - but clamp the raw displacement first to prevent explosion
+        # Reasonable single-step displacement: max ~3m (30 m/s * 0.1s), normalized = 0.03
+        max_disp_norm = 0.05  # 5m max per step - anything larger is likely an error
+        pred_disp_clamped = torch.clamp(pred_displacement, -max_disp_norm, max_disp_norm)
+        
+        new_vx_norm_raw = pred_disp_clamped[:, 0] * velocity_scale
+        new_vy_norm_raw = pred_disp_clamped[:, 1] * velocity_scale
+        
+        # Clamp to reasonable ranges (normalized values)
+        # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
+        # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
+        max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
+        new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
+        new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
+        
+        # Apply EMA smoothing to prevent sudden velocity jumps
+        # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
+        # Higher smoothing = more conservative updates (better for early training)
+        new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
+        new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
+        
+        # Calculate speed and heading from smoothed velocity
+        new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
+        new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
+        
+        # Safety: Check for NaN after velocity calculations
+        if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
+            print(f"  [ERROR] NaN in velocity features after smoothing! Keeping old values.")
+            # Keep old velocity instead of clamping to zero
+            new_vx_norm = old_vx_norm
+            new_vy_norm = old_vy_norm
+            new_speed_norm = updated_graph.x[:num_nodes_to_update, 2].clone()
+            new_heading = updated_graph.x[:num_nodes_to_update, 3].clone()
+        
+        # Calculate acceleration from velocity change (using smoothed values)
+        # acceleration = (new_v - old_v) / dt
+        # But we need to be careful: if smoothing is high, acceleration should be low
+        accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
+        ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
+        ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
+        # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
+        ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
+        ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
+        
+        # Update velocity/acceleration features
+        updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
+        updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
+        updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
+        updated_graph.x[:num_nodes_to_update, 3] = new_heading
+        updated_graph.x[:num_nodes_to_update, 5] = ax_norm
+        updated_graph.x[:num_nodes_to_update, 6] = ay_norm
+    # Else: keep original velocity features - helps stabilize early training
     # ========================================================================
     
     # Only update positions
@@ -408,12 +416,15 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     model.eval()
     
     # Compute adaptive velocity smoothing based on epoch
-    # Early epochs: high smoothing (0.8) to prevent instability
-    # Later epochs: low smoothing (0.2) to allow model's predictions to drive dynamics
+    # Early epochs: high smoothing (0.9) to prevent instability
+    # Later epochs: low smoothing (0.3) to allow model's predictions to drive dynamics
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
-    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
-    print(f"  [VIZ] Velocity smoothing: {velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
+    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
+    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
+    
+    # For very early epochs (first 5), don't update velocity features at all
+    update_velocity = epoch >= 5
+    print(f"  [VIZ] Velocity update={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
     
     base_model = model.module if is_parallel else model
     
@@ -670,7 +681,9 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             print(f"  [DEBUG VIZ] Step {step}, Agent {agent_id}: disp={pred_disp[global_idx]}, new_pos={new_pos}")
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
             
-            graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, velocity_smoothing=velocity_smoothing)
+            graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
+                                                                  velocity_smoothing=velocity_smoothing,
+                                                                  update_velocity=update_velocity)
             
             # DEBUG: Print feature changes after update for first few steps
             if step < 5 and len(pred_scenario_indices) > 0:
@@ -896,14 +909,18 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     count = 0
     
     # Compute adaptive velocity smoothing based on epoch
-    # Early epochs: high smoothing (0.8) to prevent instability
-    # Later epochs: low smoothing (0.2) to allow model's predictions to drive dynamics
+    # Early epochs: high smoothing (0.9) to prevent instability
+    # Later epochs: low smoothing (0.3) to allow model's predictions to drive dynamics
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
-    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
+    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
+    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
     
-    if epoch == 0 or epoch % 10 == 0:
-        print(f"  [Velocity Smoothing] Using smoothing={velocity_smoothing:.2f} (progress={progress:.2f})")
+    # For very early epochs (first 5), don't update velocity features at all
+    # This helps the model adapt to autoregressive rollout without feedback loops
+    update_velocity = epoch >= 5
+    
+    if epoch == 0 or epoch % 10 == 0 or epoch == 5:
+        print(f"  [Velocity Update] update_velocity={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1})")
     
     base_model = model.module if is_parallel else model
     use_amp_local = scaler is not None and torch.cuda.is_available()
@@ -1172,7 +1189,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         # Memory usage increases but learning is much faster
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred, device,  # No .detach() - enables BPTT
-                            velocity_smoothing=velocity_smoothing
+                            velocity_smoothing=velocity_smoothing,
+                            update_velocity=update_velocity
                         )
                         is_using_predicted_positions = True  # Now we're using predicted positions
                     else:
@@ -1264,8 +1282,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     
     # Compute adaptive velocity smoothing based on epoch
     progress = epoch / max(1, total_epochs - 1)
-    velocity_smoothing = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
-    velocity_smoothing = max(0.2, min(0.8, velocity_smoothing))
+    velocity_smoothing = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
+    velocity_smoothing = max(0.3, min(0.9, velocity_smoothing))
+    
+    # For very early epochs (first 5), don't update velocity features at all
+    update_velocity = epoch >= 5
     
     horizon_mse = [0.0] * num_rollout_steps
     horizon_cosine = [0.0] * num_rollout_steps
@@ -1387,7 +1408,8 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     if step < num_rollout_steps - 1:
                         graph_for_prediction = update_graph_with_prediction(
                             graph_for_prediction, pred, device,
-                            velocity_smoothing=velocity_smoothing
+                            velocity_smoothing=velocity_smoothing,
+                            update_velocity=update_velocity
                         )
                         is_using_predicted_positions = True  # Now we're using predicted positions
                 
@@ -1488,7 +1510,9 @@ def run_autoregressive_finetuning(
     # All metrics will be plotted against wandb's internal step counter
     # Epoch is logged as a value, not as a step metric
     
-    finetune_lr = learning_rate * 0.1
+    # Use lower learning rate to prevent NaN gradients during scheduled sampling
+    # Original was learning_rate * 0.1, now using learning_rate * 0.01 for stability
+    finetune_lr = learning_rate * 0.01  # 10x smaller for stable finetuning
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
                                    min_lr=1e-7)
