@@ -741,18 +741,43 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 gt_graph_next = batched_graph_sequence[next_target_t]
                 graph_for_prediction = gt_graph_next.clone()
                 
-                # Update position: accumulate predicted displacements from start
-                # For visualization, we track positions in agent_pred_positions dict
-                # So we just need to update graph.pos to match our predicted positions
+                # Update position using agent alignment (same fix as training)
                 if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                    # Get current timestep GT graph to compute offset
-                    current_gt_graph = batched_graph_sequence[start_t + step + 1]
-                    if hasattr(current_gt_graph, 'pos') and current_gt_graph.pos is not None:
-                        # Apply prediction displacement to previous position
-                        pred_displacement = pred * POSITION_SCALE
-                        # Use position from previous step + our prediction
-                        prev_gt_pos = batched_graph_sequence[start_t + step].pos
-                        graph_for_prediction.pos = prev_gt_pos + pred_displacement
+                    current_gt_graph = batched_graph_sequence[start_t + step]
+                    pred_displacement = pred * POSITION_SCALE
+                    
+                    # CRITICAL: Only update positions for agents that exist in BOTH graphs
+                    if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
+                        hasattr(current_gt_graph, 'batch') and hasattr(gt_graph_next, 'batch')):
+                        
+                        current_batch_np = current_gt_graph.batch.cpu().numpy()
+                        next_batch_np = gt_graph_next.batch.cpu().numpy()
+                        
+                        current_id_to_idx = {}
+                        for idx in range(len(current_gt_graph.agent_ids)):
+                            if idx < len(current_batch_np):
+                                bid = int(current_batch_np[idx])
+                                aid = current_gt_graph.agent_ids[idx]
+                                current_id_to_idx[(bid, aid)] = idx
+                        
+                        next_id_to_idx = {}
+                        for idx in range(len(gt_graph_next.agent_ids)):
+                            if idx < len(next_batch_np):
+                                bid = int(next_batch_np[idx])
+                                aid = gt_graph_next.agent_ids[idx]
+                                next_id_to_idx[(bid, aid)] = idx
+                        
+                        common_ids = set(current_id_to_idx.keys()) & set(next_id_to_idx.keys())
+                        
+                        for gid in common_ids:
+                            current_idx = current_id_to_idx[gid]
+                            next_idx = next_id_to_idx[gid]
+                            if current_idx < pred_displacement.shape[0] and current_idx < current_gt_graph.pos.shape[0]:
+                                graph_for_prediction.pos[next_idx] = current_gt_graph.pos[current_idx] + pred_displacement[current_idx]
+                    else:
+                        # Fallback: only update if sizes match
+                        if current_gt_graph.pos.shape[0] == pred_displacement.shape[0] == graph_for_prediction.pos.shape[0]:
+                            graph_for_prediction.pos = current_gt_graph.pos + pred_displacement
             else:
                 # No more GT graphs available, use update function as fallback
                 graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
