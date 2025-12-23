@@ -33,6 +33,10 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.nn.utils import clip_grad_norm_
 
+# Import visualization functions
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'helper_functions'))
+from visualization_functions import visualize_epoch
+
 # Suppress warnings
 warnings.filterwarnings("ignore", message=".*skipping cudagraphs.*")
 warnings.filterwarnings("ignore", message=".*cudagraph.*")
@@ -108,6 +112,10 @@ class Config:
     # Checkpoints
     checkpoint_dir: str = 'checkpoints/vectornet'
     save_every: int = 5
+    
+    # Visualization
+    viz_dir: str = 'visualizations/autoreg/vectornet'
+    visualize_every_n_epochs: int = 5
     
     # Device
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -271,7 +279,7 @@ def compute_metrics(pred, target, valid_mask=None):
     return ade, fde
 
 
-def train_epoch(model, dataloader, optimizer, config, scaler=None):
+def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_callback=None):
     """Train for one epoch.
     
     Args:
@@ -280,6 +288,7 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None):
         optimizer: Optimizer
         config: Training config
         scaler: GradScaler for AMP
+        visualize_callback: Optional callback for visualization
         
     Returns:
         Dictionary with training metrics
@@ -291,6 +300,7 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None):
     total_ade = 0.0
     total_fde = 0.0
     steps = 0
+    last_batch = None
     
     device = config.device
     amp_enabled = config.use_amp and torch.cuda.is_available()
@@ -365,17 +375,30 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None):
                 "train/batch_fde": fde.item(),
             }, commit=False)
         
+        # Store last batch for visualization
+        if batch_idx == len(dataloader) - 1:
+            last_batch = {k: v.cpu() if torch.is_tensor(v) else v for k, v in batch.items()}
+        
         # Clear CUDA cache periodically
         if torch.cuda.is_available() and batch_idx % 50 == 0:
             torch.cuda.empty_cache()
     
-    return {
+    metrics = {
         'loss': total_loss / max(1, steps),
         'traj_loss': total_traj_loss / max(1, steps),
         'node_loss': total_node_loss / max(1, steps),
         'ade': total_ade / max(1, steps),
         'fde': total_fde / max(1, steps),
     }
+    
+    # Call visualization callback after epoch completes
+    if visualize_callback is not None and last_batch is not None:
+        try:
+            visualize_callback(last_batch)
+        except Exception as e:
+            print(f"  WARNING: Visualization failed: {e}")
+    
+    return metrics
 
 
 @torch.no_grad()
@@ -623,14 +646,46 @@ def main():
     print("="*60)
     
     os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(config.viz_dir, exist_ok=True)
     
     for epoch in range(start_epoch, config.epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{config.epochs}")
         print(f"{'='*60}")
         
+        # Visualization callback
+        viz_callback = None
+        if (epoch + 1) % config.visualize_every_n_epochs == 0 or epoch == 0:
+            def viz_callback(batch):
+                print(f"  Generating visualization for epoch {epoch+1}...")
+                model.eval()
+                with torch.no_grad():
+                    # Move batch back to device
+                    batch_gpu = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                    predictions = model(batch_gpu)
+                    
+                    # Create visualization data structure
+                    viz_data = {
+                        'predictions': predictions.cpu(),
+                        'targets': batch['future_positions'].cpu(),
+                        'valid_mask': batch['future_valid'].cpu(),
+                        'scenario_ids': batch.get('scenario_ids', ['unknown'] * predictions.shape[0])
+                    }
+                    
+                    # Use visualize_epoch helper
+                    visualize_epoch(
+                        epoch=epoch,
+                        predictions=viz_data['predictions'],
+                        targets=viz_data['targets'],
+                        scenario_ids=viz_data['scenario_ids'],
+                        output_dir=config.viz_dir,
+                        prefix='vectornet',
+                        max_scenarios=5
+                    )
+                model.train()
+        
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, config, scaler)
+        train_metrics = train_epoch(model, train_loader, optimizer, config, scaler, visualize_callback=viz_callback)
         print(f"\nTrain - Loss: {train_metrics['loss']:.4f} | "
               f"ADE: {train_metrics['ade']:.4f} | FDE: {train_metrics['fde']:.4f}")
         

@@ -1203,19 +1203,68 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     pred_aligned = pred[pred_indices]
                     
-                    # ALWAYS compute target as displacement from CURRENT position to GT NEXT position
-                    # This teaches the model to predict corrections toward GT trajectory
-                    # When current_pos == GT_pos, this equals GT displacement
-                    # When current_pos is offset (predicted), this teaches error correction
-                    gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
-                    current_pos = graph_for_prediction.pos[pred_indices].to(pred.dtype)
-                    target = (gt_next_pos - current_pos) / POSITION_SCALE
+                    # CRITICAL FIX: Target should ALWAYS be the GT displacement
+                    # The position offset is only to expose the model to distribution shift
+                    # The model learns: "Given velocity/heading, predict next displacement"
+                    # NOT: "Correct back to GT trajectory"
+                    # 
+                    # To get GT displacement: we need the GT graph at (t+step) which has .y
+                    # But graph_for_prediction might be offset, so we use the GT graph's .y
+                    source_gt_graph = batched_graph_sequence[t + step]
+                    if source_gt_graph.y is not None:
+                        # Use GT displacement from the source timestep
+                        # Need to align by agent ID
+                        source_agent_ids = getattr(source_gt_graph, 'agent_ids', None)
+                        source_batch = getattr(source_gt_graph, 'batch', None)
+                        
+                        if (source_agent_ids is not None and source_batch is not None and
+                            len(source_agent_ids) == source_gt_graph.y.shape[0]):
+                            # Build mapping for source graph
+                            source_batch_np = source_batch.cpu().numpy()
+                            source_id_to_idx = {}
+                            for idx in range(len(source_agent_ids)):
+                                bid = int(source_batch_np[idx])
+                                aid = source_agent_ids[idx]
+                                source_id_to_idx[(bid, aid)] = idx
+                            
+                            # Get GT displacement for each aligned agent
+                            target_list = []
+                            for i, idx in enumerate(pred_indices.cpu().numpy()):
+                                # Get the agent ID from pred graph
+                                if idx < len(pred_agent_ids):
+                                    aid = pred_agent_ids[idx]
+                                    bid = int(pred_batch.cpu().numpy()[idx])
+                                    gid = (bid, aid)
+                                    
+                                    if gid in source_id_to_idx:
+                                        source_idx = source_id_to_idx[gid]
+                                        target_list.append(source_gt_graph.y[source_idx])
+                                    else:
+                                        # Agent not in source - shouldn't happen, use zeros
+                                        target_list.append(torch.zeros(2, device=device))
+                                else:
+                                    target_list.append(torch.zeros(2, device=device))
+                            
+                            target = torch.stack(target_list).to(pred.dtype)
+                        else:
+                            # Fallback: use target_graph.y directly (assumes alignment)
+                            target = source_gt_graph.y[target_indices].to(pred.dtype)
+                    else:
+                        # No GT displacement available - compute from positions
+                        gt_current_pos = source_gt_graph.pos[target_indices].to(pred.dtype)
+                        gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
+                        target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
                 else:
                     pred_aligned = pred
-                    # Same logic: always compute relative to current position
-                    gt_next_pos = target_graph.pos.to(pred.dtype)
-                    current_pos = graph_for_prediction.pos.to(pred.dtype)
-                    target = (gt_next_pos - current_pos) / POSITION_SCALE
+                    # Same: always use GT displacement
+                    source_gt_graph = batched_graph_sequence[t + step]
+                    if source_gt_graph.y is not None:
+                        target = source_gt_graph.y.to(pred.dtype)
+                    else:
+                        # Compute from GT positions
+                        gt_current_pos = source_gt_graph.pos.to(pred.dtype)
+                        gt_next_pos = target_graph.pos.to(pred.dtype)
+                        target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
                 
                 # Check for NaN in predictions or targets before computing loss
                 if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
