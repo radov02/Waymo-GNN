@@ -31,3 +31,5 @@ src/autoregressive_model/checkpoints/*
 *.pt
 *.tfrecord
 *.hdf5
+
+vectornet.md

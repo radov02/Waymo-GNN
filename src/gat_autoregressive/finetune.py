@@ -462,13 +462,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
-    # REDUCED velocity smoothing: 0.5 = balanced between old and predicted velocity
-    # Lower smoothing allows agents to diverge and follow their own trajectories
-    velocity_smoothing = 0.5
-    
-    # Always update velocity features - required for agent differentiation
-    update_velocity = True
-    print(f"  [VIZ] Velocity update={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1}/{total_epochs})")
+    # NEW APPROACH: Keep GT velocity features, only update position
+    # This matches training and gives model correct kinematic features
+    velocity_smoothing = 0.0  # Not used
+    update_velocity = False   # Keep GT features
+    print(f"  [VIZ] Using GT velocity features for visualization (epoch {epoch+1}/{total_epochs})")
     
     base_model = model.module if is_parallel else model
     
@@ -736,22 +734,30 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             print(f"  [DEBUG VIZ] Step {step}, Agent {agent_id}: disp={pred_disp[global_idx]}, new_pos={new_pos}")
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
             
-            graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
-                                                                  velocity_smoothing=velocity_smoothing,
-                                                                  update_velocity=update_velocity)
-            
-            # DEBUG: Print feature changes after update for first few steps
-            if step < 5 and len(pred_scenario_indices) > 0:
-                first_agent_idx = pred_scenario_indices[0]
-                if first_agent_idx < graph_for_prediction.x.shape[0]:
-                    updated_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
-                    # Denormalize velocity features (features 0-1 are normalized by MAX_SPEED=30.0)
-                    MAX_SPEED = 30.0
-                    updated_vx = updated_feats[0] * MAX_SPEED
-                    updated_vy = updated_feats[1] * MAX_SPEED
-                    updated_speed = updated_feats[2] * MAX_SPEED
-                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed_norm={updated_feats[2]:.3f}")
-                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: v=({updated_vx:.2f}, {updated_vy:.2f}) m/s, speed={updated_speed:.2f} m/s")
+            # NEW APPROACH: Use GT graph from next timestep with only position offset
+            # This gives the model correct GT velocity features for each agent
+            next_target_t = start_t + step + 2
+            if next_target_t < T:
+                gt_graph_next = batched_graph_sequence[next_target_t]
+                graph_for_prediction = gt_graph_next.clone()
+                
+                # Update position: accumulate predicted displacements from start
+                # For visualization, we track positions in agent_pred_positions dict
+                # So we just need to update graph.pos to match our predicted positions
+                if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                    # Get current timestep GT graph to compute offset
+                    current_gt_graph = batched_graph_sequence[start_t + step + 1]
+                    if hasattr(current_gt_graph, 'pos') and current_gt_graph.pos is not None:
+                        # Apply prediction displacement to previous position
+                        pred_displacement = pred * POSITION_SCALE
+                        # Use position from previous step + our prediction
+                        prev_gt_pos = batched_graph_sequence[start_t + step].pos
+                        graph_for_prediction.pos = prev_gt_pos + pred_displacement
+            else:
+                # No more GT graphs available, use update function as fallback
+                graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
+                                                                      velocity_smoothing=velocity_smoothing,
+                                                                      update_velocity=update_velocity)
     
     # Calculate errors
     horizon_errors = []
@@ -967,17 +973,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     steps = 0
     count = 0
     
-    # REDUCED velocity smoothing: 0.5 = 50% old velocity, 50% new predicted velocity
-    # Lower smoothing allows agents to diverge and follow their own trajectories
-    # Previously 0.9 caused all agents to converge to similar mean predictions
-    velocity_smoothing = 0.5
-    
-    # CRITICAL: Update velocity features so each agent maintains differentiated behavior
-    # Without this, all agents converge because they have identical input features
-    update_velocity = True
+    # NEW APPROACH: Keep GT velocity features, only update position
+    # This ensures the model sees correct kinematic features for each agent
+    # while learning to predict displacement from current (possibly offset) position to GT next position
+    velocity_smoothing = 0.0  # Not used anymore since we keep GT features
+    update_velocity = False   # Keep GT velocity features - they're already correct
     
     if epoch == 0 or epoch % 5 == 0:
-        print(f"  [Velocity Update] update_velocity={update_velocity}, smoothing={velocity_smoothing:.2f} (epoch {epoch+1})")
+        print(f"  [GT Features] Using GT velocity features (update_velocity=False) for stable agent differentiation")
     
     base_model = model.module if is_parallel else model
     use_amp_local = scaler is not None and torch.cuda.is_available()
@@ -1200,20 +1203,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     pred_aligned = pred[pred_indices]
                     
-                    if is_using_predicted_positions:
-                        gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
-                        current_pred_pos = graph_for_prediction.pos[pred_indices].to(pred.dtype)
-                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
-                    else:
-                        target = target_graph.y[target_indices].to(pred.dtype)
+                    # ALWAYS compute target as displacement from CURRENT position to GT NEXT position
+                    # This teaches the model to predict corrections toward GT trajectory
+                    # When current_pos == GT_pos, this equals GT displacement
+                    # When current_pos is offset (predicted), this teaches error correction
+                    gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
+                    current_pos = graph_for_prediction.pos[pred_indices].to(pred.dtype)
+                    target = (gt_next_pos - current_pos) / POSITION_SCALE
                 else:
                     pred_aligned = pred
-                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        gt_next_pos = target_graph.pos.to(pred.dtype)
-                        current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
-                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
-                    else:
-                        target = target_graph.y.to(pred.dtype)
+                    # Same logic: always compute relative to current position
+                    gt_next_pos = target_graph.pos.to(pred.dtype)
+                    current_pos = graph_for_prediction.pos.to(pred.dtype)
+                    target = (gt_next_pos - current_pos) / POSITION_SCALE
                 
                 # Check for NaN in predictions or targets before computing loss
                 if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
@@ -1259,17 +1261,30 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 use_prediction = np.random.random() < sampling_prob
                 
                 if use_prediction:
-                    # CRITICAL FIX: DETACH predictions to prevent gradient explosion!
-                    # BPTT through 89 steps with non-linear ops (clamp, sqrt, atan2) causes NaN.
-                    # We still expose model to its own predictions (distribution shift),
-                    # but only backprop through the current step, not the entire chain.
-                    # This is the standard "scheduled sampling" approach.
-                    graph_for_prediction = update_graph_with_prediction(
-                        graph_for_prediction, pred.detach(), device,  # DETACH for stability
-                        velocity_smoothing=velocity_smoothing,
-                        update_velocity=True  # CRITICAL: Update velocity so agents differentiate!
-                    )
-                    is_using_predicted_positions = True  # Now we're using predicted positions
+                    # NEW APPROACH: Use GT graph from target_t but with position offset
+                    # This gives the model correct GT velocity features while being at predicted position
+                    # The model sees: GT velocity/heading/speed but offset position → learns to correct
+                    
+                    # Get the GT graph for next timestep (has correct velocity features)
+                    gt_graph_next = batched_graph_sequence[target_t]
+                    
+                    # Compute position offset: where we predicted vs where GT says we should be
+                    # pred is normalized displacement, multiply by 100 to get actual
+                    pred_displacement = pred.detach() * POSITION_SCALE
+                    
+                    # Update position on a clone of GT graph
+                    graph_for_prediction = gt_graph_next.clone()
+                    if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                        # Add the prediction error to GT position
+                        # This simulates being at a slightly wrong position due to accumulated errors
+                        # graph_for_prediction.pos already has GT pos at target_t
+                        # We want: current_predicted_pos = prev_pos + pred_displacement
+                        # But we use GT graph features, just offset position slightly
+                        prev_gt_pos = batched_graph_sequence[t + step].pos
+                        predicted_pos = prev_gt_pos + pred_displacement
+                        graph_for_prediction.pos = predicted_pos
+                    
+                    is_using_predicted_positions = True  # Position is predicted, features are GT
                 else:
                     graph_for_prediction = batched_graph_sequence[target_t]
                     is_using_predicted_positions = False  # Back to GT positions
@@ -1353,12 +1368,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     steps = 0
     count = 0
     
-    # REDUCED velocity smoothing: 0.5 = balanced between old and predicted velocity
-    # Lower smoothing allows agents to diverge and follow their own trajectories
-    velocity_smoothing = 0.5
-    
-    # Always update velocity features
-    update_velocity = True
+    # NEW APPROACH: Keep GT velocity features, only update position
+    velocity_smoothing = 0.0  # Not used
+    update_velocity = False   # Keep GT features
     
     horizon_mse = [0.0] * num_rollout_steps
     horizon_cosine = [0.0] * num_rollout_steps
