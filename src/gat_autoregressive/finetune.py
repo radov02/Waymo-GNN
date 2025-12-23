@@ -527,7 +527,12 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 # Show what the model predicts for this agent
                 if len(pred_scenario_indices) > 0:
                     pred_disp_agent0 = pred_disp[pred_scenario_indices[0]]
-                    print(f"\t\t[DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}")
+                    # Calculate predicted speed from displacement (displacement / timestep)
+                    dt = 0.1  # 0.1 second timestep
+                    pred_vx = pred_disp_agent0[0] / dt
+                    pred_vy = pred_disp_agent0[1] / dt
+                    pred_speed = np.sqrt(pred_disp_agent0[0]**2 + pred_disp_agent0[1]**2) / dt
+                    print(f"\t\t[DEBUG VIZ] Step {step}: Agent 0: pred_disp_m={pred_disp_agent0}, pred_v=({pred_vx:.2f}, {pred_vy:.2f}) m/s, pred_speed={pred_speed:.2f} m/s")
                     
                     # CRITICAL DEBUG: Compare with GT displacement at this step
                     if target_graph.y is not None and first_agent_idx < target_graph.y.shape[0]:
@@ -536,8 +541,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         source_graph = batched_graph_sequence[start_t + step]
                         if source_graph.y is not None and first_agent_idx < source_graph.y.shape[0]:
                             gt_disp = source_graph.y[first_agent_idx].cpu().numpy() * POSITION_SCALE
+                            gt_vx = gt_disp[0] / dt
+                            gt_vy = gt_disp[1] / dt
+                            gt_speed = np.sqrt(gt_disp[0]**2 + gt_disp[1]**2) / dt
                             error = np.sqrt(((pred_disp_agent0 - gt_disp) ** 2).sum())
-                            print(f"  [DEBUG VIZ] Step {step}: Agent 0: gt_disp_m={gt_disp}, error={error:.2f}m")
+                            print(f"  [DEBUG VIZ] Step {step}: Agent 0: gt_disp_m={gt_disp}, gt_v=({gt_vx:.2f}, {gt_vy:.2f}) m/s, gt_speed={gt_speed:.2f} m/s, error={error:.2f}m")
             
             # Map predictions to persistent agents (only first scenario)
             for local_idx, agent_id in enumerate(current_agent_ids):
@@ -562,11 +570,17 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device)
             
             # DEBUG: Print feature changes after update for first few steps
-            if step < 3 and len(pred_scenario_indices) > 0:
+            if step < 5 and len(pred_scenario_indices) > 0:
                 first_agent_idx = pred_scenario_indices[0]
                 if first_agent_idx < graph_for_prediction.x.shape[0]:
                     updated_feats = graph_for_prediction.x[first_agent_idx].cpu().numpy()
-                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed={updated_feats[2]:.3f}")
+                    # Denormalize velocity features (features 0-1 are normalized by MAX_SPEED=30.0)
+                    MAX_SPEED = 30.0
+                    updated_vx = updated_feats[0] * MAX_SPEED
+                    updated_vy = updated_feats[1] * MAX_SPEED
+                    updated_speed = updated_feats[2] * MAX_SPEED
+                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: vx_norm={updated_feats[0]:.3f}, vy_norm={updated_feats[1]:.3f}, speed_norm={updated_feats[2]:.3f}")
+                    print(f"\t\t[DEBUG VIZ] Step {step} AFTER update: v=({updated_vx:.2f}, {updated_vy:.2f}) m/s, speed={updated_speed:.2f} m/s")
     
     # Calculate errors
     horizon_errors = []
