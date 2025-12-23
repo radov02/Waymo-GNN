@@ -1202,6 +1202,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                     print(f"  [ERROR] NaN/Inf in gradients (norm={grad_norm})! Skipping optimizer step.")
                     optimizer.zero_grad()
+                    # CRITICAL: Must call scaler.update() to reset scaler state even when skipping step
+                    scaler.update()
                     continue
                 scaler.step(optimizer)
                 scaler.update()
