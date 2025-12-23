@@ -122,6 +122,11 @@ class Config:
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     use_amp: bool = True
     amp_dtype: str = 'float16'  # 'float16' or 'bfloat16'
+    
+    # Parallelization
+    use_torch_compile: bool = True  # Use torch.compile for speedup
+    gradient_accumulation_steps: int = 1  # Accumulate gradients for larger effective batch
+    persistent_workers: bool = True  # Keep workers alive between epochs
 
 
 def parse_args():
@@ -308,14 +313,15 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
     
     # Map feature type colors (from one-hot encoding in map_vectors)
     # type_onehot is at indices 6:13 (7 types)
+    # All grey except stop signs (red)
     MAP_COLORS = {
-        0: ('#808080', 'Lanes'),        # lane - gray
-        1: ('#FFA500', 'Road Lines'),   # road_line - orange
-        2: ('#8B4513', 'Road Edges'),   # road_edge - brown
+        0: ('#A0A0A0', 'Lanes'),        # lane - gray
+        1: ('#A0A0A0', 'Road Lines'),   # road_line - gray
+        2: ('#A0A0A0', 'Road Edges'),   # road_edge - gray
         3: ('#FF0000', 'Stop Signs'),   # stop_sign - red
-        4: ('#FFFF00', 'Crosswalks'),   # crosswalk - yellow
-        5: ('#FF69B4', 'Speed Bumps'),  # speed_bump - pink
-        6: ('#00CED1', 'Driveways'),    # driveway - cyan
+        4: ('#A0A0A0', 'Crosswalks'),   # crosswalk - gray
+        5: ('#A0A0A0', 'Speed Bumps'),  # speed_bump - gray
+        6: ('#A0A0A0', 'Driveways'),    # driveway - gray
     }
     
     # Create figure with subplots
@@ -453,7 +459,7 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
 
 
 def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_callback=None):
-    """Train for one epoch.
+    """Train for one epoch with gradient accumulation support.
     
     Args:
         model: VectorNetTFRecord model
@@ -478,16 +484,18 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
     device = config.device
     amp_enabled = config.use_amp and torch.cuda.is_available()
     amp_dtype = torch.float16 if config.amp_dtype == 'float16' else torch.bfloat16
+    accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
     
     log_every = max(1, len(dataloader) // 10)
+    
+    # Zero gradients at start
+    optimizer.zero_grad(set_to_none=True)
     
     for batch_idx, batch in enumerate(dataloader):
         if batch_idx % log_every == 0:
             print(f"  Batch {batch_idx+1}/{len(dataloader)} | "
                   f"Agents: {batch['agent_vectors'].shape[0]} | "
                   f"Map: {batch['map_vectors'].shape[0]}")
-        
-        optimizer.zero_grad(set_to_none=True)
         
         with torch.amp.autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
             # Forward pass
@@ -507,35 +515,45 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
             )
             
             # Node completion loss
-            node_loss = model.get_node_completion_loss()
-            if node_loss.device != device:
-                node_loss = node_loss.to(device)
+            node_loss_val = model.get_node_completion_loss() if hasattr(model, 'get_node_completion_loss') else model._orig_mod.get_node_completion_loss()
+            if isinstance(node_loss_val, torch.Tensor) and node_loss_val.device != device:
+                node_loss_val = node_loss_val.to(device)
             
-            loss = traj_loss + config.node_completion_weight * node_loss
+            loss = traj_loss + config.node_completion_weight * node_loss_val
+            
+            # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps
             
             if torch.isnan(loss):
                 print(f"  Warning: NaN loss at batch {batch_idx}")
                 continue
         
-        # Backward pass
+        # Backward pass (accumulate gradients)
         if scaler is not None:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), config.gradient_clip)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            clip_grad_norm_(model.parameters(), config.gradient_clip)
-            optimizer.step()
         
-        # Compute metrics
+        # Step optimizer every accumulation_steps batches
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), config.gradient_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                clip_grad_norm_(model.parameters(), config.gradient_clip)
+                optimizer.step()
+            
+            optimizer.zero_grad(set_to_none=True)
+        
+        # Compute metrics (use unscaled loss)
         with torch.no_grad():
             ade, fde = compute_metrics(predictions, targets, valid_mask)
         
-        total_loss += loss.item()
+        total_loss += (loss.item() * accumulation_steps)  # Unscale for logging
         total_traj_loss += traj_loss.item()
-        total_node_loss += node_loss.item() if isinstance(node_loss, torch.Tensor) else node_loss
+        total_node_loss += node_loss_val.item() if isinstance(node_loss_val, torch.Tensor) else node_loss_val
         total_ade += ade.item()
         total_fde += fde.item()
         steps += 1
@@ -724,7 +742,7 @@ def main():
     print(f"Training scenarios: {len(train_dataset)}")
     print(f"Validation scenarios: {len(val_dataset)}")
     
-    # Create dataloaders
+    # Create dataloaders with persistent workers for speed
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -732,6 +750,8 @@ def main():
         num_workers=config.num_workers,
         collate_fn=vectornet_collate_fn,
         pin_memory=True,
+        persistent_workers=config.persistent_workers and config.num_workers > 0,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
@@ -741,6 +761,8 @@ def main():
         num_workers=config.num_workers,
         collate_fn=vectornet_collate_fn,
         pin_memory=True,
+        persistent_workers=config.persistent_workers and config.num_workers > 0,
+        prefetch_factor=2 if config.num_workers > 0 else None,
     )
     
     # Create model
@@ -766,6 +788,15 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    
+    # torch.compile for speedup (PyTorch 2.0+)
+    if config.use_torch_compile and hasattr(torch, 'compile'):
+        try:
+            print("Compiling model with torch.compile (reduce-overhead mode)...")
+            model = torch.compile(model, mode='reduce-overhead')
+            print("  ✓ Model compiled successfully")
+        except Exception as e:
+            print(f"  ✗ torch.compile failed: {e}")
     
     # Multi-GPU support
     if torch.cuda.device_count() > 1:
