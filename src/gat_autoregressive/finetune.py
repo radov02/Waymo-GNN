@@ -61,34 +61,65 @@ VIZ_DIR = autoreg_viz_dir_finetune_gat  # From config.py
 # Warning suppression - only print size mismatch warning once per epoch
 _size_mismatch_warned = False
 
+# Epoch-level horizon error tracking for early stopping
+_epoch_horizon_errors = []  # List of final horizon errors per visualization
+
 
 class EarlyStopping:
-    """Early stopping to stop finetuning when validation loss doesn't improve."""
+    """Early stopping based on average final horizon error.
     
-    def __init__(self, patience=10, min_delta=0.001, verbose=True):
+    Uses average final horizon error instead of training loss because:
+    1. Training loss with teacher forcing doesn't reflect autoregressive performance
+    2. Horizon error directly measures what we care about: prediction accuracy over time
+    """
+    
+    def __init__(self, patience=10, min_delta=0.5, target_error=5.0, verbose=True):
+        """
+        Args:
+            patience: Number of epochs without improvement before stopping
+            min_delta: Minimum improvement to reset counter (in meters)
+            target_error: If average final horizon error drops below this, consider early stopping success
+            verbose: Whether to print progress
+        """
         self.patience = patience
         self.min_delta = min_delta
+        self.target_error = target_error
         self.verbose = verbose
         self.counter = 0
-        self.best_loss = None
+        self.best_error = None
         self.early_stop = False
         
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+    def __call__(self, avg_horizon_error):
+        """Check if training should stop.
+        
+        Args:
+            avg_horizon_error: Average final horizon error across scenarios (in meters)
+        """
+        if self.best_error is None:
+            self.best_error = avg_horizon_error
+            if self.verbose:
+                print(f"  [EarlyStopping] Initial best horizon error: {avg_horizon_error:.2f}m")
+        elif avg_horizon_error > self.best_error - self.min_delta:
             self.counter += 1
             if self.verbose:
-                print(f"  EarlyStopping counter: {self.counter}/{self.patience}")
+                print(f"  [EarlyStopping] No improvement: {avg_horizon_error:.2f}m (best: {self.best_error:.2f}m) - counter: {self.counter}/{self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
-            self.best_loss = val_loss
+            improvement = self.best_error - avg_horizon_error
+            self.best_error = avg_horizon_error
             self.counter = 0
+            if self.verbose:
+                print(f"  [EarlyStopping] Improved by {improvement:.2f}m → new best: {avg_horizon_error:.2f}m")
+        
+        # Check if we've reached target performance
+        if avg_horizon_error <= self.target_error:
+            if self.verbose:
+                print(f"  [EarlyStopping] 🎯 Reached target error ({avg_horizon_error:.2f}m ≤ {self.target_error}m)!")
             
     def reset(self):
         self.counter = 0
-        self.best_loss = None
+        self.best_error = None
         self.early_stop = False
 
 
@@ -144,26 +175,22 @@ def load_pretrained_model(checkpoint_path, device):
 
 def update_graph_with_prediction(graph, pred_displacement, device):
     """
-    Update graph for next autoregressive step - POSITION ONLY, preserve velocity features.
+    Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
     
     The model predicts normalized displacement (dx/100, dy/100).
     
     Updates:
     - Position (graph.pos): updated with predicted displacement (* 100)
+    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized
+    - Speed (feature 2): magnitude of new velocity, normalized
+    - Heading (feature 3): direction of new velocity
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    PRESERVED (not updated):
-    - Velocity (features 0-1): kept from original graph
-    - Speed (feature 2): kept from original graph
-    - Heading (feature 3): kept from original graph
-    - Acceleration (features 5-6): kept from original graph
-    
-    RATIONALE:
-    Updating velocity features from predictions causes mode collapse where all agents
-    converge to similar velocity features and thus similar predictions. By preserving
-    the original velocity context, each agent maintains its unique motion characteristics.
+    NOTE: Previously we preserved velocity features, but this caused trajectory convergence
+    because the model learned to ignore velocity and predict an "average" displacement.
+    Now we update velocity from predictions to maintain agent-specific behavior.
     """
     global _size_mismatch_warned
     updated_graph = graph.clone()
@@ -192,18 +219,45 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
-    # ============== POSITION-ONLY UPDATE (PRESERVE VELOCITY FEATURES) ==============
-    # Key insight: Updating velocity features from predictions causes mode collapse.
-    # The model was trained with GT velocity features, so it expects consistent velocities.
-    # When we update velocities from noisy predictions, all agents converge to similar
-    # velocity features, causing them to predict similar trajectories.
-    #
-    # Solution: Only update POSITION, keep velocity/acceleration features from GT.
-    # This preserves each agent's unique motion characteristics.
-    # ================================================================================
+    # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
+    # Convert predicted displacement to velocity: velocity = displacement / dt
+    # pred_displacement is normalized (actual_disp / 100)
+    # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
+    # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
+    velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
     
-    # DON'T update velocity/acceleration features - keep them from original graph
-    # The model should use the original velocity context to make predictions
+    # Get old velocity for acceleration calculation
+    old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
+    old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
+    
+    # New velocity from predictions
+    new_vx_norm = pred_displacement[:, 0] * velocity_scale
+    new_vy_norm = pred_displacement[:, 1] * velocity_scale
+    
+    # Clamp to reasonable ranges (normalized values)
+    # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s, 2.0 = 60 m/s
+    new_vx_norm = torch.clamp(new_vx_norm, -2.0, 2.0)
+    new_vy_norm = torch.clamp(new_vy_norm, -2.0, 2.0)
+    
+    # Calculate speed and heading
+    new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
+    new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
+    
+    # Calculate acceleration from velocity change
+    accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
+    ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
+    ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
+    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
+    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
+    
+    # Update velocity/acceleration features
+    updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
+    updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
+    updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
+    updated_graph.x[:num_nodes_to_update, 3] = new_heading
+    updated_graph.x[:num_nodes_to_update, 5] = ax_norm
+    updated_graph.x[:num_nodes_to_update, 6] = ay_norm
+    # ========================================================================
     
     # Only update positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
@@ -325,9 +379,15 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             if scenario is not None:
                 print(f"  ✓ Loaded scenario for map visualization")
             else:
-                print(f"  Warning: Scenario loaded as None. Proceeding without map features.")
+                print(f"  ⚠ Scenario loaded as None. Proceeding without map features.")
+                print(f"    NOTE: TFRecord files may not exist on this machine. Map features require original Waymo data.")
         except Exception as e:
-            print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
+            error_msg = str(e)
+            if "No such file or directory" in error_msg or "tfrecord" in error_msg.lower():
+                print(f"  ⚠ TFRecord file not found - map features unavailable.")
+                print(f"    To enable map features, ensure Waymo TFRecord files are in data/scenario/training/")
+            else:
+                print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
     
     # Move to device
     for t in range(T):
@@ -355,7 +415,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     if actual_rollout_steps < 1:
         print(f"  [ERROR] Not enough timesteps for rollout. T={T}, start_t={start_t}")
-        return None
+        return None, float('inf')
     
     POSITION_SCALE = 100.0
     
@@ -746,7 +806,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         pass
     
     print(f"  -> Saved visualization to {filepath}")
-    return filepath
+    
+    # Return final horizon error for early stopping tracking
+    final_horizon_error = horizon_errors[-1] if horizon_errors else float('inf')
+    return filepath, final_horizon_error
 
 
 def train_epoch_autoregressive(model, dataloader, optimizer, device, 
@@ -1295,10 +1358,11 @@ def run_autoregressive_finetuning(
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
                                    min_lr=1e-7)
     
-    # Initialize early stopping
+    # Initialize early stopping - now based on horizon error, not training loss
     early_stopper = EarlyStopping(
         patience=early_stopping_patience,
-        min_delta=early_stopping_min_delta,
+        min_delta=1.0,  # 1 meter minimum improvement in horizon error
+        target_error=5.0,  # Target: 5m final horizon error
         verbose=True
     )
     
@@ -1432,6 +1496,9 @@ def run_autoregressive_finetuning(
         # Log epoch-level metrics (no explicit step to avoid conflicts with batch logging)
         wandb.log(log_dict, commit=True)
         
+        # Track horizon errors for early stopping
+        epoch_horizon_errors = []
+        
         # Visualize using TRAINING data (more reliable than validation)
         if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
             try:
@@ -1441,10 +1508,14 @@ def run_autoregressive_finetuning(
                 for viz_batch in train_loader:
                     if viz_count >= 4:
                         break
-                    visualize_autoregressive_rollout(
+                    result = visualize_autoregressive_rollout(
                         model, viz_batch, epoch, num_rollout_steps, 
                         device, is_parallel, save_dir=VIZ_DIR
                     )
+                    if isinstance(result, tuple):
+                        filepath, final_error = result
+                        if final_error != float('inf') and not np.isnan(final_error):
+                            epoch_horizon_errors.append(final_error)
                     viz_count += 1
                 print(f"  Created {viz_count} visualizations\n")
             except Exception as e:
@@ -1452,11 +1523,29 @@ def run_autoregressive_finetuning(
                 print(f"  Warning: Visualization failed: {e}")
                 traceback.print_exc()
         
-        # Early stopping based on training loss
-        early_stopper(train_metrics['loss'])
+        # Calculate average horizon error for early stopping
+        if epoch_horizon_errors:
+            avg_horizon_error = np.mean(epoch_horizon_errors)
+            print(f"\n  [EPOCH {epoch+1}] Average Final Horizon Error: {avg_horizon_error:.2f}m (across {len(epoch_horizon_errors)} scenarios)")
+            
+            # Log to wandb
+            wandb.log({
+                "avg_final_horizon_error_m": avg_horizon_error,
+                "min_horizon_error_m": min(epoch_horizon_errors),
+                "max_horizon_error_m": max(epoch_horizon_errors),
+            }, commit=True)
+            
+            # Early stopping based on horizon error
+            early_stopper(avg_horizon_error)
+        else:
+            # Fallback to training loss if no visualizations
+            avg_horizon_error = train_metrics['loss'] * 100  # Scale to be comparable
+            early_stopper(avg_horizon_error)
         
-        if train_metrics['loss'] < best_val_loss:
-            best_val_loss = train_metrics['loss']
+        # Determine metric to use for best model saving
+        current_metric = avg_horizon_error
+        if current_metric < best_val_loss:
+            best_val_loss = current_metric
             save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
             save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, save_filename)
             model_to_save = get_model_for_saving(model, is_parallel)
@@ -1466,6 +1555,7 @@ def run_autoregressive_finetuning(
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_metrics['loss'],
+                'avg_horizon_error': avg_horizon_error if epoch_horizon_errors else None,
                 'num_rollout_steps': num_rollout_steps,
                 'sampling_strategy': sampling_strategy
             }
@@ -1473,7 +1563,7 @@ def run_autoregressive_finetuning(
             if 'config' in checkpoint:
                 checkpoint_data['config'] = checkpoint['config']
             torch.save(checkpoint_data, save_path)
-            print(f"  -> Saved best model to {save_filename} (train_loss: {train_metrics['loss']:.4f})")
+            print(f"  -> Saved best model to {save_filename} (horizon_error: {best_val_loss:.2f}m)")
         
         # Check early stopping
         if early_stopper.early_stop:
