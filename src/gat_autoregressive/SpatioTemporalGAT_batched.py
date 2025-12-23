@@ -1,10 +1,14 @@
 """Batched Spatio-Temporal GAT architecture for trajectory prediction.
 
 This version supports TRUE multi-scenario batching for better GPU utilization.
-Key improvement: Maintains separate GRU hidden states per scenario in the batch,
-allowing parallel processing of multiple scenarios.
+Key improvement: Maintains separate GRU hidden states per (scenario, agent_id),
+allowing parallel processing of multiple scenarios while keeping per-agent temporal memory.
 
-Architecture: Static GAT (spatial) + Batched GRU (temporal) + MLP (decoder)
+Architecture: Static GAT (spatial) + Per-Agent GRU (temporal) + MLP (decoder)
+
+CRITICAL: The GRU hidden state must be tracked PER AGENT using agent_ids,
+not by position index. This ensures each agent maintains its own temporal memory
+even when agents enter/leave or get reordered between timesteps.
 
 Performance gains:
 - 2-4x speedup with batch_size=4-8 on modern GPUs
@@ -98,13 +102,16 @@ class SpatioTemporalGATBatched(nn.Module):
             nn.Linear(hidden_dim // 2, output_dim)
         )
         
-        # Per-scenario GRU hidden states
-        # Shape: [num_layers, batch_size, max_agents, hidden_dim]
-        # We'll reshape to [num_layers, batch_size * max_agents, hidden_dim] for GRU
+        # Per-agent GRU hidden states - TRACKED BY AGENT ID
+        # Dictionary: (scenario_batch_idx, agent_id) -> hidden_state tensor [num_layers, 1, hidden_dim]
+        # This ensures each agent maintains its own temporal memory regardless of order
+        self.agent_hidden_states = {}
+        
+        # Legacy attributes for backward compatibility
         self.gru_hidden = None
         self.current_batch_size = 0
-        self.current_agents_per_scenario = None  # Track actual agent counts
-        self.current_max_agents = None  # Track max agents for consistent dense batching
+        self.current_agents_per_scenario = None
+        self.current_max_agents = None
         
         self._init_weights()
     
@@ -130,6 +137,9 @@ class SpatioTemporalGATBatched(nn.Module):
                                  num_agents=None, device=None):
         """Reset GRU hidden states for new batch of scenarios.
         
+        CRITICAL: This clears all per-agent hidden states, starting fresh.
+        Call this at the START of each new scenario/batch, not between timesteps!
+        
         Supports two calling conventions for backward compatibility:
         1. Batched: reset_gru_hidden_states(batch_size=B, agents_per_scenario=[n1, n2, ...])
         2. Simple: reset_gru_hidden_states(num_agents=N) - treats as single scenario
@@ -140,24 +150,24 @@ class SpatioTemporalGATBatched(nn.Module):
             num_agents: Total number of agents (for simple single-scenario compatibility)
             device: Device to create tensor on
         """
+        # CRITICAL: Clear per-agent hidden state dictionary for new scenarios
+        self.agent_hidden_states = {}
+        
         # Handle simple num_agents call (backward compatibility with visualization)
         if num_agents is not None and batch_size is None:
-            # Simple mode: treat as single scenario with num_agents agents
             batch_size = 1
             agents_per_scenario = [num_agents]
         
         if batch_size is None or agents_per_scenario is None:
-            # Just reset to None - will be initialized in forward pass
             self.gru_hidden = None
             return
             
         self.current_batch_size = batch_size
         self.current_agents_per_scenario = agents_per_scenario
         max_agents = max(agents_per_scenario)
-        self.current_max_agents = max_agents  # Store for forward pass to use
+        self.current_max_agents = max_agents
         
-        # Hidden state: [num_layers, B * max_agents, hidden_dim]
-        # We use max_agents padding so all scenarios have same shape
+        # Legacy hidden state for compatibility (will be replaced by per-agent tracking)
         self.gru_hidden = torch.zeros(
             self.num_gru_layers,
             batch_size * max_agents,
@@ -201,8 +211,11 @@ class SpatioTemporalGATBatched(nn.Module):
         return h
     
     def forward(self, x, edge_index, edge_weight=None, batch=None, 
-                batch_size=None, batch_num=-1, timestep=-1):
+                batch_size=None, batch_num=-1, timestep=-1, agent_ids=None):
         """Forward pass for one timestep with batched scenarios.
+        
+        CRITICAL: Now tracks GRU hidden states PER AGENT using agent_ids.
+        Each agent maintains its own temporal memory regardless of order in batch.
         
         Args:
             x: Node features [total_nodes, input_dim] (concatenated from B scenarios)
@@ -212,6 +225,7 @@ class SpatioTemporalGATBatched(nn.Module):
             batch_size: Number of scenarios in batch (B)
             batch_num: Batch number (for logging)
             timestep: Timestep in sequence (for logging)
+            agent_ids: List of agent IDs for each node (for per-agent hidden state tracking)
             
         Returns:
             Displacement predictions [total_nodes, output_dim]
@@ -223,77 +237,71 @@ class SpatioTemporalGATBatched(nn.Module):
         if batch is None or batch_size is None or batch_size == 1:
             return self._forward_single_scenario(x, edge_index, batch_num, timestep)
         
-        # ===== BATCHED MULTI-SCENARIO PROCESSING =====
+        # ===== BATCHED MULTI-SCENARIO PROCESSING WITH PER-AGENT GRU =====
         
         # 1. Spatial encoding (already batched via PyG)
+        # GAT processes all agents together, using graph structure for attention
         spatial_features = self.spatial_encoding(x, edge_index)
         
-        # 2. Convert to dense batch for GRU: [B, max_nodes, hidden_dim]
-        # CRITICAL: Use self.current_max_agents if available to ensure consistent sizing
-        # with the GRU hidden state initialized in reset_gru_hidden_states.
-        # If not available, compute dynamically (but this may cause hidden state resets)
-        use_max_nodes = self.current_max_agents if self.current_max_agents is not None else None
+        # 2. Process each agent through GRU individually with per-agent hidden states
+        # This ensures each agent maintains its own temporal memory
+        batch_np = batch.cpu().numpy()
         
-        # to_dense_batch pads scenarios with fewer nodes
-        dense_spatial, mask = to_dense_batch(spatial_features, batch, max_num_nodes=use_max_nodes)
-        # dense_spatial: [B, max_nodes, hidden_dim]
-        # mask: [B, max_nodes] - True for real nodes, False for padding
+        # Get or create hidden states for each agent
+        temporal_features_list = []
+        new_hidden_states = {}
         
-        B, max_nodes, hidden_dim = dense_spatial.shape
+        for node_idx in range(total_nodes):
+            scenario_idx = int(batch_np[node_idx])
+            
+            # Get agent ID - use node_idx as fallback if agent_ids not provided
+            if agent_ids is not None and node_idx < len(agent_ids):
+                agent_id = agent_ids[node_idx]
+            else:
+                agent_id = node_idx  # Fallback: use node index (less robust)
+            
+            # Create unique key for this agent in this scenario
+            agent_key = (scenario_idx, agent_id)
+            
+            # Get or initialize hidden state for this agent
+            if agent_key in self.agent_hidden_states:
+                h_agent = self.agent_hidden_states[agent_key]
+            else:
+                # New agent - initialize with zeros
+                h_agent = torch.zeros(
+                    self.num_gru_layers, 1, self.hidden_dim,
+                    device=device, dtype=spatial_features.dtype
+                )
+            
+            # GRU forward for this agent: input [1, 1, hidden_dim]
+            agent_spatial = spatial_features[node_idx:node_idx+1].unsqueeze(0)  # [1, 1, hidden_dim]
+            agent_output, new_h = self.gru(agent_spatial, h_agent)
+            
+            # Store new hidden state (detached to prevent memory growth)
+            new_hidden_states[agent_key] = new_h.detach()
+            
+            # Collect temporal features
+            temporal_features_list.append(agent_output.squeeze(0).squeeze(0))  # [hidden_dim]
         
-        # 3. Initialize or resize GRU hidden state if needed
-        # This should only trigger if reset_gru_hidden_states wasn't called properly
-        if (self.gru_hidden is None or 
-            self.gru_hidden.size(1) != B * max_nodes or
-            self.gru_hidden.device != device):
-            # Log warning when this happens unexpectedly (indicates potential bug)
-            if self.gru_hidden is not None and self.gru_hidden.size(1) != B * max_nodes:
-                print(f"  [WARNING] GRU hidden state size mismatch: expected {B * max_nodes}, got {self.gru_hidden.size(1)}. Resetting.")
-            self.gru_hidden = torch.zeros(
-                self.num_gru_layers,
-                B * max_nodes,
-                self.hidden_dim,
-                device=device
-            )
+        # Update hidden states dictionary
+        self.agent_hidden_states = new_hidden_states
         
-        # 4. Reshape for GRU: [1, B*max_nodes, hidden_dim]
-        # Each "agent" across all scenarios is treated as a batch element
-        gru_input = dense_spatial.view(1, B * max_nodes, hidden_dim)
+        # Stack temporal features: [total_nodes, hidden_dim]
+        temporal_features = torch.stack(temporal_features_list, dim=0)
         
-        # 5. GRU forward pass
-        gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
-        self.gru_hidden = new_hidden.detach()
+        # 3. Skip connection: concatenate temporal features with original node features
+        decoder_input = torch.cat([temporal_features, x], dim=-1)
         
-        # 6. Reshape back: [B, max_nodes, hidden_dim]
-        temporal_features_dense = gru_output.view(B, max_nodes, hidden_dim)
-        
-        # 7. Convert back to sparse format using mask
-        # Extract only the real nodes (not padding)
-        temporal_features = temporal_features_dense[mask]  # [total_nodes, hidden_dim]
-        
-        # 8. Also need original x in dense format for skip connection
-        # Use same max_num_nodes to match the mask from step 2
-        dense_x, _ = to_dense_batch(x, batch, max_num_nodes=use_max_nodes)
-        x_sparse = dense_x[mask]  # Should equal original x
-        
-        # 9. Skip connection: concatenate temporal features with original node features
-        # Use x_sparse instead of x to ensure dimension consistency after dense conversion
-        decoder_input = torch.cat([temporal_features, x_sparse], dim=-1)
-        
-        # 10. Decode predictions
+        # 4. Decode predictions
         predictions = self.decoder(decoder_input)
         
         # Clamp to prevent explosive predictions
-        # Normalized displacement of 0.1 = 10m per 0.1s = 100 m/s (way too fast)
-        # Reasonable max: 0.05 = 5m per 0.1s = 50 m/s (still very fast but prevents explosion)
         predictions = torch.clamp(predictions, min=-0.5, max=0.5)
         
         if debug_mode:
-            print(f"------ Batched GAT Forward (B={B}) at timestep {timestep}: ------")
-            print(f"  Total nodes: {total_nodes}, Max nodes/scenario: {max_nodes}")
-            print(f"  Spatial features: {spatial_features.shape}")
-            print(f"  Dense spatial: {dense_spatial.shape}")
-            print(f"  Temporal features: {temporal_features.shape}")
+            print(f"------ Batched GAT Forward (B={batch_size}) at timestep {timestep}: ------")
+            print(f"  Total nodes: {total_nodes}")
+            print(f"  Unique agents tracked: {len(self.agent_hidden_states)}")
             print(f"  Predictions: {predictions.shape}")
         
         return predictions
