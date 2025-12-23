@@ -33,3 +33,6 @@ src/autoregressive_model/checkpoints/*
 *.hdf5
 
 vectornet.md
+src/vectornet/data/training/*
+src/vectornet/data/validation/*
+src/vectornet/data/testing/*
