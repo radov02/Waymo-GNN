@@ -240,7 +240,7 @@ gat_viz_dir_testing = 'visualizations/autoreg/gat/testing'  # GAT test visualiza
 # - For 48GB GPU (RTX 6000): use 32-64 for high GPU utilization
 batch_size = 48  # Increased from 32 to maximize RTX 6000 48GB utilization
 learning_rate = 0.001
-epochs = 40
+epochs = 20
 gradient_clip_value = 1.0
 # Learning rate scheduler settings
 scheduler_patience = 5  # Wait 5 epochs before reducing LR
