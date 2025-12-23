@@ -476,10 +476,44 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             completed_steps = step + 1
             
-            # Update graph for next step
-            graph_for_prediction = update_graph_with_prediction(
-                graph_for_prediction, pred, device
-            )
+            # NEW APPROACH: Use GT graph from next timestep with only position offset
+            # This gives the model correct GT velocity features for each agent
+            next_target_t = start_t + step + 2
+            if next_target_t < T:
+                next_gt_graph = batched_graph_sequence[next_target_t]
+                # Start with GT graph (all correct features)
+                graph_for_prediction = next_gt_graph.clone()
+                
+                # But offset position by our prediction to teach error correction
+                # Find common agents between current and next graph
+                if hasattr(next_gt_graph, 'agent_ids') and hasattr(next_gt_graph, 'batch'):
+                    next_agent_ids = list(next_gt_graph.agent_ids)
+                    next_batch = next_gt_graph.batch.cpu().numpy()
+                    
+                    # Filter to first scenario only
+                    if B > 1:
+                        next_batch0_mask = (next_gt_graph.batch == 0)
+                        next_batch0_indices = torch.where(next_batch0_mask)[0].cpu().numpy()
+                    else:
+                        next_batch0_indices = np.arange(next_gt_graph.num_nodes)
+                    
+                    # Apply position offset to common agents
+                    for local_idx, agent_id in enumerate(current_agent_ids):
+                        if agent_id in agent_pred_positions:
+                            # Find this agent in next graph
+                            for next_idx in next_batch0_indices:
+                                if next_idx < len(next_agent_ids) and next_agent_ids[next_idx] == agent_id:
+                                    global_idx = pred_scenario_indices[local_idx]
+                                    if global_idx < pred_disp.shape[0]:
+                                        # Offset position by our prediction
+                                        pred_offset = pred_disp[global_idx]
+                                        graph_for_prediction.pos[next_idx] = graph_for_prediction.pos[next_idx] + torch.from_numpy(pred_offset).to(device)
+                                    break
+            else:
+                # Fallback: use prediction-based update
+                graph_for_prediction = update_graph_with_prediction(
+                    graph_for_prediction, pred, device, update_velocity=False
+                )
         
         print(f"  [DEBUG VIZ] Completed {completed_steps} prediction steps")
         
@@ -671,31 +705,51 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     return filepath
 
 
-def update_graph_with_prediction(graph, pred_displacement, device):
+def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
     """
-    Update node features based on predicted displacement for next autoregressive step.
+    Update graph for next autoregressive step - NEW APPROACH: Keep GT velocity features.
     
     The model predicts normalized displacement (dx/100, dy/100).
-    Node features expect normalized velocity (vx/30, vy/30) and acceleration (ax/10, ay/10).
     
     Updates:
-    - Position (graph.pos): updated with FULL predicted displacement
-    - Velocity (features 0-1): BLENDED between old and prediction-derived (0.7 factor)
-    - Speed (feature 2): magnitude of blended velocity
-    - Heading (feature 3): direction of blended velocity  
-    - Acceleration (features 5-6): change in blended velocity from previous step
+    - Position (graph.pos): updated with predicted displacement (* 100)
+    - Velocity (features 0-1): NOT UPDATED (kept from GT) for stable agent differentiation
+    - Speed (feature 2): NOT UPDATED (kept from GT)
+    - Heading (feature 3): NOT UPDATED (kept from GT)
+    - Acceleration: NOT UPDATED (kept from GT)
     - Relative position to SDC (features 7-8): recalculated based on new positions
     - Distance to SDC (feature 9): recalculated
     - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
     
-    VELOCITY BLENDING RATIONALE:
-    - Positions use 100% of predicted displacement (required for trajectory accuracy)
-    - Velocity features use 70% prediction + 30% old velocity for smoother transitions
-    - This helps the model handle its own prediction errors during autoregressive rollout
-    - Pure prediction-derived velocity can cause instability if predictions are noisy
+    Args:
+        graph: PyG Data object with node features and positions
+        pred_displacement: Predicted normalized displacement [N, 2]
+        device: Torch device
+        velocity_smoothing: Not used in new approach
+        update_velocity: If False, keep original velocity features (helps stabilize training)
+    
+    NOTE: We now keep GT velocity features to maintain agent-specific behavior.
+    The model learns to predict displacement from current (possibly offset) position to GT next position.
+    This prevents trajectory convergence that happened when updating velocity from predictions.
     """
+    global _size_mismatch_warned
     updated_graph = graph.clone()
     dt = 0.1  # 0.1 second timestep
+    
+    # CRITICAL: Handle size mismatch between prediction and graph
+    # This can happen when agents enter/leave between timesteps
+    num_nodes_graph = updated_graph.x.shape[0]
+    num_nodes_pred = pred_displacement.shape[0]
+    
+    if num_nodes_pred != num_nodes_graph:
+        # Size mismatch - only update the overlapping nodes
+        if not _size_mismatch_warned:
+            print(f"  [WARNING] Size mismatch in update_graph_with_prediction: pred={num_nodes_pred}, graph={num_nodes_graph} (suppressing further warnings)")
+            _size_mismatch_warned = True
+        num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
+        pred_displacement = pred_displacement[:num_nodes_to_update]
+    else:
+        num_nodes_to_update = num_nodes_graph
     
     # Normalization constants (must match graph_creation_functions.py)
     POSITION_SCALE = 100.0  # displacement normalization
@@ -703,60 +757,20 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
-    # Convert normalized displacement to normalized velocity
-    # The model predicts displacement, and we derive velocity from it.
-    # pred_displacement is normalized (actual_displacement / 100)
-    # Convert to actual velocity: actual_disp = pred_disp * 100, velocity = actual_disp / dt
-    # Then normalize velocity: vx_norm = velocity / MAX_SPEED
-    # Combined: vx_norm = (pred_disp * 100 / 0.1) / 30 = pred_disp * 1000 / 30 = pred_disp * 33.33
-    velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
+    # ============== NaN DETECTION AND HANDLING ==============
+    if torch.isnan(pred_displacement).any():
+        print(f"  [WARNING] NaN detected in predictions! Replacing with zeros to prevent cascade.")
+        pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
     
-    pred_vx_norm = pred_displacement[:, 0] * velocity_scale
-    pred_vy_norm = pred_displacement[:, 1] * velocity_scale
+    # NEW APPROACH: Keep GT velocity features, don't update them
+    # This maintains correct agent-specific kinematic features
+    # The model learns: given current position + GT velocity, predict displacement to GT next position
     
-    # Get old velocity for acceleration calculation and blending
-    old_vx_norm = updated_graph.x[:, 0].clone()
-    old_vy_norm = updated_graph.x[:, 1].clone()
-    
-    # VELOCITY BLENDING: Use MINIMAL blend to prevent error amplification
-    # - 1.0 = fully use prediction-derived (causes severe instability)
-    # - 0.0 = keep old velocity (most stable but ignores predictions)
-    # - 0.3 = mostly keep old velocity with small update from predictions
-    # REDUCED from 0.7 to 0.3 to prevent error amplification
-    # The position is still updated with FULL prediction, so trajectories diverge anyway
-    VELOCITY_BLEND_FACTOR = 0.3
-    new_vx_norm = old_vx_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vx_norm * VELOCITY_BLEND_FACTOR
-    new_vy_norm = old_vy_norm * (1 - VELOCITY_BLEND_FACTOR) + pred_vy_norm * VELOCITY_BLEND_FACTOR
-    
-    # Calculate normalized acceleration (change from old to new velocity)
-    # Using the BLENDED velocities ensures acceleration is also smoothed
-    accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
-    ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
-    ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-    
-    # Clamp to reasonable ranges - TIGHTER clamping to prevent extreme values
-    # MAX_SPEED=30 m/s, so:
-    # - normalized 1.5 = 45 m/s (162 km/h) - max for highway
-    # - normalized 2.0 = 60 m/s (216 km/h) - absolute max
-    # Reduced from 3.0 to 1.5 to prevent runaway predictions
-    new_vx_norm = torch.clamp(new_vx_norm, -1.5, 1.5)
-    new_vy_norm = torch.clamp(new_vy_norm, -1.5, 1.5)
-    ax_norm = torch.clamp(ax_norm, -2.0, 2.0)  # ~2g max acceleration
-    ay_norm = torch.clamp(ay_norm, -2.0, 2.0)
-    
-    # Update velocity/acceleration features
-    updated_graph.x[:, 0] = new_vx_norm
-    updated_graph.x[:, 1] = new_vy_norm
-    updated_graph.x[:, 2] = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)  # normalized speed
-    updated_graph.x[:, 3] = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # heading [-1, 1]
-    updated_graph.x[:, 5] = ax_norm
-    updated_graph.x[:, 6] = ay_norm
-    
-    # Update positions and position-dependent features
+    # Only update positions (keep all other features from GT)
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
         # pred_displacement is normalized, multiply by 100 to get actual displacement
         actual_displacement = pred_displacement * POSITION_SCALE
-        updated_graph.pos = updated_graph.pos + actual_displacement
+        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
         
         # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
         if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
@@ -834,36 +848,70 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     return updated_graph
 
 
-def scheduled_sampling_probability(epoch, total_epochs, strategy='linear'):
+def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
     """
     Calculate probability of using model's own prediction vs ground truth.
     
     Args:
-        epoch: Current epoch
-        total_epochs: Total training epochs
-        strategy: 'linear', 'exponential', or 'inverse_sigmoid'
+        epoch: Current epoch (0-indexed)
+        total_epochs: Total number of training epochs
+        strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
+        warmup_epochs: Number of epochs before increasing scheduled sampling (reduced from 10)
     
     Returns:
-        p: Probability of using model's prediction (0 = teacher forcing, 1 = full autoregressive)
+        Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    progress = epoch / total_epochs
+    # IMPORTANT: Always use SOME scheduled sampling, even in warmup!
+    # This teaches the model to handle its own prediction errors from the start.
+    # A minimum of 10% autoregressive prevents the model from overfitting to perfect inputs.
+    min_sampling = 0.1  # Always use at least 10% model predictions
     
-    if strategy == 'linear':
-        # Linear increase from 0 to 1
-        return progress
+    if epoch < warmup_epochs:
+        return min_sampling
+    
+    # Adjust progress to account for warmup period
+    adjusted_epoch = epoch - warmup_epochs
+    adjusted_total = total_epochs - warmup_epochs
+    progress = adjusted_epoch / max(1, adjusted_total)
+    
+    # Scale from min_sampling to max_sampling (0.6) over training
+    # Higher max allows model to learn error correction better
+    max_sampling = 0.6
+    
+    if strategy == 'linear' or strategy == 'delayed_linear':
+        return min_sampling + progress * (max_sampling - min_sampling)
     elif strategy == 'exponential':
-        # Slower start, faster end
-        return 1 - np.exp(-5 * progress)
+        return min_sampling + (1 - np.exp(-5 * progress)) * (max_sampling - min_sampling)
     elif strategy == 'inverse_sigmoid':
-        # S-curve: slow start, fast middle, slow end
-        k = 10  # steepness
-        return 1 / (1 + np.exp(-k * (progress - 0.5)))
+        k = 10
+        return min_sampling + (1 / (1 + np.exp(-k * (progress - 0.5)))) * (max_sampling - min_sampling)
     else:
-        return progress
+        return min_sampling + progress * (max_sampling - min_sampling)
+
+
+def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
+    """Curriculum learning: gradually increase rollout length.
+    
+    Start with short rollouts (easier) and increase over training.
+    This helps the model learn to handle error accumulation gradually.
+    
+    Args:
+        epoch: Current epoch (0-indexed)
+        max_rollout_steps: Maximum rollout steps (e.g., 89)
+        total_epochs: Total training epochs
+    
+    Returns:
+        Number of rollout steps to use this epoch
+    """
+    # Start with 10 steps, linearly increase to max over training
+    min_steps = 10
+    progress = epoch / max(1, total_epochs - 1)
+    steps = int(min_steps + (max_rollout_steps - min_steps) * progress)
+    return min(steps, max_rollout_steps)
 
 
 def train_epoch_autoregressive(model, dataloader, optimizer, device, 
-                               sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0):
+                               sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0, total_epochs=40):
     """
     Train one epoch with scheduled sampling for autoregressive prediction (with optional AMP).
     
@@ -934,37 +982,43 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         )
         
         optimizer.zero_grad()
-        accumulated_loss = None
-        valid_steps = 0
         
-        # Process sequence with autoregressive rollout
-        # Cap rollout to available timesteps
-        effective_rollout = min(num_rollout_steps, T - 1)
+        # CURRICULUM LEARNING: Start with short rollouts, gradually increase
+        # This helps model learn to handle error accumulation progressively
+        curriculum_steps = curriculum_rollout_steps(epoch, num_rollout_steps, total_epochs)
+        effective_rollout = min(curriculum_steps, T - 1)
         if effective_rollout < 1:
-            continue  # Skip this batch - not enough timesteps
+            continue
         
-        for t in range(max(1, T - effective_rollout)):
-            current_graph = batched_graph_sequence[t]
-            if current_graph.y is None:
-                continue
-            
-            # CRITICAL: Reset GRU hidden states for each new rollout starting point
-            # Must use proper batch sizing, not just total num_agents!
-            base_model.reset_gru_hidden_states(
-                batch_size=B,
-                agents_per_scenario=agents_per_scenario,
-                device=device
-            )
-            
-            # Autoregressive rollout from this starting point
-            rollout_loss = None
-            graph_for_prediction = current_graph
-            is_using_predicted_positions = False  # Track if we've diverged from GT
-            
-            for step in range(effective_rollout):
-                target_t = t + step + 1
-                if target_t >= T:
-                    break
+        # Log curriculum progress occasionally
+        if batch_idx == 0 and epoch % 5 == 0:
+            print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
+        
+        # Position scale for computing targets
+        POSITION_SCALE = 100.0
+        
+        # SIMPLIFIED: Do ONE rollout per batch starting from t=0
+        # This is cleaner and more effective than trying many starting points
+        # Each batch contains multiple scenarios, so we get plenty of diversity
+        t = 0  # Always start from beginning of scenario
+        current_graph = batched_graph_sequence[t]
+        if current_graph.y is None:
+            continue
+        
+        # GRU hidden states were reset at batch start
+        # No need to reset again here
+        
+        rollout_loss = None
+        graph_for_prediction = current_graph
+        is_using_predicted_positions = False  # Track if we're using our predictions
+        accumulated_mse = 0.0
+        accumulated_cosine = 0.0
+        num_steps_counted = 0
+        
+        for step in range(effective_rollout):
+            target_t = t + step + 1
+            if target_t >= T:
+                break
                 
                 # source_graph is the graph at time (t + step) - this is where we predict FROM
                 # target_graph is the graph at time target_t - this is where we predict TO
@@ -1113,27 +1167,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                                 continue
                         
                         pred_aligned = pred[pred_indices]
-                        
-                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                            gt_next_pos = target_graph.pos[target_indices]
-                            current_pred_pos = graph_for_prediction.pos[pred_indices]
-                            target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
-                            target = target.to(pred.dtype)
-                        else:
-                            target = source_graph.y[source_indices].to(pred.dtype)
+                        # ALWAYS use GT displacement from source_graph.y as target
+                        # This is the correct GT displacement regardless of scheduled sampling
+                        target = source_graph.y[source_indices].to(pred.dtype)
                     else:
                         pred_aligned = pred
-                        if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                            if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
-                                gt_next_pos = target_graph.pos
-                                current_pred_pos = graph_for_prediction.pos
-                                target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
-                                target = target.to(pred.dtype)
-                            else:
-                                target = source_graph.y.to(pred.dtype)
-                                is_using_predicted_positions = False
-                        else:
-                            target = source_graph.y.to(pred.dtype)
+                        # ALWAYS use GT displacement from source_graph.y as target
+                        target = source_graph.y.to(pred.dtype)
                     
                     # MSE loss
                     mse_loss = F.mse_loss(pred_aligned, target)
@@ -1164,28 +1204,63 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     use_prediction = np.random.random() < sampling_prob
                     
                     if use_prediction:
-                        # BPTT: Don't detach predictions to allow gradient flow through time
-                        # This lets the model learn to correct its own errors across multiple steps
-                        # Memory usage increases but learning is much faster
+                        # Use our prediction to update position, but keep GT features
+                        # This gives the model correct kinematic features for next prediction
                         graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred, device  # No .detach() - enables BPTT
+                            graph_for_prediction, pred.detach(), device, update_velocity=False
                         )
                         is_using_predicted_positions = True
                     else:
-                        # Teacher forcing: use ground truth
-                        graph_for_prediction = batched_graph_sequence[target_t]
+                        # Teacher forcing: use ground truth from next timestep
+                        # NEW APPROACH: Use GT graph with only position offset
+                        next_target_t = target_t + 1
+                        if next_target_t < T:
+                            next_gt_graph = batched_graph_sequence[next_target_t]
+                            # Start with GT graph (all correct features)
+                            graph_for_prediction = next_gt_graph.clone()
+                            
+                            # But offset position by our prediction error to teach error correction
+                            # This is key: model learns to predict from offset positions
+                            if pred_indices is not None and hasattr(next_gt_graph, 'pos'):
+                                # Get corresponding indices in next_gt_graph via agent alignment
+                                next_agent_ids = getattr(next_gt_graph, 'agent_ids', None)
+                                next_batch = getattr(next_gt_graph, 'batch', None)
+                                if next_agent_ids is not None and next_batch is not None:
+                                    next_batch_np = next_batch.cpu().numpy()
+                                    next_id_to_idx = {}
+                                    for idx in range(next_gt_graph.x.shape[0]):
+                                        bid = int(next_batch_np[idx])
+                                        aid = next_agent_ids[idx]
+                                        next_id_to_idx[(bid, aid)] = idx
+                                    
+                                    # Find agents that exist in both current and next
+                                    common_ids_list = sorted(common_ids)
+                                    next_indices_list = []
+                                    for gid in common_ids_list:
+                                        if gid in next_id_to_idx:
+                                            next_indices_list.append(next_id_to_idx[gid])
+                                    
+                                    if len(next_indices_list) > 0:
+                                        next_indices_tensor = torch.tensor(next_indices_list, device=device, dtype=torch.long)
+                                        pred_for_offset = pred[pred_indices[:len(next_indices_list)]]
+                                        actual_displacement = pred_for_offset.detach() * POSITION_SCALE
+                                        graph_for_prediction.pos[next_indices_tensor] = graph_for_prediction.pos[next_indices_tensor] + actual_displacement
+                        else:
+                            graph_for_prediction = batched_graph_sequence[target_t]
                         is_using_predicted_positions = False
             
-            if rollout_loss is not None:
-                if accumulated_loss is None:
-                    accumulated_loss = rollout_loss
-                else:
-                    accumulated_loss = accumulated_loss + rollout_loss
-                valid_steps += 1
         
-        # Backpropagate with optional AMP scaling
-        if valid_steps > 0 and accumulated_loss is not None:
-            avg_loss = accumulated_loss / valid_steps
+        # End of single rollout - do backward pass immediately
+        if rollout_loss is not None:
+            # Check for NaN in loss before backward
+            if torch.isnan(rollout_loss):
+                print(f"  [WARNING] NaN in rollout_loss! Skipping backward.")
+                continue
+            
+            # Normalize by number of rollout steps for consistent gradient magnitudes
+            avg_loss = rollout_loss / max(1, count)
+            
+            # Backward pass with optional AMP scaling
             if use_amp_local:
                 scaler.scale(avg_loss).backward()
                 scaler.unscale_(optimizer)
@@ -1196,37 +1271,50 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 avg_loss.backward()
                 clip_grad_norm_(model.parameters(), gradient_clip_value)
                 optimizer.step()
-            total_loss += accumulated_loss.item()
+            total_loss += rollout_loss.item()
             steps += 1
         
         if batch_idx % 20 == 0:
-            loss_val = accumulated_loss.item() if hasattr(accumulated_loss, 'item') else accumulated_loss
+            loss_val = rollout_loss.item() if rollout_loss is not None and hasattr(rollout_loss, 'item') else 0.0
             avg_mse_so_far = total_mse / max(1, count)
             avg_cos_so_far = total_cosine / max(1, count)
-            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
-            print(f"  Loss={loss_val/max(1,valid_steps):.4f}, Sampling prob={sampling_prob:.2f}")
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
+            print(f"  Loss={loss_val/max(1,count):.4f}, Sampling prob={sampling_prob:.2f}")
             print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
             
-            # Log per-step metrics to wandb (no explicit step - let wandb auto-increment)
+            # Log per-step metrics to wandb
             wandb.log({
-                "train/batch_loss": loss_val / max(1, valid_steps),
+                "train/batch_loss": loss_val / max(1, count),
                 "train/batch_mse": avg_mse_so_far,
                 "train/batch_rmse_meters": rmse_meters,
                 "train/batch_cosine_sim": avg_cos_so_far,
                 "train/batch_sampling_prob": sampling_prob,
             }, commit=True)
     
-    # Print epoch summary
+    # Print epoch summary with RMSE in meters
     final_mse = total_mse / max(1, count)
     final_rmse = (final_mse ** 0.5) * 100.0
+    final_loss = total_loss / max(1, steps)
+    final_cosine = total_cosine / max(1, count)
+    
     print(f"\n[TRAIN EPOCH SUMMARY]")
-    print(f"  Loss: {total_loss / max(1, steps):.6f} | MSE: {final_mse:.6f} | RMSE: {final_rmse:.2f}m")
-    print(f"  CosSim: {total_cosine / max(1, count):.4f}")
+    print(f"  Loss: {final_loss:.6f} | Per-step MSE: {final_mse:.6f} | Per-step RMSE: {final_rmse:.2f}m")
+    print(f"  CosSim: {final_cosine:.4f}")
+    print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
+    
+    # Log per-epoch metrics to wandb
+    wandb.log({
+        "train_epoch/loss": final_loss,
+        "train_epoch/mse": final_mse,
+        "train_epoch/rmse_meters": final_rmse,
+        "train_epoch/cosine_sim": final_cosine,
+        "train_epoch/sampling_prob": sampling_prob,
+    }, commit=True)
     
     return {
-        'loss': total_loss / max(1, steps),
-        'mse': total_mse / max(1, count),
-        'cosine_sim': total_cosine / max(1, count)
+        'loss': final_loss,
+        'mse': final_mse,
+        'cosine_sim': final_cosine
     }
 
 
@@ -1619,7 +1707,7 @@ def run_autoregressive_finetuning(
         # Training
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 
-            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch
+            sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch, total_epochs=num_epochs
         )
         
         # Validation (always full autoregressive)
