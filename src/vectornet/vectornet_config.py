@@ -79,6 +79,11 @@ vectornet_prediction_horizon = 50
 # Standard is 10 timesteps (1 second at 10Hz)
 vectornet_history_length = 10
 
+# Number of agents to predict trajectories for per scenario
+# Set to None to predict for ALL valid agents (can be slow)
+# Set to an integer to limit (e.g., 8 for top 8 agents)
+vectornet_num_agents_to_predict = 8
+
 # ============== VectorNet Training Hyperparameters ==============
 # Batch size: Number of scenarios per batch
 # VectorNet is more memory efficient than CNN, so can use larger batches

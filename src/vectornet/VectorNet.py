@@ -823,11 +823,13 @@ class VectorNetTFRecord(nn.Module):
                 - map_vectors: [N_map, 13]
                 - map_polyline_ids: [N_map]
                 - map_batch: [N_map]
-                - target_polyline_idx: [B]
+                - target_polyline_indices: [total_targets] - indices of all target agent polylines
+                - target_scenario_batch: [total_targets] - which scenario each target belongs to
+                - total_targets: int - total number of targets across all scenarios
                 - batch_size: int
                 
         Returns:
-            predictions: [B, prediction_horizon, output_dim]
+            predictions: [total_targets, prediction_horizon, output_dim]
         """
         device = next(self.parameters()).device
         batch_size = batch['batch_size']
@@ -836,7 +838,7 @@ class VectorNetTFRecord(nn.Module):
         agent_polyline_ids = batch['agent_polyline_ids'].to(device)
         map_vectors = batch['map_vectors'].to(device)
         map_polyline_ids = batch['map_polyline_ids'].to(device)
-        target_polyline_idx = batch['target_polyline_idx'].to(device)
+        target_polyline_indices = batch['target_polyline_indices'].to(device)  # [total_targets]
         
         # Encode agent polylines
         agent_polyline_features, agent_unique_ids = self._encode_polylines(
@@ -878,12 +880,12 @@ class VectorNetTFRecord(nn.Module):
             masked_outputs = global_features[mask]
             self.masked_predictions = self.node_decoder(masked_outputs)
         
-        # Extract target agent features
-        # target_polyline_idx indexes into agent polylines, which are first in the concatenation
-        target_features = global_features[target_polyline_idx]  # [B, hidden_dim]
+        # Extract target agent features for ALL target agents
+        # target_polyline_indices contains indices into agent polylines for all targets
+        target_features = global_features[target_polyline_indices]  # [total_targets, hidden_dim]
         
-        # Decode trajectories
-        predictions = self.trajectory_decoder(target_features)  # [B, prediction_horizon, output_dim]
+        # Decode trajectories for all target agents
+        predictions = self.trajectory_decoder(target_features)  # [total_targets, prediction_horizon, output_dim]
         
         return predictions
     

@@ -70,6 +70,7 @@ class Config:
     future_len: int = 50
     max_train_scenarios: int = None  # None = all
     max_val_scenarios: int = 1000
+    num_agents_to_predict: int = 8  # Number of agents per scenario to predict (None = all)
     
     # Model
     hidden_dim: int = 128
@@ -288,27 +289,55 @@ def compute_metrics(pred, target, valid_mask=None):
 def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_ids,
                                      agent_vectors, agent_polyline_ids, agent_batch_idx,
                                      map_vectors, map_polyline_ids, map_batch_idx,
+                                     target_scenario_batch, num_targets_per_scenario,
                                      epoch, output_dir, max_scenarios=2):
-    """Visualize VectorNet trajectory predictions with map features.
+    """Visualize VectorNet trajectory predictions with map features and multi-agent support.
     
     Args:
-        predictions: [B, T, 2] predicted positions
-        targets: [B, T, 2] ground truth positions  
-        valid_mask: [B, T] validity mask
-        scenario_ids: List of scenario IDs
+        predictions: [total_targets, T, 2] predicted positions for all targets
+        targets: [total_targets, T, 2] ground truth positions for all targets
+        valid_mask: [total_targets, T] validity mask for all targets
+        scenario_ids: List of scenario IDs (length = batch_size)
         agent_vectors: [N_agents, 16] agent polyline vectors
         agent_polyline_ids: [N_agents] polyline IDs for agents
         agent_batch_idx: [N_agents] batch index for each agent vector
         map_vectors: [N_map, 13] map polyline vectors
         map_polyline_ids: [N_map] polyline IDs for map features
         map_batch_idx: [N_map] batch index for each map vector
+        target_scenario_batch: [total_targets] which scenario each target belongs to
+        num_targets_per_scenario: [batch_size] how many targets per scenario
         epoch: Current epoch number
         output_dir: Directory to save visualizations
         max_scenarios: Maximum number of scenarios to visualize
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    B = min(predictions.shape[0], max_scenarios)
+    # Handle numpy/tensor conversion
+    if torch.is_tensor(predictions):
+        predictions = predictions.cpu().numpy()
+    if torch.is_tensor(targets):
+        targets = targets.cpu().numpy()
+    if torch.is_tensor(valid_mask):
+        valid_mask = valid_mask.cpu().numpy()
+    if torch.is_tensor(target_scenario_batch):
+        target_scenario_batch = target_scenario_batch.cpu().numpy()
+    if torch.is_tensor(num_targets_per_scenario):
+        num_targets_per_scenario = num_targets_per_scenario.cpu().numpy()
+    if torch.is_tensor(agent_vectors):
+        agent_vectors = agent_vectors.cpu().numpy()
+    if torch.is_tensor(agent_polyline_ids):
+        agent_polyline_ids = agent_polyline_ids.cpu().numpy()
+    if torch.is_tensor(agent_batch_idx):
+        agent_batch_idx = agent_batch_idx.cpu().numpy()
+    if torch.is_tensor(map_vectors):
+        map_vectors = map_vectors.cpu().numpy()
+    if torch.is_tensor(map_polyline_ids):
+        map_polyline_ids = map_polyline_ids.cpu().numpy()
+    if torch.is_tensor(map_batch_idx):
+        map_batch_idx = map_batch_idx.cpu().numpy()
+    
+    batch_size = len(scenario_ids)
+    num_scenarios_to_viz = min(batch_size, max_scenarios)
     T = predictions.shape[1]
     
     # Map feature type colors (from one-hot encoding in map_vectors)
@@ -324,28 +353,38 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         6: ('#A0A0A0', 'Driveways'),    # driveway - gray
     }
     
+    # Colors for multiple agent predictions
+    AGENT_PREDICTION_COLORS = [
+        '#E41A1C',  # Red
+        '#377EB8',  # Blue
+        '#4DAF4A',  # Green
+        '#984EA3',  # Purple
+        '#FF7F00',  # Orange
+        '#FFFF33',  # Yellow
+        '#A65628',  # Brown
+        '#F781BF',  # Pink
+    ]
+    
     # Create figure with subplots
-    fig, axes = plt.subplots(1, B, figsize=(10*B, 10))
-    if B == 1:
+    fig, axes = plt.subplots(1, num_scenarios_to_viz, figsize=(10*num_scenarios_to_viz, 10))
+    if num_scenarios_to_viz == 1:
         axes = [axes]
     
-    for i in range(B):
-        ax = axes[i]
-        pred = predictions[i].numpy()  # [T, 2]
-        tgt = targets[i].numpy()       # [T, 2]
-        mask = valid_mask[i].numpy() if valid_mask is not None else np.ones(T)
+    for scenario_idx in range(num_scenarios_to_viz):
+        ax = axes[scenario_idx]
         
-        # Filter by valid mask
-        valid_idx = mask > 0.5
-        pred_valid = pred[valid_idx]
-        tgt_valid = tgt[valid_idx]
+        # Get target indices for this scenario
+        target_mask = target_scenario_batch == scenario_idx
+        scenario_predictions = predictions[target_mask]  # [num_targets_this_scenario, T, 2]
+        scenario_targets = targets[target_mask]           # [num_targets_this_scenario, T, 2]
+        scenario_valid = valid_mask[target_mask]          # [num_targets_this_scenario, T]
+        num_targets = scenario_predictions.shape[0]
         
         # ===== Plot Map Features =====
-        # Get map vectors for this scenario
         if map_batch_idx is not None and len(map_batch_idx) > 0:
-            scenario_map_mask = (map_batch_idx == i)
-            scenario_map_vectors = map_vectors[scenario_map_mask].numpy()
-            scenario_map_polyline_ids = map_polyline_ids[scenario_map_mask].numpy()
+            scenario_map_mask = (map_batch_idx == scenario_idx)
+            scenario_map_vectors = map_vectors[scenario_map_mask]
+            scenario_map_polyline_ids = map_polyline_ids[scenario_map_mask]
             
             # Group by polyline ID and plot
             unique_polylines = np.unique(scenario_map_polyline_ids)
@@ -363,30 +402,25 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
                 type_idx = np.argmax(type_onehot)
                 color, label = MAP_COLORS.get(type_idx, ('#CCCCCC', 'Unknown'))
                 
-                # Extract start and end points (ds_x, ds_y at 0:2, de_x, de_y at 3:5)
-                # Build polyline from consecutive vectors
+                # Extract start and end points
                 points = []
                 for vec in poly_vectors:
                     points.append([vec[0], vec[1]])  # ds_x, ds_y
-                # Add last endpoint
                 if len(poly_vectors) > 0:
                     points.append([poly_vectors[-1, 3], poly_vectors[-1, 4]])  # de_x, de_y
-                
                 points = np.array(points)
                 
-                # Plot with label only once per type
                 show_label = type_idx not in plotted_types
                 ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1, 
                        alpha=0.4, label=label if show_label else None)
                 plotted_types.add(type_idx)
         
-        # ===== Plot Agent Trajectories (from agent_vectors) =====
+        # ===== Plot Agent Histories =====
         if agent_batch_idx is not None and len(agent_batch_idx) > 0:
-            scenario_agent_mask = (agent_batch_idx == i)
-            scenario_agent_vectors = agent_vectors[scenario_agent_mask].numpy()
-            scenario_agent_polyline_ids = agent_polyline_ids[scenario_agent_mask].numpy()
+            scenario_agent_mask = (agent_batch_idx == scenario_idx)
+            scenario_agent_vectors = agent_vectors[scenario_agent_mask]
+            scenario_agent_polyline_ids = agent_polyline_ids[scenario_agent_mask]
             
-            # Group by polyline ID and plot history trajectories
             unique_agent_polylines = np.unique(scenario_agent_polyline_ids)
             
             for j, poly_id in enumerate(unique_agent_polylines[:20]):  # Limit to 20 agents
@@ -396,55 +430,75 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
                 if len(poly_vectors) == 0:
                     continue
                 
-                # Build trajectory from vectors
                 points = []
                 for vec in poly_vectors:
-                    points.append([vec[0], vec[1]])  # ds_x, ds_y (start point)
-                # Add last endpoint
+                    points.append([vec[0], vec[1]])
                 if len(poly_vectors) > 0:
-                    points.append([poly_vectors[-1, 3], poly_vectors[-1, 4]])  # de_x, de_y
-                
+                    points.append([poly_vectors[-1, 3], poly_vectors[-1, 4]])
                 points = np.array(points)
                 
-                # Plot agent history (lighter for other agents)
-                alpha = 0.8 if j == 0 else 0.3
-                lw = 2 if j == 0 else 1
+                alpha = 0.6 if j < num_targets else 0.3
+                lw = 2 if j < num_targets else 1
                 ax.plot(points[:, 0], points[:, 1], 'g-', linewidth=lw, alpha=alpha,
                        label='Agent History' if j == 0 else None)
         
-        # ===== Plot Ground Truth Future Trajectory =====
-        ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], 'b-', linewidth=3, 
-                label='GT Future', alpha=0.9, zorder=10)
-        ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c='blue', s=150, 
-                   marker='o', zorder=15, edgecolors='white', linewidth=2)
-        ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='blue', s=150, 
-                   marker='s', zorder=15, edgecolors='white', linewidth=2)
+        # ===== Plot Multi-Agent Predictions and Ground Truth =====
+        total_ade = 0.0
+        total_fde = 0.0
         
-        # ===== Plot Predicted Future Trajectory =====
-        ax.plot(pred_valid[:, 0], pred_valid[:, 1], 'r--', linewidth=3, 
-                label='Predicted', alpha=0.9, zorder=10)
-        ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c='red', s=150, 
-                   marker='x', zorder=15, linewidth=3)
+        for t_idx in range(num_targets):
+            pred = scenario_predictions[t_idx]  # [T, 2]
+            tgt = scenario_targets[t_idx]       # [T, 2]
+            mask = scenario_valid[t_idx]        # [T]
+            
+            valid_idx = mask > 0.5
+            pred_valid = pred[valid_idx]
+            tgt_valid = tgt[valid_idx]
+            
+            if len(pred_valid) == 0:
+                continue
+            
+            # Color for this agent
+            color_idx = t_idx % len(AGENT_PREDICTION_COLORS)
+            pred_color = AGENT_PREDICTION_COLORS[color_idx]
+            
+            # Plot Ground Truth (blue shades)
+            gt_alpha = 0.9 if t_idx == 0 else 0.6
+            ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], '-', color='blue', 
+                    linewidth=2, alpha=gt_alpha, zorder=10,
+                    label='GT Future' if t_idx == 0 else None)
+            ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='blue', s=80, 
+                       marker='s', zorder=15, alpha=gt_alpha)
+            
+            # Plot Prediction
+            ax.plot(pred_valid[:, 0], pred_valid[:, 1], '--', color=pred_color,
+                    linewidth=2, alpha=0.9, zorder=10,
+                    label=f'Pred Agent {t_idx+1}')
+            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=pred_color, s=100, 
+                       marker='x', zorder=15, linewidth=2)
+            
+            # Compute metrics
+            disp = np.linalg.norm(pred_valid - tgt_valid, axis=1)
+            total_ade += disp.mean()
+            total_fde += disp[-1] if len(disp) > 0 else 0
         
-        # Compute ADE/FDE for this scenario
-        disp = np.linalg.norm(pred_valid - tgt_valid, axis=1)
-        ade = disp.mean()
-        fde = disp[-1] if len(disp) > 0 else 0
+        avg_ade = total_ade / max(1, num_targets)
+        avg_fde = total_fde / max(1, num_targets)
         
         # Get scenario ID
-        sid = scenario_ids[i] if i < len(scenario_ids) else f"scenario_{i}"
+        sid = scenario_ids[scenario_idx] if scenario_idx < len(scenario_ids) else f"scenario_{scenario_idx}"
         if isinstance(sid, bytes):
             sid = sid.decode('utf-8')
         
-        ax.set_title(f'Scenario: {sid[:25]}...\nADE: {ade:.2f}m | FDE: {fde:.2f}m', 
+        ax.set_title(f'Scenario: {sid[:25]}...\n{num_targets} agents | Avg ADE: {avg_ade:.2f}m | Avg FDE: {avg_fde:.2f}m', 
                     fontsize=12, fontweight='bold')
         ax.set_xlabel('X (m)', fontsize=11)
         ax.set_ylabel('Y (m)', fontsize=11)
         ax.set_aspect('equal', adjustable='box')
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper left', fontsize=9, ncol=2)
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
     
-    plt.suptitle(f'VectorNet Predictions - Epoch {epoch+1}', fontsize=16, fontweight='bold')
+    plt.suptitle(f'VectorNet Multi-Agent Predictions - Epoch {epoch+1}', fontsize=16, fontweight='bold')
     plt.tight_layout()
     
     # Save
@@ -729,6 +783,7 @@ def main():
         history_len=config.history_len,
         future_len=config.future_len,
         max_scenarios=config.max_train_scenarios,
+        num_agents_to_predict=config.num_agents_to_predict,
     )
     
     val_dataset = VectorNetTFRecordDataset(
@@ -737,6 +792,7 @@ def main():
         history_len=config.history_len,
         future_len=config.future_len,
         max_scenarios=config.max_val_scenarios,
+        num_agents_to_predict=config.num_agents_to_predict,
     )
     
     print(f"Training scenarios: {len(train_dataset)}")
@@ -868,21 +924,23 @@ def main():
                     batch_gpu = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                     predictions = model(batch_gpu)
                     
-                    # Visualize predictions with map features
+                    # Visualize predictions with map features (multi-agent version)
                     visualize_vectornet_predictions(
                         predictions=predictions.cpu(),
                         targets=batch['future_positions'],
                         valid_mask=batch['future_valid'],
-                        scenario_ids=batch.get('scenario_ids', [f'scenario_{i}' for i in range(predictions.shape[0])]),
+                        scenario_ids=batch.get('scenario_ids', [f'scenario_{i}' for i in range(batch['batch_size'])]),
                         agent_vectors=batch['agent_vectors'],
                         agent_polyline_ids=batch['agent_polyline_ids'],
-                        agent_batch_idx=batch['agent_batch'],  # Correct key name
+                        agent_batch_idx=batch['agent_batch'],
                         map_vectors=batch['map_vectors'],
                         map_polyline_ids=batch['map_polyline_ids'],
-                        map_batch_idx=batch['map_batch'],  # Correct key name
+                        map_batch_idx=batch['map_batch'],
+                        target_scenario_batch=batch['target_scenario_batch'],
+                        num_targets_per_scenario=batch['num_targets_per_scenario'],
                         epoch=epoch,
                         output_dir=config.viz_dir,
-                        max_scenarios=2  # Only 2 scenarios
+                        max_scenarios=2
                     )
                 model.train()
         
