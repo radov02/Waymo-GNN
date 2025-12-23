@@ -291,7 +291,7 @@ def compute_metrics(pred, target, valid_mask=None):
 def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_ids,
                                      agent_vectors, agent_polyline_ids, agent_batch_idx,
                                      map_vectors, map_polyline_ids, map_batch_idx,
-                                     target_scenario_batch, num_targets_per_scenario,
+                                     target_polyline_indices, target_scenario_batch, num_targets_per_scenario,
                                      epoch, output_dir, max_scenarios=2):
     """Visualize VectorNet trajectory predictions with map features and multi-agent support.
     
@@ -306,6 +306,7 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         map_vectors: [N_map, 13] map polyline vectors
         map_polyline_ids: [N_map] polyline IDs for map features
         map_batch_idx: [N_map] batch index for each map vector
+        target_polyline_indices: [total_targets] polyline index for each target agent
         target_scenario_batch: [total_targets] which scenario each target belongs to
         num_targets_per_scenario: [batch_size] how many targets per scenario
         epoch: Current epoch number
@@ -325,6 +326,8 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         target_scenario_batch = target_scenario_batch.cpu().numpy()
     if torch.is_tensor(num_targets_per_scenario):
         num_targets_per_scenario = num_targets_per_scenario.cpu().numpy()
+    if torch.is_tensor(target_polyline_indices):
+        target_polyline_indices = target_polyline_indices.cpu().numpy()
     if torch.is_tensor(agent_vectors):
         agent_vectors = agent_vectors.cpu().numpy()
     if torch.is_tensor(agent_polyline_ids):
@@ -368,7 +371,29 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
         scenario_predictions = predictions[target_mask]  # [num_targets_this_scenario, T, 2]
         scenario_targets = targets[target_mask]           # [num_targets_this_scenario, T, 2]
         scenario_valid = valid_mask[target_mask]          # [num_targets_this_scenario, T]
+        scenario_target_polylines = target_polyline_indices[target_mask]  # [num_targets_this_scenario]
         num_targets = scenario_predictions.shape[0]
+        
+        # Get current positions for each target agent from their polylines
+        # Current position = end point of last vector in agent's polyline
+        scenario_agent_mask = (agent_batch_idx == scenario_idx)
+        scenario_agent_vectors = agent_vectors[scenario_agent_mask]
+        scenario_agent_polyline_ids = agent_polyline_ids[scenario_agent_mask]
+        
+        current_positions = []
+        for t_idx in range(num_targets):
+            target_poly_id = scenario_target_polylines[t_idx]
+            # Find vectors belonging to this polyline
+            poly_mask = scenario_agent_polyline_ids == target_poly_id
+            poly_vectors = scenario_agent_vectors[poly_mask]
+            if len(poly_vectors) > 0:
+                # Current position is de_x, de_y of last vector (indices 3, 4)
+                current_pos = poly_vectors[-1, 3:5]  # [de_x, de_y]
+                current_positions.append(current_pos)
+            else:
+                # Fallback to first valid target position
+                current_positions.append(scenario_targets[t_idx, 0, :2])
+        current_positions = np.array(current_positions)  # [num_targets, 2]
         
         # ===== Plot Map Features =====
         if map_batch_idx is not None and len(map_batch_idx) > 0:
@@ -439,27 +464,34 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
                 agent_color = VIBRANT_COLORS[color_idx]
                 agent_label = f'Agent {t_idx+1} (Pred)'
             
+            # Get current position for this agent
+            curr_pos = current_positions[t_idx]
+            
+            # Build complete trajectories starting from current position
+            gt_traj = np.vstack([curr_pos.reshape(1, 2), tgt_valid])  # [T+1, 2]
+            pred_traj = np.vstack([curr_pos.reshape(1, 2), pred_valid])  # [T+1, 2]
+            
             # Plot Ground Truth (solid black line, same as finetune.py)
-            ax.plot(tgt_valid[:, 0], tgt_valid[:, 1], '-', color='black', 
+            ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color='black', 
                     linewidth=1.5, alpha=0.8, zorder=10,
                     label='Ground Truth' if t_idx == 0 else None)
             
-            # Plot start position (circle marker) - smaller
-            ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c=agent_color, s=35, 
+            # Plot start position (circle marker at current position) - smaller
+            ax.scatter(curr_pos[0], curr_pos[1], c=agent_color, s=35, 
                        marker='o', zorder=15, edgecolors='black', linewidth=0.5,
                        label=None)
             
             # Plot GT endpoint (x marker in black)
-            ax.scatter(tgt_valid[-1, 0], tgt_valid[-1, 1], c='black', s=60, 
+            ax.scatter(gt_traj[-1, 0], gt_traj[-1, 1], c='black', s=60, 
                        marker='x', zorder=15, linewidth=2,
                        label=None)
             
             # Plot Prediction (dashed line with agent color)
-            ax.plot(pred_valid[:, 0], pred_valid[:, 1], '--', color=agent_color,
+            ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=agent_color,
                     linewidth=2, alpha=0.9, zorder=11)
             
             # Plot predicted endpoint (square marker) - smaller and more transparent
-            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=agent_color, s=30, 
+            ax.scatter(pred_traj[-1, 0], pred_traj[-1, 1], c=agent_color, s=30, 
                        marker='s', zorder=16, alpha=0.5, edgecolors='black', linewidth=0.5)
             
             # Add to legend
@@ -940,6 +972,7 @@ def main():
                         map_vectors=batch['map_vectors'],
                         map_polyline_ids=batch['map_polyline_ids'],
                         map_batch_idx=batch['map_batch'],
+                        target_polyline_indices=batch['target_polyline_indices'],
                         target_scenario_batch=batch['target_scenario_batch'],
                         num_targets_per_scenario=batch['num_targets_per_scenario'],
                         epoch=epoch,
