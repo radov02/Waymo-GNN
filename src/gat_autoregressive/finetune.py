@@ -1274,15 +1274,50 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     
                     # Update position on a clone of GT graph
                     graph_for_prediction = gt_graph_next.clone()
+                    
+                    # CRITICAL: Only update positions for agents that exist in BOTH graphs
+                    # Use the same alignment logic we use for computing loss
                     if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        # Add the prediction error to GT position
-                        # This simulates being at a slightly wrong position due to accumulated errors
-                        # graph_for_prediction.pos already has GT pos at target_t
-                        # We want: current_predicted_pos = prev_pos + pred_displacement
-                        # But we use GT graph features, just offset position slightly
-                        prev_gt_pos = batched_graph_sequence[t + step].pos
-                        predicted_pos = prev_gt_pos + pred_displacement
-                        graph_for_prediction.pos = predicted_pos
+                        # Get current graph (where we just predicted from)
+                        current_graph = batched_graph_sequence[t + step]
+                        
+                        # Only update if we have valid predictions and agent alignment
+                        if (hasattr(current_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
+                            hasattr(current_graph, 'batch') and hasattr(gt_graph_next, 'batch')):
+                            
+                            # Build agent ID mappings (same as loss computation)
+                            current_batch_np = current_graph.batch.cpu().numpy()
+                            next_batch_np = gt_graph_next.batch.cpu().numpy()
+                            
+                            current_id_to_idx = {}
+                            for idx in range(len(current_graph.agent_ids)):
+                                bid = int(current_batch_np[idx])
+                                aid = current_graph.agent_ids[idx]
+                                current_id_to_idx[(bid, aid)] = idx
+                            
+                            next_id_to_idx = {}
+                            for idx in range(len(gt_graph_next.agent_ids)):
+                                bid = int(next_batch_np[idx])
+                                aid = gt_graph_next.agent_ids[idx]
+                                next_id_to_idx[(bid, aid)] = idx
+                            
+                            # Find common agents
+                            common_ids = set(current_id_to_idx.keys()) & set(next_id_to_idx.keys())
+                            
+                            if len(common_ids) > 0:
+                                # For each common agent, offset their position
+                                for gid in common_ids:
+                                    current_idx = current_id_to_idx[gid]
+                                    next_idx = next_id_to_idx[gid]
+                                    
+                                    if current_idx < pred_displacement.shape[0]:
+                                        # Apply prediction to current position to get offset position
+                                        graph_for_prediction.pos[next_idx] = current_graph.pos[current_idx] + pred_displacement[current_idx]
+                        else:
+                            # No agent IDs - assume same ordering (less safe)
+                            if current_graph.pos.shape[0] == pred_displacement.shape[0]:
+                                num_to_update = min(pred_displacement.shape[0], graph_for_prediction.pos.shape[0])
+                                graph_for_prediction.pos[:num_to_update] = current_graph.pos[:num_to_update] + pred_displacement[:num_to_update]
                     
                     is_using_predicted_positions = True  # Position is predicted, features are GT
                 else:
