@@ -382,7 +382,7 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     return updated_graph
 
 
-def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
+def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=10):
     """Calculate probability of using model's own prediction vs ground truth.
     
     Args:
@@ -394,8 +394,8 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # DELAYED START: Use pure teacher forcing for first warmup_epochs
-    # This lets the model learn basic predictions before handling its own errors
+    # EXTENDED WARMUP: Use pure teacher forcing for first warmup_epochs
+    # The model needs more time to learn basic predictions before handling errors
     if epoch < warmup_epochs:
         return 0.0
     
@@ -404,15 +404,40 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     adjusted_total = total_epochs - warmup_epochs
     progress = adjusted_epoch / max(1, adjusted_total)
     
+    # CAP at 50% - never go full autoregressive during training
+    # The model needs some GT signal to learn from
+    max_sampling = 0.5
+    
     if strategy == 'linear' or strategy == 'delayed_linear':
-        return progress
+        return progress * max_sampling
     elif strategy == 'exponential':
-        return 1 - np.exp(-5 * progress)
+        return (1 - np.exp(-5 * progress)) * max_sampling
     elif strategy == 'inverse_sigmoid':
         k = 10
-        return 1 / (1 + np.exp(-k * (progress - 0.5)))
+        return (1 / (1 + np.exp(-k * (progress - 0.5)))) * max_sampling
     else:
-        return progress
+        return progress * max_sampling
+
+
+def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
+    """Curriculum learning: gradually increase rollout length.
+    
+    Start with short rollouts (easier) and increase over training.
+    This helps the model learn to handle error accumulation gradually.
+    
+    Args:
+        epoch: Current epoch (0-indexed)
+        max_rollout_steps: Maximum rollout steps (e.g., 89)
+        total_epochs: Total training epochs
+    
+    Returns:
+        Number of rollout steps to use this epoch
+    """
+    # Start with 10 steps, linearly increase to max over training
+    min_steps = 10
+    progress = epoch / max(1, total_epochs - 1)
+    steps = int(min_steps + (max_rollout_steps - min_steps) * progress)
+    return min(steps, max_rollout_steps)
 
 
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
@@ -990,9 +1015,16 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         
         optimizer.zero_grad()
         
-        effective_rollout = min(num_rollout_steps, T - 1)
+        # CURRICULUM LEARNING: Start with short rollouts, gradually increase
+        # This helps model learn to handle error accumulation progressively
+        curriculum_steps = curriculum_rollout_steps(epoch, num_rollout_steps, total_epochs)
+        effective_rollout = min(curriculum_steps, T - 1)
         if effective_rollout < 1:
             continue
+        
+        # Log curriculum progress occasionally
+        if batch_idx == 0 and epoch % 5 == 0:
+            print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
         
         # Position scale for computing targets
         POSITION_SCALE = 100.0
@@ -1222,13 +1254,15 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 use_prediction = np.random.random() < sampling_prob
                 
                 if use_prediction:
-                    # BPTT: Don't detach predictions to allow gradient flow through time
-                    # This lets the model learn to correct its own errors across multiple steps
-                    # Memory usage increases but learning is much faster
+                    # CRITICAL FIX: DETACH predictions to prevent gradient explosion!
+                    # BPTT through 89 steps with non-linear ops (clamp, sqrt, atan2) causes NaN.
+                    # We still expose model to its own predictions (distribution shift),
+                    # but only backprop through the current step, not the entire chain.
+                    # This is the standard "scheduled sampling" approach.
                     graph_for_prediction = update_graph_with_prediction(
-                        graph_for_prediction, pred, device,  # No .detach() - enables BPTT
+                        graph_for_prediction, pred.detach(), device,  # DETACH for stability
                         velocity_smoothing=velocity_smoothing,
-                        update_velocity=update_velocity
+                        update_velocity=False  # Don't update velocity - keep GT features
                     )
                     is_using_predicted_positions = True  # Now we're using predicted positions
                 else:
@@ -1675,15 +1709,19 @@ def run_autoregressive_finetuning(
         
         print(f"\nEpoch {epoch+1}/{num_epochs} (sampling_prob={sampling_prob:.3f})")
         
+        # Calculate curriculum rollout steps for this epoch
+        curr_rollout = curriculum_rollout_steps(epoch, num_rollout_steps, num_epochs)
+        
         # Explain what sampling_prob means for clarity
         if sampling_prob < 0.01:
             print(f"  [TEACHER FORCING] Using GT graphs as input for each step.")
-            print(f"  → Training loss will be low, but model doesn't learn to handle its own errors.")
-            print(f"  → Visualization (always autoregressive) will show higher errors.")
-        elif sampling_prob > 0.99:
-            print(f"  [FULL AUTOREGRESSIVE] Using model's own predictions as input.")
+            print(f"  → Model learns single-step prediction with perfect input.")
+            print(f"  → Visualization (autoregressive) tests multi-step performance.")
+        elif sampling_prob > 0.49:
+            print(f"  [MAX SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input (capped at 50%).")
         else:
-            print(f"  [MIXED] {sampling_prob*100:.0f}% predicted input, {(1-sampling_prob)*100:.0f}% GT input.")
+            print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted, {(1-sampling_prob)*100:.0f}% GT input.")
+        print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) → target: {num_rollout_steps} steps")
         
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 

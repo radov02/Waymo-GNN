@@ -279,7 +279,9 @@ checkpoint_dir = 'checkpoints'
 checkpoint_dir_autoreg = 'checkpoints/autoregressive'  # Autoregressive model checkpoints
 
 # ============== Autoregressive Fine-tuning ==============
-autoreg_num_rollout_steps = 89       # Number of steps to roll out (20 = 2.0s horizon)
+# CURRICULUM LEARNING: Training starts with 10 steps and gradually increases
+# to max_rollout_steps over training. This helps model learn progressively.
+autoreg_num_rollout_steps = 50       # Max rollout steps (50 = 5.0s horizon) - curriculum starts at 10
 autoreg_num_epochs = 40             # Number of fine-tuning epochs
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 1  # Visualize every N epochs during fine-tuning
