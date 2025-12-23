@@ -247,7 +247,8 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
         
         # New velocity from predictions - but clamp the raw displacement first to prevent explosion
         # Reasonable single-step displacement: max ~3m (30 m/s * 0.1s), normalized = 0.03
-        max_disp_norm = 0.05  # 5m max per step - anything larger is likely an error
+        # TIGHTER CLAMPING: 3m max to match physical limits (30 m/s * 0.1s = 3m)
+        max_disp_norm = 0.03  # 3m max per step - physically realistic limit
         pred_disp_clamped = torch.clamp(pred_displacement, -max_disp_norm, max_disp_norm)
         
         new_vx_norm_raw = pred_disp_clamped[:, 0] * velocity_scale
@@ -381,11 +382,29 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     return updated_graph
 
 
-def scheduled_sampling_probability(epoch, total_epochs, strategy='linear'):
-    """Calculate probability of using model's own prediction vs ground truth."""
-    progress = epoch / total_epochs
+def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
+    """Calculate probability of using model's own prediction vs ground truth.
     
-    if strategy == 'linear':
+    Args:
+        epoch: Current epoch (0-indexed)
+        total_epochs: Total number of training epochs
+        strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
+        warmup_epochs: Number of epochs to use pure teacher forcing before scheduled sampling
+    
+    Returns:
+        Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
+    """
+    # DELAYED START: Use pure teacher forcing for first warmup_epochs
+    # This lets the model learn basic predictions before handling its own errors
+    if epoch < warmup_epochs:
+        return 0.0
+    
+    # Adjust progress to account for warmup period
+    adjusted_epoch = epoch - warmup_epochs
+    adjusted_total = total_epochs - warmup_epochs
+    progress = adjusted_epoch / max(1, adjusted_total)
+    
+    if strategy == 'linear' or strategy == 'delayed_linear':
         return progress
     elif strategy == 'exponential':
         return 1 - np.exp(-5 * progress)
@@ -415,8 +434,9 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
-    # Fixed velocity smoothing: 0.7 = 70% old velocity, 30% new predicted velocity
-    velocity_smoothing = 0.7
+    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
+    # Higher smoothing for more stable autoregressive rollout
+    velocity_smoothing = 0.9
     
     # Always update velocity features - smoothing handles stability
     update_velocity = True
@@ -919,9 +939,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     steps = 0
     count = 0
     
-    # Fixed velocity smoothing: 0.7 = 70% old velocity, 30% new predicted velocity
-    # This provides stability while still allowing velocity updates from predictions
-    velocity_smoothing = 0.7
+    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
+    # Higher smoothing for more stable training - prevents velocity explosion
+    velocity_smoothing = 0.9
     
     # Always update velocity features - each agent needs differentiated inputs
     update_velocity = True
@@ -1294,8 +1314,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     steps = 0
     count = 0
     
-    # Fixed velocity smoothing: 0.7 = 70% old velocity, 30% new predicted velocity
-    velocity_smoothing = 0.7
+    # Fixed velocity smoothing: 0.9 = 90% old velocity, 10% new predicted velocity
+    # Higher smoothing for stability
+    velocity_smoothing = 0.9
     
     # Always update velocity features
     update_velocity = True
@@ -1608,6 +1629,14 @@ def run_autoregressive_finetuning(
             print(f"  [WARNING] Validation loader is empty! Disabling validation.")
             val_loader = None
     
+    # ============== DISABLE AMP FOR FINETUNING ==============
+    # AMP (float16) causes NaN in long autoregressive rollouts due to:
+    # 1. Accumulated numerical errors over 89 steps
+    # 2. Velocity feedback amplifying small FP16 errors
+    # 3. GradScaler having issues with inconsistent loss magnitudes
+    # OVERRIDE: Force AMP off for stability during autoregressive finetuning
+    use_amp_finetune = False  # DISABLED - use float32 for stability
+    
     print(f"\n{'='*80}")
     print(f"GAT AUTOREGRESSIVE FINE-TUNING (BATCHED)")
     print(f"{'='*80}")
@@ -1616,22 +1645,24 @@ def run_autoregressive_finetuning(
     print(f"Model: SpatioTemporalGATBatched (supports batch_size > 1)")
     print(f"Batch size: {batch_size} scenarios processed in parallel")
     print(f"Rollout steps: {num_rollout_steps} ({num_rollout_steps * 0.1}s horizon)")
-    print(f"Sampling strategy: {sampling_strategy}")
+    print(f"Sampling strategy: {sampling_strategy} (with 5-epoch warmup)")
     print(f"Fine-tuning LR: {finetune_lr}")
     print(f"Epochs: {num_epochs}")
     print(f"Early stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
     print(f"Validation: Disabled (using training visualizations)")
-    print(f"Mixed Precision (AMP): {'Enabled' if use_amp and torch.cuda.is_available() else 'Disabled'}")
+    print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
     print(f"Checkpoints: {CHECKPOINT_DIR_AUTOREG}")
     print(f"Visualizations: {VIZ_DIR}")
     print(f"{'='*80}\n")
     
-    # Initialize GradScaler for AMP (only if enabled and CUDA available)
+    # Initialize GradScaler for AMP (DISABLED for finetuning stability)
     scaler = None
-    if use_amp and torch.cuda.is_available():
+    if use_amp_finetune and torch.cuda.is_available():
         scaler = torch.amp.GradScaler('cuda')
         print("[AMP] Mixed Precision Training ENABLED - using float16 for forward pass")
+    else:
+        print("[AMP] DISABLED for autoregressive finetuning (float32 for stability)")
     
     best_val_loss = float('inf')
     
