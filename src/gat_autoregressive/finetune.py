@@ -486,9 +486,18 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     agent_trajectories = {}
     
     with torch.no_grad():
-        # REMOVED: Warm up GRU - this doesn't match training which uses cold-start
-        # The training loop resets GRU at each rollout start, so visualization should too.
-        # Previously: for t in range(start_t): model(...)
+        # WARM UP GRU: Run through timesteps 0 to start_t to build up temporal context
+        # This matches how training processes the full sequence from t=0
+        # Without this, visualization starts with zero hidden states which hurts predictions
+        print(f"  [VIZ] Warming up GRU for {start_t} timesteps...")
+        for warm_t in range(start_t):
+            warm_graph = batched_graph_sequence[warm_t]
+            if warm_graph.x is not None:
+                agent_ids_warm = getattr(warm_graph, 'agent_ids', None)
+                _ = model(warm_graph.x, warm_graph.edge_index,
+                         batch=warm_graph.batch, batch_size=B, batch_num=0, timestep=warm_t,
+                         agent_ids=agent_ids_warm)
+        print(f"  [VIZ] GRU warmup complete. Starting rollout from t={start_t}")
         
         start_graph = batched_graph_sequence[start_t]
         
@@ -1333,93 +1342,97 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             # Position scale for computing targets
             POSITION_SCALE = 100.0
             
-            for t in range(start_t, max(start_t + 1, T - effective_rollout)):
-                current_graph = batched_graph_sequence[t]
-                if current_graph.y is None:
+            # WARM UP GRU: Run through timesteps 0 to start_t to build temporal context
+            # This matches training which processes sequences from t=0
+            for warm_t in range(start_t):
+                warm_graph = batched_graph_sequence[warm_t]
+                if warm_graph.x is not None:
+                    agent_ids_warm = getattr(warm_graph, 'agent_ids', None)
+                    _ = model(warm_graph.x, warm_graph.edge_index,
+                             batch=warm_graph.batch, batch_size=B, batch_num=0, timestep=warm_t,
+                             agent_ids=agent_ids_warm)
+            
+            # Start rollout from start_t (one starting point per batch)
+            current_graph = batched_graph_sequence[start_t]
+            if current_graph.y is None:
+                continue
+            
+            graph_for_prediction = current_graph
+            rollout_loss = 0.0
+            is_using_predicted_positions = False
+            
+            for step in range(effective_rollout):
+                target_t = start_t + step + 1
+                if target_t >= T:
+                    break
+                
+                target_graph = batched_graph_sequence[target_t]
+                if target_graph.y is None:
+                    break
+                
+                if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
+                    graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
                     continue
                 
-                # CRITICAL: Reset GRU hidden states for each new rollout starting point
-                base_model.reset_gru_hidden_states(
+                # GAT forward with agent_ids for per-agent GRU tracking
+                agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
+                pred = model(
+                    graph_for_prediction.x,
+                    graph_for_prediction.edge_index,
+                    batch=graph_for_prediction.batch,
                     batch_size=B,
-                    agents_per_scenario=agents_per_scenario,
-                    device=device
+                    batch_num=0,
+                    timestep=start_t + step,
+                    agent_ids=agent_ids_for_model
                 )
                 
-                graph_for_prediction = current_graph
-                rollout_loss = 0.0
-                is_using_predicted_positions = False  # Track if we're using our predictions
+                # CRITICAL: Compute correct target based on current position
+                if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                    # When using predicted positions, target is displacement from current predicted pos to GT next pos
+                    gt_next_pos = target_graph.pos.to(pred.dtype)
+                    current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
+                    target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                else:
+                    # First step uses GT position
+                    target = target_graph.y.to(pred.dtype)
                 
-                for step in range(effective_rollout):
-                    target_t = t + step + 1
-                    if target_t >= T:
-                        break
-                    
-                    target_graph = batched_graph_sequence[target_t]
-                    if target_graph.y is None:
-                        break
-                    
-                    if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
-                        graph_for_prediction = target_graph
-                        is_using_predicted_positions = False
-                        continue
-                    
-                    # GAT forward with agent_ids for per-agent GRU tracking
-                    agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
-                    pred = model(
-                        graph_for_prediction.x,
-                        graph_for_prediction.edge_index,
-                        batch=graph_for_prediction.batch,
-                        batch_size=B,
-                        batch_num=0,
-                        timestep=t + step,
-                        agent_ids=agent_ids_for_model
+                mse = F.mse_loss(pred, target)
+                
+                # Debug: print position drift for first batch
+                if batch_idx == 0 and not debug_printed:
+                    pos_drift = 0.0
+                    if hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
+                        pos_drift = torch.norm(graph_for_prediction.pos - target_graph.pos, dim=1).mean().item()
+                    if step in [0, 4, 9, 19, 49, 88]:
+                        print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, pos_drift={pos_drift:.1f}m, auto={is_using_predicted_positions}")
+                    if step == 88:
+                        debug_printed = True
+                
+                pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
+                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                
+                rollout_loss += mse
+                total_mse += mse.item()
+                total_cosine += cos_sim.item()
+                count += 1
+                
+                horizon_mse[step] += mse.item()
+                horizon_cosine[step] += cos_sim.item()
+                horizon_counts[step] += 1
+                
+                if step < num_rollout_steps - 1:
+                    graph_for_prediction = update_graph_with_prediction(
+                        graph_for_prediction, pred, device,
+                        velocity_smoothing=velocity_smoothing,
+                        update_velocity=update_velocity
                     )
-                    
-                    # CRITICAL: Compute correct target based on current position
-                    if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        # When using predicted positions, target is displacement from current predicted pos to GT next pos
-                        gt_next_pos = target_graph.pos.to(pred.dtype)
-                        current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
-                        target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
-                    else:
-                        # First step uses GT position
-                        target = target_graph.y.to(pred.dtype)
-                    
-                    mse = F.mse_loss(pred, target)
-                    
-                    # Debug: print position drift for first batch, first rollout start
-                    if batch_idx == 0 and t == start_t and not debug_printed:
-                        pos_drift = 0.0
-                        if hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                            pos_drift = torch.norm(graph_for_prediction.pos - target_graph.pos, dim=1).mean().item()
-                        if step in [0, 4, 9, 19, 49, 88]:
-                            print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, pos_drift={pos_drift:.1f}m, auto={is_using_predicted_positions}")
-                        if step == 88:
-                            debug_printed = True
-                    
-                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
-                    target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
-                    cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
-                    
-                    rollout_loss += mse
-                    total_mse += mse.item()
-                    total_cosine += cos_sim.item()
-                    count += 1
-                    
-                    horizon_mse[step] += mse.item()
-                    horizon_cosine[step] += cos_sim.item()
-                    horizon_counts[step] += 1
-                    
-                    if step < num_rollout_steps - 1:
-                        graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred, device,
-                            velocity_smoothing=velocity_smoothing,
-                            update_velocity=update_velocity
-                        )
-                        is_using_predicted_positions = True  # Now we're using predicted positions
-                
-                total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
-                steps += 1
+                    is_using_predicted_positions = True  # Now we're using predicted positions
+            
+            # After rollout completes
+            total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
+            steps += 1
     
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
@@ -1630,6 +1643,16 @@ def run_autoregressive_finetuning(
         sampling_prob = scheduled_sampling_probability(epoch, num_epochs, sampling_strategy)
         
         print(f"\nEpoch {epoch+1}/{num_epochs} (sampling_prob={sampling_prob:.3f})")
+        
+        # Explain what sampling_prob means for clarity
+        if sampling_prob < 0.01:
+            print(f"  [TEACHER FORCING] Using GT graphs as input for each step.")
+            print(f"  → Training loss will be low, but model doesn't learn to handle its own errors.")
+            print(f"  → Visualization (always autoregressive) will show higher errors.")
+        elif sampling_prob > 0.99:
+            print(f"  [FULL AUTOREGRESSIVE] Using model's own predictions as input.")
+        else:
+            print(f"  [MIXED] {sampling_prob*100:.0f}% predicted input, {(1-sampling_prob)*100:.0f}% GT input.")
         
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 
