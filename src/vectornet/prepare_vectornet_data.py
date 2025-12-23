@@ -4,9 +4,9 @@ This script creates symbolic links or copies Waymo scenario TFRecord files
 to the expected directory structure for VectorNet training.
 
 VectorNetTFRecordDataset expects:
-- data/scenario/training/*.tfrecord
-- data/scenario/validation/*.tfrecord
-- data/scenario/testing/*.tfrecord
+- src/vectornet/data/training/*.tfrecord
+- src/vectornet/data/validation/*.tfrecord
+- src/vectornet/data/testing/*.tfrecord
 
 Usage:
     # Create symbolic links (recommended, no disk space used)
@@ -60,8 +60,10 @@ def find_tfrecord_files(base_dir):
     return splits
 
 
-def setup_target_directories(target_base='data/scenario'):
+def setup_target_directories(target_base=None):
     """Create target directory structure."""
+    if target_base is None:
+        target_base = os.path.join(os.path.dirname(__file__), 'data')
     for split in ['training', 'validation', 'testing']:
         target_dir = os.path.join(target_base, split)
         os.makedirs(target_dir, exist_ok=True)
@@ -111,8 +113,10 @@ def create_links(source_files, target_dir, mode='link', dry_run=False):
                 print(f"  ERROR: Failed to {mode} {source_file}: {e}")
 
 
-def verify_setup(target_base='data/scenario'):
+def verify_setup(target_base=None):
     """Verify that TFRecord files are accessible."""
+    if target_base is None:
+        target_base = os.path.join(os.path.dirname(__file__), 'data')
     print("\n" + "="*60)
     print("Verifying setup...")
     print("="*60)
@@ -148,8 +152,8 @@ def main():
     parser.add_argument(
         '--target_dir',
         type=str,
-        default='data/scenario',
-        help='Target directory for VectorNet (default: data/scenario)'
+        default=None,
+        help='Target directory for VectorNet (default: src/vectornet/data)'
     )
     parser.add_argument(
         '--link',
@@ -168,6 +172,10 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Set default target directory if not provided
+    if args.target_dir is None:
+        args.target_dir = os.path.join(os.path.dirname(__file__), 'data')
     
     # Determine mode
     if args.dry_run:

@@ -60,7 +60,7 @@ class Config:
     """Training configuration."""
     
     # Data
-    data_dir: str = 'data/scenario'
+    data_dir: str = os.path.join(os.path.dirname(__file__), 'data')
     history_len: int = 10
     future_len: int = 50
     max_train_scenarios: int = None  # None = all
@@ -120,8 +120,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train VectorNet on TFRecord data')
     
     # Data
-    parser.add_argument('--data_dir', type=str, default='data/scenario',
-                       help='Base directory for TFRecord data')
+    parser.add_argument('--data_dir', type=str, default=None,
+                       help='Base directory for TFRecord data (default: src/vectornet/data)')
     parser.add_argument('--max_train', type=int, default=None,
                        help='Max training scenarios (None = all)')
     parser.add_argument('--max_val', type=int, default=1000,
@@ -470,7 +470,10 @@ def main():
     config = Config()
     
     # Update config from args
-    config.data_dir = args.data_dir
+    if args.data_dir is None:
+        config.data_dir = os.path.join(os.path.dirname(__file__), 'data')
+    else:
+        config.data_dir = args.data_dir
     config.max_train_scenarios = args.max_train
     config.max_val_scenarios = args.max_val
     config.hidden_dim = args.hidden_dim
