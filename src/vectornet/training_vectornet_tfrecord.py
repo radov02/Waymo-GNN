@@ -392,45 +392,23 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
                 type_idx = np.argmax(type_onehot)
                 color, label = MAP_COLORS.get(type_idx, ('#CCCCCC', 'Unknown'))
                 
-                # Extract start and end points
+                # Extract connected polyline points
+                # Each vector is a segment: (ds_x, ds_y) -> (de_x, de_y)
+                # Build continuous path by following start->end of each segment
                 points = []
-                for vec in poly_vectors:
-                    points.append([vec[0], vec[1]])  # ds_x, ds_y
-                if len(poly_vectors) > 0:
-                    points.append([poly_vectors[-1, 3], poly_vectors[-1, 4]])  # de_x, de_y
+                for i, vec in enumerate(poly_vectors):
+                    if i == 0:
+                        points.append([vec[0], vec[1]])  # First start point
+                    points.append([vec[3], vec[4]])  # End point of each segment
                 points = np.array(points)
                 
                 show_label = type_idx not in plotted_types
-                ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1, 
-                       alpha=0.4, label=label if show_label else None)
+                ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1.5, 
+                       alpha=0.6, label=label if show_label else None, zorder=1)
                 plotted_types.add(type_idx)
         
-        # ===== Plot Agent Histories =====
-        if agent_batch_idx is not None and len(agent_batch_idx) > 0:
-            scenario_agent_mask = (agent_batch_idx == scenario_idx)
-            scenario_agent_vectors = agent_vectors[scenario_agent_mask]
-            scenario_agent_polyline_ids = agent_polyline_ids[scenario_agent_mask]
-            
-            unique_agent_polylines = np.unique(scenario_agent_polyline_ids)
-            
-            for j, poly_id in enumerate(unique_agent_polylines[:20]):  # Limit to 20 agents
-                poly_mask = scenario_agent_polyline_ids == poly_id
-                poly_vectors = scenario_agent_vectors[poly_mask]
-                
-                if len(poly_vectors) == 0:
-                    continue
-                
-                points = []
-                for vec in poly_vectors:
-                    points.append([vec[0], vec[1]])
-                if len(poly_vectors) > 0:
-                    points.append([poly_vectors[-1, 3], poly_vectors[-1, 4]])
-                points = np.array(points)
-                
-                alpha = 0.6 if j < num_targets else 0.3
-                lw = 2 if j < num_targets else 1
-                ax.plot(points[:, 0], points[:, 1], 'g-', linewidth=lw, alpha=alpha,
-                       label='Agent History' if j == 0 else None)
+        # ===== Agent Histories Removed =====
+        # Previously plotted green trajectories - removed for cleaner visualization
         
         # ===== Plot Multi-Agent Predictions and Ground Truth =====
         total_ade = 0.0
@@ -466,9 +444,9 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
                     linewidth=1.5, alpha=0.8, zorder=10,
                     label='Ground Truth' if t_idx == 0 else None)
             
-            # Plot start position (circle marker)
-            ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c=agent_color, s=60, 
-                       marker='o', zorder=15, edgecolors='black', linewidth=1,
+            # Plot start position (circle marker) - smaller
+            ax.scatter(tgt_valid[0, 0], tgt_valid[0, 1], c=agent_color, s=35, 
+                       marker='o', zorder=15, edgecolors='black', linewidth=0.5,
                        label=None)
             
             # Plot GT endpoint (x marker in black)
@@ -480,9 +458,9 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
             ax.plot(pred_valid[:, 0], pred_valid[:, 1], '--', color=agent_color,
                     linewidth=2, alpha=0.9, zorder=11)
             
-            # Plot predicted endpoint (square marker)
-            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=agent_color, s=80, 
-                       marker='s', zorder=16, edgecolors='black', linewidth=1)
+            # Plot predicted endpoint (square marker) - smaller and more transparent
+            ax.scatter(pred_valid[-1, 0], pred_valid[-1, 1], c=agent_color, s=30, 
+                       marker='s', zorder=16, alpha=0.5, edgecolors='black', linewidth=0.5)
             
             # Add to legend
             agent_legend_elements.append(
