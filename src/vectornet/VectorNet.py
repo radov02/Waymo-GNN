@@ -95,34 +95,42 @@ class PolylineSubgraphNetwork(nn.Module):
             unique_polylines: [P] unique polyline identifiers
         """
         h = x
-        unique_polylines = torch.unique(polyline_ids)
+        unique_polylines, inverse_indices = torch.unique(polyline_ids, return_inverse=True)
         P = len(unique_polylines)
+        N = h.shape[0]
         
         # First layer
         h = self.encoders[0](h)  # [N, hidden_dim]
         
-        # Remaining layers with aggregation
+        # Remaining layers with VECTORIZED aggregation (much faster than for-loops)
         for layer_idx in range(1, self.num_layers):
-            # Aggregate within each polyline using max pooling
-            agg_features = torch.zeros(h.shape[0], self.hidden_dim, device=h.device)
+            # Vectorized max pooling per polyline using scatter_reduce
+            # This replaces the slow for-loop with a single CUDA kernel
+            polyline_max = torch.zeros(P, self.hidden_dim, device=h.device)
+            polyline_max.scatter_reduce_(
+                0, 
+                inverse_indices.unsqueeze(-1).expand(-1, self.hidden_dim),
+                h,
+                reduce='amax',
+                include_self=False
+            )
             
-            for poly_id in unique_polylines:
-                mask = polyline_ids == poly_id
-                if mask.sum() > 0:
-                    poly_features = h[mask]  # [M, hidden_dim]
-                    max_pooled = poly_features.max(dim=0)[0]  # [hidden_dim]
-                    agg_features[mask] = max_pooled
+            # Gather back to node level
+            agg_features = polyline_max[inverse_indices]  # [N, hidden_dim]
             
             # Concatenate and encode
             h = torch.cat([h, agg_features], dim=-1)  # [N, 2*hidden_dim]
             h = self.encoders[layer_idx](h)  # [N, hidden_dim]
         
-        # Final aggregation to get polyline-level features
+        # Final aggregation to get polyline-level features (vectorized)
         polyline_features = torch.zeros(P, self.hidden_dim, device=h.device)
-        for i, poly_id in enumerate(unique_polylines):
-            mask = polyline_ids == poly_id
-            if mask.sum() > 0:
-                polyline_features[i] = h[mask].max(dim=0)[0]
+        polyline_features.scatter_reduce_(
+            0,
+            inverse_indices.unsqueeze(-1).expand(-1, self.hidden_dim),
+            h,
+            reduce='amax',
+            include_self=False
+        )
         
         return polyline_features, unique_polylines
 
@@ -750,12 +758,18 @@ class VectorNetTFRecord(nn.Module):
         self.masked_predictions = None
     
     def _scatter_max(self, src, index, dim_size):
-        """Scatter max operation for aggregating vectors to polylines."""
-        out = torch.zeros(dim_size, src.shape[-1], device=src.device)
-        for i in range(dim_size):
-            mask = index == i
-            if mask.sum() > 0:
-                out[i] = src[mask].max(dim=0)[0]
+        """Vectorized scatter max operation for aggregating vectors to polylines."""
+        # Use scatter_reduce which is much faster than Python loops
+        out = torch.full((dim_size, src.shape[-1]), float('-inf'), device=src.device, dtype=src.dtype)
+        out.scatter_reduce_(
+            0,
+            index.unsqueeze(-1).expand(-1, src.shape[-1]),
+            src,
+            reduce='amax',
+            include_self=True
+        )
+        # Replace -inf with 0 for empty polylines
+        out = torch.where(out == float('-inf'), torch.zeros_like(out), out)
         return out
     
     def _encode_polylines(self, vectors, polyline_ids, encoder):

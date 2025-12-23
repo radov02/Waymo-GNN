@@ -82,7 +82,7 @@ class Config:
     
     # Training
     batch_size: int = 32
-    num_workers: int = 4
+    num_workers: int = 8  # Increased for faster data loading
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     epochs: int = 100
@@ -124,7 +124,7 @@ class Config:
     amp_dtype: str = 'float16'  # 'float16' or 'bfloat16'
     
     # Parallelization
-    use_torch_compile: bool = True  # Use torch.compile for speedup
+    use_torch_compile: bool = False  # Disabled - causes slowdown with dynamic shapes
     gradient_accumulation_steps: int = 1  # Accumulate gradients for larger effective batch
     persistent_workers: bool = True  # Keep workers alive between epochs
 
@@ -876,10 +876,10 @@ def main():
                         scenario_ids=batch.get('scenario_ids', [f'scenario_{i}' for i in range(predictions.shape[0])]),
                         agent_vectors=batch['agent_vectors'],
                         agent_polyline_ids=batch['agent_polyline_ids'],
-                        agent_batch_idx=batch['agent_batch_idx'],
+                        agent_batch_idx=batch['agent_batch'],  # Correct key name
                         map_vectors=batch['map_vectors'],
                         map_polyline_ids=batch['map_polyline_ids'],
-                        map_batch_idx=batch['map_batch_idx'],
+                        map_batch_idx=batch['map_batch'],  # Correct key name
                         epoch=epoch,
                         output_dir=config.viz_dir,
                         max_scenarios=2  # Only 2 scenarios
