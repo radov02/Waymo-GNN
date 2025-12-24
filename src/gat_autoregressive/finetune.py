@@ -378,22 +378,22 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # IMPORTANT: Always use SOME scheduled sampling, even in warmup!
-    # This teaches the model to handle its own prediction errors from the start.
-    # A minimum of 10% autoregressive prevents the model from overfitting to perfect inputs.
-    min_sampling = 0.1  # Always use at least 10% model predictions
+    # Start with teacher forcing and gradually transition to full autoregressive
+    # At final epoch, we want sampling_prob = 1.0 (100% autoregressive)
+    min_sampling = 0.0  # Start with pure teacher forcing
     
     if epoch < warmup_epochs:
-        return min_sampling
+        # During warmup, use small amount of model predictions to start learning
+        return 0.1
     
     # Adjust progress to account for warmup period
     adjusted_epoch = epoch - warmup_epochs
-    adjusted_total = total_epochs - warmup_epochs
+    adjusted_total = total_epochs - warmup_epochs - 1  # -1 so last epoch reaches max
     progress = adjusted_epoch / max(1, adjusted_total)
+    progress = min(1.0, progress)  # Cap at 1.0
     
-    # Scale from min_sampling to max_sampling (0.6) over training
-    # Higher max allows model to learn error correction better
-    max_sampling = 0.6
+    # Scale from min_sampling to 1.0 (full autoregressive at final epoch)
+    max_sampling = 1.0
     
     if strategy == 'linear' or strategy == 'delayed_linear':
         return min_sampling + progress * (max_sampling - min_sampling)
@@ -1281,9 +1281,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     # Skip this step's loss
                     continue
                 
-                # ============== DISPLACEMENT LOSS ==============
+                # ============== IMPROVED LOSS FUNCTION ==============
                 # MSE between predicted and target displacement (per-agent)
                 mse_loss = F.mse_loss(pred_aligned, target)
+                
+                # Huber loss (smooth L1) - more robust to outliers
+                huber_loss = F.smooth_l1_loss(pred_aligned, target)
                 
                 # Direction loss: cosine similarity between prediction and target
                 # This helps with direction even when magnitude is off
@@ -1292,18 +1295,24 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
                 cosine_loss = (1 - cos_sim).mean()
                 
+                # Magnitude loss - ensure predicted displacement has correct length
+                pred_magnitude = torch.norm(pred_aligned, dim=1)
+                target_magnitude = torch.norm(target, dim=1)
+                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
+                
                 # Final NaN check on loss values
-                if torch.isnan(mse_loss) or torch.isnan(cosine_loss):
+                if torch.isnan(mse_loss) or torch.isnan(cosine_loss) or torch.isnan(huber_loss):
                     print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                     continue
                 
                 # Clamp MSE loss to prevent gradient explosion from outliers
                 mse_loss = torch.clamp(mse_loss, max=10.0)
+                huber_loss = torch.clamp(huber_loss, max=10.0)
                 
-                # Combined loss: displacement MSE (60%) + direction (40%)
-                # Simple and effective - just learn to predict GT displacements
-                discount = 0.95 ** step
-                step_loss = (0.6 * mse_loss + 0.4 * cosine_loss) * discount
+                # Combined loss: Huber (40%) + MSE (20%) + Direction (30%) + Magnitude (10%)
+                # Temporal discount for later steps
+                discount = 0.97 ** step  # Slightly less aggressive discount
+                step_loss = (0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss) * discount
             
             if rollout_loss is None:
                 rollout_loss = step_loss
@@ -1844,20 +1853,16 @@ def run_autoregressive_finetuning(
         # Calculate RMSE in meters for more interpretable logging
         train_rmse_meters = (train_metrics['mse'] ** 0.5) * 100.0
         
+        # Build log dictionary for this epoch
         log_dict = {
             "epoch": epoch + 1,  # 1-indexed for readability
             "sampling_probability": sampling_prob,
-            "train_loss": train_metrics['loss'],
-            "train_per_epoch_loss": train_metrics['loss'],  # Per-epoch loss for tracking
-            "train_mse": train_metrics['mse'],
-            "train_rmse_meters": train_rmse_meters,
-            "train_per_step_rmse": train_rmse_meters,  # Per-step RMSE for tracking
-            "train_cosine_sim": train_metrics['cosine_sim'],
+            "train/loss": train_metrics['loss'],
+            "train/mse": train_metrics['mse'],
+            "train/rmse_meters": train_rmse_meters,
+            "train/cosine_sim": train_metrics['cosine_sim'],
             "learning_rate": current_lr
         }
-        
-        # Log epoch-level metrics (no explicit step to avoid conflicts with batch logging)
-        wandb.log(log_dict, commit=True)
         
         # Track horizon errors for early stopping
         epoch_horizon_errors = []
@@ -1886,17 +1891,15 @@ def run_autoregressive_finetuning(
                 print(f"  Warning: Visualization failed: {e}")
                 traceback.print_exc()
         
-        # Calculate average horizon error for early stopping
+        # Calculate average horizon error and add to log_dict
         if epoch_horizon_errors:
             avg_horizon_error = np.mean(epoch_horizon_errors)
             print(f"\n  [EPOCH {epoch+1}] Average Final Horizon Error: {avg_horizon_error:.2f}m (across {len(epoch_horizon_errors)} scenarios)")
             
-            # Log to wandb
-            wandb.log({
-                "avg_final_horizon_error_m": avg_horizon_error,
-                "min_horizon_error_m": min(epoch_horizon_errors),
-                "max_horizon_error_m": max(epoch_horizon_errors),
-            }, commit=True)
+            # Add horizon error metrics to main log dict
+            log_dict["horizon/avg_final_error_m"] = avg_horizon_error
+            log_dict["horizon/min_error_m"] = min(epoch_horizon_errors)
+            log_dict["horizon/max_error_m"] = max(epoch_horizon_errors)
             
             # Early stopping disabled - let training run for all epochs
             # early_stopper(avg_horizon_error)
@@ -1904,6 +1907,9 @@ def run_autoregressive_finetuning(
             # Fallback to training loss if no visualizations
             avg_horizon_error = train_metrics['loss'] * 100  # Scale to be comparable
             # early_stopper(avg_horizon_error)
+        
+        # Log all metrics for this epoch with explicit step parameter
+        wandb.log(log_dict, step=epoch)
         
         # Determine metric to use for best model saving
         current_metric = avg_horizon_error

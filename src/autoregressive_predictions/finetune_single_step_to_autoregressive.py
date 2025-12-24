@@ -852,22 +852,22 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # IMPORTANT: Always use SOME scheduled sampling, even in warmup!
-    # This teaches the model to handle its own prediction errors from the start.
-    # A minimum of 10% autoregressive prevents the model from overfitting to perfect inputs.
-    min_sampling = 0.1  # Always use at least 10% model predictions
+    # Start with teacher forcing and gradually transition to full autoregressive
+    # At final epoch, we want sampling_prob = 1.0 (100% autoregressive)
+    min_sampling = 0.0  # Start with pure teacher forcing
     
     if epoch < warmup_epochs:
-        return min_sampling
+        # During warmup, use small amount of model predictions to start learning
+        return 0.1
     
     # Adjust progress to account for warmup period
     adjusted_epoch = epoch - warmup_epochs
-    adjusted_total = total_epochs - warmup_epochs
+    adjusted_total = total_epochs - warmup_epochs - 1  # -1 so last epoch reaches max
     progress = adjusted_epoch / max(1, adjusted_total)
+    progress = min(1.0, progress)  # Cap at 1.0
     
-    # Scale from min_sampling to max_sampling (0.6) over training
-    # Higher max allows model to learn error correction better
-    max_sampling = 0.6
+    # Scale from min_sampling to 1.0 (full autoregressive at final epoch)
+    max_sampling = 1.0
     
     if strategy == 'linear' or strategy == 'delayed_linear':
         return min_sampling + progress * (max_sampling - min_sampling)
@@ -1010,236 +1010,245 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             target_t = t + step + 1
             if target_t >= T:
                 break
+            
+            # source_graph is the graph at time (t + step) - this is where we predict FROM
+            # target_graph is the graph at time target_t - this is where we predict TO
+            source_t = t + step
+            source_graph = batched_graph_sequence[source_t]
+            target_graph = batched_graph_sequence[target_t]
+            
+            # The target displacement is in source_graph.y (displacement from source_t to source_t+1)
+            if source_graph.y is None:
+                break
+            
+            # ========== CRITICAL: AGENT ALIGNMENT ==========
+            # The graphs at different timesteps may have different agents (some enter/leave).
+            # We need to compute loss only for agents that exist in BOTH graphs,
+            # and align predictions with targets by agent ID, not by node index.
+            #
+            # IMPORTANT: Agent IDs are NOT globally unique across scenarios in a batch!
+            # Two different scenarios can have agents with the same ID.
+            # We must combine agent_id with batch_id to create globally unique identifiers.
+            
+            pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
+            target_agent_ids = getattr(target_graph, 'agent_ids', None)
+            source_agent_ids = getattr(source_graph, 'agent_ids', None)
+            pred_batch = getattr(graph_for_prediction, 'batch', None)
+            target_batch = getattr(target_graph, 'batch', None)
+            source_batch = getattr(source_graph, 'batch', None)
+            
+            # Validate that agent_ids and batch tensors have matching lengths
+            pred_num_nodes = graph_for_prediction.x.shape[0]
+            target_num_nodes = target_graph.x.shape[0]
+            source_num_nodes = source_graph.x.shape[0]
+            
+            # Check for length mismatches - if any, fall back to simple comparison
+            agent_ids_valid = (
+                pred_agent_ids is not None and 
+                target_agent_ids is not None and
+                source_agent_ids is not None and
+                pred_batch is not None and 
+                target_batch is not None and
+                source_batch is not None and
+                len(pred_agent_ids) == pred_num_nodes and
+                len(target_agent_ids) == target_num_nodes and
+                len(source_agent_ids) == source_num_nodes and
+                pred_batch.shape[0] == pred_num_nodes and
+                target_batch.shape[0] == target_num_nodes and
+                source_batch.shape[0] == source_num_nodes
+            )
+            
+            # If agent IDs and batch info are available and valid, use them for proper alignment
+            if agent_ids_valid:
+                # Create globally unique IDs by combining (batch_idx, agent_id)
+                pred_batch_np = pred_batch.cpu().numpy()
+                target_batch_np = target_batch.cpu().numpy()
+                source_batch_np = source_batch.cpu().numpy()
                 
-                # source_graph is the graph at time (t + step) - this is where we predict FROM
-                # target_graph is the graph at time target_t - this is where we predict TO
-                source_t = t + step
-                source_graph = batched_graph_sequence[source_t]
-                target_graph = batched_graph_sequence[target_t]
+                # Build mapping: (batch_idx, agent_id) -> node_index
+                pred_id_to_idx = {}
+                for idx in range(pred_num_nodes):
+                    bid = int(pred_batch_np[idx])
+                    aid = pred_agent_ids[idx]
+                    pred_id_to_idx[(bid, aid)] = idx
                 
-                # The target displacement is in source_graph.y (displacement from source_t to source_t+1)
-                if source_graph.y is None:
-                    break
+                target_id_to_idx = {}
+                for idx in range(target_num_nodes):
+                    bid = int(target_batch_np[idx])
+                    aid = target_agent_ids[idx]
+                    target_id_to_idx[(bid, aid)] = idx
                 
-                # ========== CRITICAL: AGENT ALIGNMENT ==========
-                # The graphs at different timesteps may have different agents (some enter/leave).
-                # We need to compute loss only for agents that exist in BOTH graphs,
-                # and align predictions with targets by agent ID, not by node index.
-                #
-                # IMPORTANT: Agent IDs are NOT globally unique across scenarios in a batch!
-                # Two different scenarios can have agents with the same ID.
-                # We must combine agent_id with batch_id to create globally unique identifiers.
+                source_id_to_idx = {}
+                for idx in range(source_num_nodes):
+                    bid = int(source_batch_np[idx])
+                    aid = source_agent_ids[idx]
+                    source_id_to_idx[(bid, aid)] = idx
                 
-                pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
-                target_agent_ids = getattr(target_graph, 'agent_ids', None)
-                source_agent_ids = getattr(source_graph, 'agent_ids', None)
-                pred_batch = getattr(graph_for_prediction, 'batch', None)
-                target_batch = getattr(target_graph, 'batch', None)
-                source_batch = getattr(source_graph, 'batch', None)
+                # Find common agents across all three (same batch AND same agent ID)
+                common_ids = set(pred_id_to_idx.keys()) & set(target_id_to_idx.keys()) & set(source_id_to_idx.keys())
                 
-                # Validate that agent_ids and batch tensors have matching lengths
-                pred_num_nodes = graph_for_prediction.x.shape[0]
-                target_num_nodes = target_graph.x.shape[0]
-                source_num_nodes = source_graph.x.shape[0]
+                if len(common_ids) < 2:
+                    graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
+                    continue
                 
-                # Check for length mismatches - if any, fall back to simple comparison
-                agent_ids_valid = (
-                    pred_agent_ids is not None and 
-                    target_agent_ids is not None and
-                    source_agent_ids is not None and
-                    pred_batch is not None and 
-                    target_batch is not None and
-                    source_batch is not None and
-                    len(pred_agent_ids) == pred_num_nodes and
-                    len(target_agent_ids) == target_num_nodes and
-                    len(source_agent_ids) == source_num_nodes and
-                    pred_batch.shape[0] == pred_num_nodes and
-                    target_batch.shape[0] == target_num_nodes and
-                    source_batch.shape[0] == source_num_nodes
+                # Get aligned indices - convert common_ids to list for deterministic ordering
+                common_ids_list = sorted(common_ids)  # Sort for deterministic behavior
+                pred_indices = torch.tensor([pred_id_to_idx[gid] for gid in common_ids_list], 
+                                            device=device, dtype=torch.long)
+                target_indices = torch.tensor([target_id_to_idx[gid] for gid in common_ids_list], 
+                                              device=device, dtype=torch.long)
+                source_indices = torch.tensor([source_id_to_idx[gid] for gid in common_ids_list], 
+                                              device=device, dtype=torch.long)
+                
+                # Validate indices are in bounds
+                if (pred_indices.max() >= pred_num_nodes or 
+                    target_indices.max() >= target_num_nodes or
+                    source_indices.max() >= source_num_nodes):
+                    # Index out of bounds - fall back to skipping
+                    graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
+                    continue
+            else:
+                # No valid agent IDs or batch info - fall back to node count check
+                if pred_num_nodes != source_num_nodes:
+                    graph_for_prediction = target_graph
+                    is_using_predicted_positions = False
+                    continue
+                pred_indices = None
+                target_indices = None
+                source_indices = None
+            
+            # Forward pass with optional AMP
+            with torch.amp.autocast('cuda', enabled=use_amp_local):
+                edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
+                pred = model(
+                    graph_for_prediction.x,
+                    graph_for_prediction.edge_index,
+                    edge_weight=edge_w,
+                    batch=graph_for_prediction.batch,
+                    batch_size=B,
+                    batch_num=batch_idx,
+                    timestep=t + step
                 )
                 
-                # If agent IDs and batch info are available and valid, use them for proper alignment
-                if agent_ids_valid:
-                    # Create globally unique IDs by combining (batch_idx, agent_id)
-                    pred_batch_np = pred_batch.cpu().numpy()
-                    target_batch_np = target_batch.cpu().numpy()
-                    source_batch_np = source_batch.cpu().numpy()
-                    
-                    # Build mapping: (batch_idx, agent_id) -> node_index
-                    pred_id_to_idx = {}
-                    for idx in range(pred_num_nodes):
-                        bid = int(pred_batch_np[idx])
-                        aid = pred_agent_ids[idx]
-                        pred_id_to_idx[(bid, aid)] = idx
-                    
-                    target_id_to_idx = {}
-                    for idx in range(target_num_nodes):
-                        bid = int(target_batch_np[idx])
-                        aid = target_agent_ids[idx]
-                        target_id_to_idx[(bid, aid)] = idx
-                    
-                    source_id_to_idx = {}
-                    for idx in range(source_num_nodes):
-                        bid = int(source_batch_np[idx])
-                        aid = source_agent_ids[idx]
-                        source_id_to_idx[(bid, aid)] = idx
-                    
-                    # Find common agents across all three (same batch AND same agent ID)
-                    common_ids = set(pred_id_to_idx.keys()) & set(target_id_to_idx.keys()) & set(source_id_to_idx.keys())
-                    
-                    if len(common_ids) < 2:
+                # Apply alignment if needed
+                if pred_indices is not None:
+                    # Additional validation: check pred size matches expectations
+                    if pred_indices.max() >= pred.shape[0]:
+                        # Prediction tensor is smaller than expected - skip this step
                         graph_for_prediction = target_graph
                         is_using_predicted_positions = False
                         continue
                     
-                    # Get aligned indices - convert common_ids to list for deterministic ordering
-                    common_ids_list = sorted(common_ids)  # Sort for deterministic behavior
-                    pred_indices = torch.tensor([pred_id_to_idx[gid] for gid in common_ids_list], 
-                                                device=device, dtype=torch.long)
-                    target_indices = torch.tensor([target_id_to_idx[gid] for gid in common_ids_list], 
-                                                  device=device, dtype=torch.long)
-                    source_indices = torch.tensor([source_id_to_idx[gid] for gid in common_ids_list], 
-                                                  device=device, dtype=torch.long)
-                    
-                    # Validate indices are in bounds
-                    if (pred_indices.max() >= pred_num_nodes or 
-                        target_indices.max() >= target_num_nodes or
-                        source_indices.max() >= source_num_nodes):
-                        # Index out of bounds - fall back to skipping
-                        graph_for_prediction = target_graph
-                        is_using_predicted_positions = False
-                        continue
-                else:
-                    # No valid agent IDs or batch info - fall back to node count check
-                    if pred_num_nodes != source_num_nodes:
-                        graph_for_prediction = target_graph
-                        is_using_predicted_positions = False
-                        continue
-                    pred_indices = None
-                    target_indices = None
-                    source_indices = None
-                
-                # Forward pass with optional AMP
-                with torch.amp.autocast('cuda', enabled=use_amp_local):
-                    edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
-                    pred = model(
-                        graph_for_prediction.x,
-                        graph_for_prediction.edge_index,
-                        edge_weight=edge_w,
-                        batch=graph_for_prediction.batch,
-                        batch_size=B,
-                        batch_num=batch_idx,
-                        timestep=t + step
-                    )
-                    
-                    # Apply alignment if needed
-                    if pred_indices is not None:
-                        # Additional validation: check pred size matches expectations
-                        if pred_indices.max() >= pred.shape[0]:
-                            # Prediction tensor is smaller than expected - skip this step
-                            graph_for_prediction = target_graph
+                    # Validate target tensor sizes before indexing
+                    if is_using_predicted_positions:
+                        if (not hasattr(target_graph, 'pos') or target_graph.pos is None or
+                            target_indices.max() >= target_graph.pos.shape[0] or
+                            not hasattr(graph_for_prediction, 'pos') or graph_for_prediction.pos is None or
+                            pred_indices.max() >= graph_for_prediction.pos.shape[0]):
+                            # Position tensors invalid - fall back to GT displacement
                             is_using_predicted_positions = False
+                    
+                    if not is_using_predicted_positions:
+                        # Validate source_graph.y exists and has correct size
+                        if source_graph.y is None or source_indices.max() >= source_graph.y.shape[0]:
+                            # Source invalid - skip this step
+                            graph_for_prediction = target_graph
                             continue
-                        
-                        # Validate target tensor sizes before indexing
-                        if is_using_predicted_positions:
-                            if (not hasattr(target_graph, 'pos') or target_graph.pos is None or
-                                target_indices.max() >= target_graph.pos.shape[0] or
-                                not hasattr(graph_for_prediction, 'pos') or graph_for_prediction.pos is None or
-                                pred_indices.max() >= graph_for_prediction.pos.shape[0]):
-                                # Position tensors invalid - fall back to GT displacement
-                                is_using_predicted_positions = False
-                        
-                        if not is_using_predicted_positions:
-                            # Validate source_graph.y exists and has correct size
-                            if source_graph.y is None or source_indices.max() >= source_graph.y.shape[0]:
-                                # Source invalid - skip this step
-                                graph_for_prediction = target_graph
-                                continue
-                        
-                        pred_aligned = pred[pred_indices]
-                        # ALWAYS use GT displacement from source_graph.y as target
-                        # This is the correct GT displacement regardless of scheduled sampling
-                        target = source_graph.y[source_indices].to(pred.dtype)
-                    else:
-                        pred_aligned = pred
-                        # ALWAYS use GT displacement from source_graph.y as target
-                        target = source_graph.y.to(pred.dtype)
                     
-                    # MSE loss
-                    mse_loss = F.mse_loss(pred_aligned, target)
-                    
-                    # Directional loss (cosine similarity)
-                    pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
-                    target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
-                    cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
-                    cosine_loss = (1 - cos_sim).mean()
-                    
-                    # Combined loss with temporal discount (later steps matter less)
-                    discount = 0.95 ** step
-                    step_loss = (0.5 * mse_loss + 0.5 * cosine_loss) * discount
-                
-                if rollout_loss is None:
-                    rollout_loss = step_loss
+                    pred_aligned = pred[pred_indices]
+                    # ALWAYS use GT displacement from source_graph.y as target
+                    # This is the correct GT displacement regardless of scheduled sampling
+                    target = source_graph.y[source_indices].to(pred.dtype)
                 else:
-                    rollout_loss = rollout_loss + step_loss
+                    pred_aligned = pred
+                    # ALWAYS use GT displacement from source_graph.y as target
+                    target = source_graph.y.to(pred.dtype)
                 
-                # Track metrics
-                with torch.no_grad():
-                    total_mse += mse_loss.item()
-                    total_cosine += cos_sim.mean().item()
-                    count += 1
+                # ============== IMPROVED LOSS FUNCTION ==============
+                # MSE loss for displacement magnitude
+                mse_loss = F.mse_loss(pred_aligned, target)
                 
-                # Scheduled sampling: decide whether to use prediction or ground truth
-                if step < num_rollout_steps - 1:
-                    use_prediction = np.random.random() < sampling_prob
-                    
-                    if use_prediction:
-                        # Use our prediction to update position, but keep GT features
-                        # This gives the model correct kinematic features for next prediction
-                        graph_for_prediction = update_graph_with_prediction(
-                            graph_for_prediction, pred.detach(), device, update_velocity=False
-                        )
-                        is_using_predicted_positions = True
-                    else:
-                        # Teacher forcing: use ground truth from next timestep
-                        # NEW APPROACH: Use GT graph with only position offset
-                        next_target_t = target_t + 1
-                        if next_target_t < T:
-                            next_gt_graph = batched_graph_sequence[next_target_t]
-                            # Start with GT graph (all correct features)
-                            graph_for_prediction = next_gt_graph.clone()
-                            
-                            # But offset position by our prediction error to teach error correction
-                            # This is key: model learns to predict from offset positions
-                            if pred_indices is not None and hasattr(next_gt_graph, 'pos'):
-                                # Get corresponding indices in next_gt_graph via agent alignment
-                                next_agent_ids = getattr(next_gt_graph, 'agent_ids', None)
-                                next_batch = getattr(next_gt_graph, 'batch', None)
-                                if next_agent_ids is not None and next_batch is not None:
-                                    next_batch_np = next_batch.cpu().numpy()
-                                    next_id_to_idx = {}
-                                    for idx in range(next_gt_graph.x.shape[0]):
-                                        bid = int(next_batch_np[idx])
-                                        aid = next_agent_ids[idx]
-                                        next_id_to_idx[(bid, aid)] = idx
-                                    
-                                    # Find agents that exist in both current and next
-                                    common_ids_list = sorted(common_ids)
-                                    next_indices_list = []
-                                    for gid in common_ids_list:
-                                        if gid in next_id_to_idx:
-                                            next_indices_list.append(next_id_to_idx[gid])
-                                    
-                                    if len(next_indices_list) > 0:
-                                        next_indices_tensor = torch.tensor(next_indices_list, device=device, dtype=torch.long)
-                                        pred_for_offset = pred[pred_indices[:len(next_indices_list)]]
-                                        actual_displacement = pred_for_offset.detach() * POSITION_SCALE
-                                        graph_for_prediction.pos[next_indices_tensor] = graph_for_prediction.pos[next_indices_tensor] + actual_displacement
-                        else:
-                            graph_for_prediction = batched_graph_sequence[target_t]
-                        is_using_predicted_positions = False
+                # Huber loss (smooth L1) - more robust to outliers
+                huber_loss = F.smooth_l1_loss(pred_aligned, target)
+                
+                # Directional loss (cosine similarity) - important for direction
+                pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
+                target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
+                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
+                cosine_loss = (1 - cos_sim).mean()
+                
+                # Magnitude loss - ensure predicted displacement has correct length
+                pred_magnitude = torch.norm(pred_aligned, dim=1)
+                target_magnitude = torch.norm(target, dim=1)
+                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
+                
+                # Combined loss: Huber (40%) + MSE (20%) + Direction (30%) + Magnitude (10%)
+                # Temporal discount for later steps (reduces gradient from accumulated errors)
+                discount = 0.97 ** step  # Slightly less aggressive discount
+                step_loss = (0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss) * discount
             
+            if rollout_loss is None:
+                rollout_loss = step_loss
+            else:
+                rollout_loss = rollout_loss + step_loss
+            
+            # Track metrics
+            with torch.no_grad():
+                total_mse += mse_loss.item()
+                total_cosine += cos_sim.mean().item()
+                count += 1
+            
+            # Scheduled sampling: decide whether to use prediction or ground truth
+            if step < num_rollout_steps - 1:
+                use_prediction = np.random.random() < sampling_prob
+                
+                if use_prediction:
+                    # Use our prediction to update position, but keep GT features
+                    # This gives the model correct kinematic features for next prediction
+                    graph_for_prediction = update_graph_with_prediction(
+                        graph_for_prediction, pred.detach(), device, update_velocity=False
+                    )
+                    is_using_predicted_positions = True
+                else:
+                    # Teacher forcing: use ground truth from next timestep
+                    # NEW APPROACH: Use GT graph with only position offset
+                    next_target_t = target_t + 1
+                    if next_target_t < T:
+                        next_gt_graph = batched_graph_sequence[next_target_t]
+                        # Start with GT graph (all correct features)
+                        graph_for_prediction = next_gt_graph.clone()
+                        
+                        # But offset position by our prediction error to teach error correction
+                        # This is key: model learns to predict from offset positions
+                        if pred_indices is not None and hasattr(next_gt_graph, 'pos'):
+                            # Get corresponding indices in next_gt_graph via agent alignment
+                            next_agent_ids = getattr(next_gt_graph, 'agent_ids', None)
+                            next_batch = getattr(next_gt_graph, 'batch', None)
+                            if next_agent_ids is not None and next_batch is not None:
+                                next_batch_np = next_batch.cpu().numpy()
+                                next_id_to_idx = {}
+                                for idx in range(next_gt_graph.x.shape[0]):
+                                    bid = int(next_batch_np[idx])
+                                    aid = next_agent_ids[idx]
+                                    next_id_to_idx[(bid, aid)] = idx
+                                
+                                # Find agents that exist in both current and next
+                                common_ids_list = sorted(common_ids)
+                                next_indices_list = []
+                                for gid in common_ids_list:
+                                    if gid in next_id_to_idx:
+                                        next_indices_list.append(next_id_to_idx[gid])
+                                
+                                if len(next_indices_list) > 0:
+                                    next_indices_tensor = torch.tensor(next_indices_list, device=device, dtype=torch.long)
+                                    pred_for_offset = pred[pred_indices[:len(next_indices_list)]]
+                                    actual_displacement = pred_for_offset.detach() * POSITION_SCALE
+                                    graph_for_prediction.pos[next_indices_tensor] = graph_for_prediction.pos[next_indices_tensor] + actual_displacement
+                    else:
+                        graph_for_prediction = batched_graph_sequence[target_t]
+                    is_using_predicted_positions = False
         
         # End of single rollout - do backward pass immediately
         if rollout_loss is not None:
@@ -1700,34 +1709,32 @@ def run_autoregressive_finetuning(
         # Calculate RMSE in meters for more interpretable logging
         train_rmse_meters = (train_metrics['mse'] ** 0.5) * 100.0
         
-        # Log to wandb
+        # Log to wandb - use step parameter to sync with epoch number
         log_dict = {
             "epoch": epoch + 1,  # 1-indexed for readability
             "sampling_probability": sampling_prob,
-            "train_loss": train_metrics['loss'],
-            "train_per_epoch_loss": train_metrics['loss'],  # Per-epoch loss for tracking
-            "train_mse": train_metrics['mse'],
-            "train_rmse_meters": train_rmse_meters,
-            "train_per_step_rmse": train_rmse_meters,  # Per-step RMSE for tracking
-            "train_cosine_sim": train_metrics['cosine_sim'],
+            "train/loss": train_metrics['loss'],
+            "train/mse": train_metrics['mse'],
+            "train/rmse_meters": train_rmse_meters,
+            "train/cosine_sim": train_metrics['cosine_sim'],
             "learning_rate": current_lr
         }
         
         if val_metrics:
             val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
             log_dict.update({
-                "val_loss": val_metrics['loss'],
-                "val_mse": val_metrics['mse'],
-                "val_rmse_meters": val_rmse_meters,
-                "val_cosine_sim": val_metrics['cosine_sim']
+                "val/loss": val_metrics['loss'],
+                "val/mse": val_metrics['mse'],
+                "val/rmse_meters": val_rmse_meters,
+                "val/cosine_sim": val_metrics['cosine_sim']
             })
             # Per-horizon metrics
             for h in range(num_rollout_steps):
-                log_dict[f"val_mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
-                log_dict[f"val_cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
+                log_dict[f"val/mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
+                log_dict[f"val/cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
         
-        # Log epoch-level metrics (no explicit step to avoid conflicts with batch logging)
-        wandb.log(log_dict, commit=True)
+        # Log all metrics for this epoch with explicit step parameter
+        wandb.log(log_dict, step=epoch)
         
         # Print summary
         if val_metrics:
