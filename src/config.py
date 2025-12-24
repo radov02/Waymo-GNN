@@ -53,7 +53,7 @@ scheduler_factor = 0.5  # reduce LR by scheduler_factor*100 % when triggered
 min_lr = 1e-5         # minimum learning rate
 # Early stopping settings:
 early_stopping_patience = 10  # stop if no improvement for N epochs
-early_stopping_min_delta = 0.00001  # minimum improvement to count as progress
+early_stopping_min_delta = 0.00000001  # minimum improvement to count as progress
 # Loss weights - balance direction and magnitude for accurate trajectory prediction:
 loss_alpha = 0.2    # angle weight (directional accuracy)
 loss_beta = 0.5     # MSE weight (positional accuracy) - the primary loss for magnitude
@@ -114,7 +114,7 @@ vectornet_scheduler_patience = 5
 vectornet_scheduler_factor = 0.5
 vectornet_min_lr = 1e-6
 vectornet_early_stopping_patience = 10
-vectornet_early_stopping_min_delta = 0.00001
+vectornet_early_stopping_min_delta = 0.0000001
 # Loss Weights:
 vectornet_loss_alpha = 0.2    # Angle loss weight
 vectornet_loss_beta = 0.5     # MSE loss weight (primary)
@@ -150,6 +150,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============== DataLoader Configuration ==============
 pin_memory = torch.cuda.is_available()  # Faster CPU->GPU transfer (CUDA only)
 debug_mode = False
+enable_debug_viz = False  # Enable [DEBUG VIZ] print statements for debugging visualizations
 
 # GCN Model DataLoader Settings:
 gcn_num_workers = 4  # Parallel data loading for GCN (set 0 on Windows if multiprocessing errors)

@@ -32,7 +32,7 @@ from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_lay
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios,
-                    use_gradient_checkpointing, radius)
+                    use_gradient_checkpointing, radius, enable_debug_viz)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
@@ -284,10 +284,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             start_agent_ids = [i for i in start_scenario_indices]
         
         # DEBUG: Print starting info
-        print(f"  [DEBUG VIZ] T={T}, start_t={start_t}, num_rollout_steps={num_rollout_steps}")
-        print(f"  [DEBUG VIZ] {len(start_agent_ids)} agents at start_t")
-        print(f"  [DEBUG VIZ] First 3 agent IDs: {start_agent_ids[:3]}")
-        print(f"  [DEBUG VIZ] Starting pos (first 3 agents): {start_pos[:3]}")
+        if enable_debug_viz:
+            print(f"  [DEBUG VIZ] T={T}, start_t={start_t}, num_rollout_steps={num_rollout_steps}")
+            print(f"  [DEBUG VIZ] {len(start_agent_ids)} agents at start_t")
+            print(f"  [DEBUG VIZ] First 3 agent IDs: {start_agent_ids[:3]}")
+            print(f"  [DEBUG VIZ] Starting pos (first 3 agents): {start_pos[:3]}")
         
         # First pass: find which agents persist throughout the rollout window
         # We can only properly track agents that exist at ALL timesteps
@@ -316,7 +317,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             # Keep only agents that exist in both
             persistent_agent_ids = persistent_agent_ids.intersection(target_agent_ids_set)
         
-        print(f"  [DEBUG VIZ] {len(persistent_agent_ids)} agents persist through all {actual_rollout_steps} steps")
+        if enable_debug_viz:
+            print(f"  [DEBUG VIZ] {len(persistent_agent_ids)} agents persist through all {actual_rollout_steps} steps")
         
         # Initialize trajectories only for persistent agents
         agent_trajectories = {}
@@ -436,7 +438,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             pred_disp = pred.cpu().numpy() * POSITION_SCALE
             
             # DEBUG: Print prediction stats on first step only
-            if step == 0:
+            if step == 0 and enable_debug_viz:
                 pred_batch0 = pred_disp[pred_scenario_indices]
                 print(f"  [DEBUG VIZ] Step 0 pred disp range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]m")
             
@@ -461,7 +463,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             step_errors.append(step_err)
             
             # Print average step error on first step only
-            if step_errors and step == 0:
+            if step_errors and step == 0 and enable_debug_viz:
                 print(f"  [DEBUG VIZ] Step 0 avg displacement error: {np.mean(step_errors):.2f}m")
             
             completed_steps = step + 1
@@ -505,7 +507,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                     graph_for_prediction, pred, device, update_velocity=False
                 )
         
-        print(f"  [DEBUG VIZ] Completed {completed_steps} prediction steps")
+        if enable_debug_viz:
+            print(f"  [DEBUG VIZ] Completed {completed_steps} prediction steps")
         
         # Store agent_ids_list for later use
         agent_ids_list = list(persistent_agent_ids)
@@ -1281,14 +1284,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     print(f"  CosSim: {final_cosine:.4f}")
     print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
-    # Log per-epoch metrics to wandb
-    wandb.log({
-        "train_epoch/loss": final_loss,
-        "train_epoch/mse": final_mse,
-        "train_epoch/rmse_meters": final_rmse,
-        "train_epoch/cosine_sim": final_cosine,
-        "train_epoch/sampling_prob": sampling_prob,
-    }, commit=True)
+    # NOTE: No wandb.log here - logging is done per-epoch in main training loop
+    # This avoids duplicate logging (per-step vs per-epoch)
     
     return {
         'loss': final_loss,

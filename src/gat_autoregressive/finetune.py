@@ -30,7 +30,7 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
                     early_stopping_patience, early_stopping_min_delta,
                     gat_checkpoint_dir, gat_checkpoint_dir_autoreg,
                     cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz,
-                    POSITION_SCALE, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC)
+                    POSITION_SCALE, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC, enable_debug_viz)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
@@ -664,7 +664,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             pred_disp = pred.cpu().numpy() * POSITION_SCALE
             
             # DEBUG: Print prediction stats on first few steps
-            if step < 5:
+            if step < 5 and enable_debug_viz:
                 print(f"\t\t[DEBUG VIZ] Step {step}: Raw pred (norm): min={pred.min().item():.4f}, max={pred.max().item():.4f}, mean={pred.mean().item():.4f}")
                 # Print input features for scenario 0's first agent
                 if len(pred_scenario_indices) > 0:
@@ -714,7 +714,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         agent_pred_positions[agent_id] = new_pos
                         
                         # DEBUG: Print position updates on first few steps
-                        if step < 3 and local_idx == 0:
+                        if step < 3 and local_idx == 0 and enable_debug_viz:
                             print(f"  [DEBUG VIZ] Step {step}, Agent {agent_id}: disp={pred_disp[global_idx]}, new_pos={new_pos}")
                         agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
             
@@ -1436,14 +1436,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     print(f"  CosSim: {final_cosine:.4f}")
     print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
-    # Log per-epoch metrics to wandb
-    wandb.log({
-        "train_epoch/loss": final_loss,
-        "train_epoch/mse": final_mse,
-        "train_epoch/rmse_meters": final_rmse,
-        "train_epoch/cosine_sim": final_cosine,
-        "train_epoch/sampling_prob": sampling_prob,
-    }, commit=True)
+    # NOTE: No wandb.log here - logging is done per-epoch in main training loop
+    # This avoids duplicate logging (per-step vs per-epoch)
     
     return {
         'loss': final_loss,
