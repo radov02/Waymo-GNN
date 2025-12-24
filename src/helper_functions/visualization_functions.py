@@ -5,7 +5,7 @@ import torch
 import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
-from config import (sequence_length, radius, graph_creation_method, viz_scenario_dir, 
+from config import (sequence_length, radius, graph_creation_method, 
                     viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, 
                     show_timesteps_viz, max_scenario_files_for_viz)
 import matplotlib.pyplot as plt
@@ -92,7 +92,7 @@ def draw_map_features(ax, scenario, x_lim=None, y_lim=None):
     return map_features_drawn
 
 
-def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir=viz_scenario_dir, figsize=(16, 10)):
+def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir, figsize=(16, 10)):
     """Visualize a temporal sequence of graphs created from a scenario. Shows how the graph structure evolves over time."""
     os.makedirs(save_dir, exist_ok=True)
     T = len(graph_sequence)
@@ -242,7 +242,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
     
     return filepath
 
-def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num_timesteps=15):
+def create_graph_sequence_visualization(scenario, save_dir, num_timesteps=15):
     """Creates .png showing graphs for given scenario sequence"""
     from config import radius, graph_creation_method, sequence_length
     from helper_functions.graph_creation_functions import timestep_to_pyg_data
