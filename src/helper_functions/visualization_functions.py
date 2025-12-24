@@ -6,8 +6,9 @@ import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
 from config import (sequence_length, radius, graph_creation_method, 
-                    viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, 
-                    show_timesteps_viz, max_scenario_files_for_viz)
+                    visualize_every_n_epochs, max_nodes_per_graph_viz, 
+                    show_timesteps_viz, max_scenario_files_for_viz,
+                    gcn_viz_dir_autoreg, gat_viz_dir_autoreg, vectornet_viz_dir)
 import matplotlib.pyplot as plt
 
 # Cache for loaded scenarios to avoid reloading the same scenario multiple times
@@ -435,7 +436,7 @@ def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True, max_fil
         print(f"  Warning: Could not load scenario {scenario_id}: {e}")
         return None
 
-def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save_dir=viz_training_dir,
+def visualize_training_progress(model, batch_dict, epoch, save_dir, scenario_id=None,
                                 device='cpu', max_nodes_per_graph=10, show_timesteps=8):
     """
     Visualization showing actual vs predicted trajectories with map features.
@@ -1099,7 +1100,17 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     model.train()
     return filepath, avg_error
 
-def visualize_epoch(epoch, viz_batch, model, device, wandb):
+def visualize_epoch(epoch, viz_batch, model, device, wandb, save_dir):
+    """Visualize training progress at specified epochs.
+    
+    Args:
+        epoch: Current epoch number
+        viz_batch: Batch dictionary with graph data
+        model: The model to visualize predictions from
+        device: Device for inference
+        wandb: W&B run object for logging
+        save_dir: Directory to save visualizations (e.g., gcn_viz_dir_autoreg, gat_viz_dir_autoreg)
+    """
     should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0
         
     if should_visualize and viz_batch is not None:
@@ -1107,8 +1118,8 @@ def visualize_epoch(epoch, viz_batch, model, device, wandb):
         try:
             filepath, avg_error = visualize_training_progress(
                 model, viz_batch, epoch=epoch+1,
+                save_dir=save_dir,
                 scenario_id=None,  # Will auto-detect from batch data
-                save_dir=viz_training_dir,
                 device=device,
                 max_nodes_per_graph=max_nodes_per_graph_viz,
                 show_timesteps=show_timesteps_viz
