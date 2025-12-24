@@ -47,6 +47,7 @@ from config import (
     vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_viz_dir_testing, POSITION_SCALE,
     vectornet_best_model,
     test_max_scenarios, test_visualize, test_visualize_max, test_use_wandb,
+    test_num_agents_to_predict, test_tfrecord_path,
     use_gradient_checkpointing
 )
 
@@ -119,14 +120,18 @@ def load_model(checkpoint_path, device):
 
 
 def compute_trajectory_metrics(predictions, targets):
-    """Compute ADE, FDE, and miss rate from predicted vs target trajectories."""
+    """Compute ADE, FDE, and miss rate from predicted vs target trajectories.
+    
+    Note: VectorNet outputs ABSOLUTE positions (relative to SDC at history_len-1),
+    not displacements. No cumsum needed.
+    """
     min_t = min(predictions.shape[1], targets.shape[1])
     predictions = predictions[:, :min_t, :]
     targets = targets[:, :min_t, :]
     
-    # Convert displacements to cumulative positions
-    pred_pos = torch.cumsum(predictions, dim=1)
-    target_pos = torch.cumsum(targets, dim=1)
+    # Predictions are already absolute positions (no cumsum needed)
+    pred_pos = predictions
+    target_pos = targets
     
     # Compute per-timestep displacement errors
     errors = torch.sqrt(((pred_pos - target_pos) ** 2).sum(dim=-1))  # [N, T]
@@ -215,10 +220,10 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
                 'scenario_ids': scenario_ids,
                 'agent_vectors': batch['agent_vectors'].cpu() if 'agent_vectors' in batch else None,
                 'agent_polyline_ids': batch['agent_polyline_ids'].cpu() if 'agent_polyline_ids' in batch else None,
-                'agent_batch_idx': batch['agent_batch_idx'].cpu() if 'agent_batch_idx' in batch else None,
+                'agent_batch_idx': batch['agent_batch'].cpu() if 'agent_batch' in batch else None,
                 'map_vectors': batch['map_vectors'].cpu() if 'map_vectors' in batch else None,
                 'map_polyline_ids': batch['map_polyline_ids'].cpu() if 'map_polyline_ids' in batch else None,
-                'map_batch_idx': batch['map_batch_idx'].cpu() if 'map_batch_idx' in batch else None,
+                'map_batch_idx': batch['map_batch'].cpu() if 'map_batch' in batch else None,
                 'target_polyline_indices': batch['target_polyline_indices'].cpu() if 'target_polyline_indices' in batch else None,
                 'target_scenario_batch': batch['target_scenario_batch'].cpu() if 'target_scenario_batch' in batch else None,
                 'num_targets_per_scenario': batch['num_targets_per_scenario'].cpu() if 'num_targets_per_scenario' in batch else None,
@@ -245,10 +250,8 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
 def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir, max_viz=10):
     """Generate visualization of predicted vs ground truth trajectories with map features.
     
-    Matches the training script's visualization approach:
-    - Extract current position from agent polyline vectors
-    - Build trajectories by prepending current position
-    - Plot map features grouped by polyline ID
+    VectorNet predictions and targets are ABSOLUTE positions in normalized coordinates
+    (relative to SDC at history_len-1). The coordinate system is centered on SDC.
     """
     os.makedirs(save_dir, exist_ok=True)
     saved_paths = []
@@ -265,6 +268,20 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
         5: (MAP_FEATURE_GRAY, 'Speed Bumps'),
         6: (MAP_FEATURE_GRAY, 'Driveways'),
     }
+    
+    # Debug: print data ranges for first batch
+    if len(batches) > 0 and batches[0]['targets'] is not None:
+        first_targets = batches[0]['targets'].numpy() if torch.is_tensor(batches[0]['targets']) else batches[0]['targets']
+        first_preds = batches[0]['predictions'].numpy() if torch.is_tensor(batches[0]['predictions']) else batches[0]['predictions']
+        print(f"\n[DEBUG] First batch data ranges:")
+        print(f"  Targets: min={first_targets.min():.2f}, max={first_targets.max():.2f}, shape={first_targets.shape}")
+        print(f"  Predictions: min={first_preds.min():.2f}, max={first_preds.max():.2f}")
+        if batches[0]['map_vectors'] is not None:
+            first_map = batches[0]['map_vectors'].numpy() if torch.is_tensor(batches[0]['map_vectors']) else batches[0]['map_vectors']
+            print(f"  Map vectors: shape={first_map.shape}, x-range=[{first_map[:, 0].min():.1f}, {first_map[:, 0].max():.1f}], y-range=[{first_map[:, 1].min():.1f}, {first_map[:, 1].max():.1f}]")
+        if batches[0]['agent_vectors'] is not None:
+            first_agents = batches[0]['agent_vectors'].numpy() if torch.is_tensor(batches[0]['agent_vectors']) else batches[0]['agent_vectors']
+            print(f"  Agent vectors: shape={first_agents.shape}, de_x/de_y (cols 3,4) range=[{first_agents[:, 3].min():.1f}, {first_agents[:, 3].max():.1f}], [{first_agents[:, 4].min():.1f}, {first_agents[:, 4].max():.1f}]")
     
     # Iterate through stored batches and scenarios
     scenario_counter = 0
@@ -465,14 +482,34 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
     return saved_paths, avg_ade
 
 
-def run_testing(test_dataset_path='data/scenario',
+def run_testing(test_dataset_path=None,
                 checkpoint_path=None,
                 batch_size=32,
                 max_scenarios=None,
+                num_agents=None,
                 visualize=True,
                 visualize_max=10,
                 use_wandb=True):
-    """Run testing with multi-step VectorNet prediction."""
+    """Run testing with multi-step VectorNet prediction.
+    
+    Args:
+        test_dataset_path: Path to TFRecord data (default: from config)
+        checkpoint_path: Path to model checkpoint (default: auto-detect)
+        batch_size: Batch size for evaluation
+        max_scenarios: Max scenarios to test (default: from config)
+        num_agents: Number of agents to predict per scenario (default: from config)
+        visualize: Generate visualizations
+        visualize_max: Max scenarios to visualize
+        use_wandb: Enable wandb logging
+    """
+    # Use config defaults
+    if test_dataset_path is None:
+        test_dataset_path = test_tfrecord_path
+    if max_scenarios is None:
+        max_scenarios = test_max_scenarios
+    if num_agents is None:
+        num_agents = test_num_agents_to_predict
+    
     print("\n" + "="*70)
     print("VECTORNET MODEL TESTING - Multi-Step Prediction")
     print("="*70)
@@ -491,6 +528,7 @@ def run_testing(test_dataset_path='data/scenario',
                 "task": "testing",
                 "batch_size": batch_size,
                 "max_scenarios": max_scenarios,
+                "num_agents_to_predict": num_agents,
                 "test_dataset": test_dataset_path,
             },
             tags=["vectornet", "testing", "multi-step"]
@@ -541,6 +579,7 @@ def run_testing(test_dataset_path='data/scenario',
     # Load dataset
     print(f"\n--- Loading Test Data ---")
     print(f"Data: {test_dataset_path}")
+    print(f"Agents to predict per scenario: {num_agents}")
     
     # Use TFRecord dataset to match training
     test_dataset = VectorNetTFRecordDataset(
@@ -549,7 +588,7 @@ def run_testing(test_dataset_path='data/scenario',
         history_len=history_length,
         future_len=prediction_horizon,
         max_scenarios=max_scenarios,
-        num_agents_to_predict=1,  # Predict for SDC
+        num_agents_to_predict=num_agents,  # Use config value for multiple agents
     )
     
     print(f"Test scenarios: {len(test_dataset)}")
@@ -571,6 +610,7 @@ def run_testing(test_dataset_path='data/scenario',
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Prediction horizon: {prediction_horizon} steps ({prediction_horizon * 0.1:.1f}s)")
     print(f"  History length: {history_length} steps ({history_length * 0.1:.1f}s)")
+    print(f"  Agents per scenario: {num_agents}")
     print(f"  Max scenarios: {max_scenarios if max_scenarios else 'all'}")
     print(f"  W&B logging: {use_wandb}")
     
@@ -667,12 +707,14 @@ def main():
     parser = argparse.ArgumentParser(description='VectorNet Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint (default: auto-detect)')
-    parser.add_argument('--test_data', type=str, default='data/scenario',
-                        help='Base directory for TFRecord test data (default: data/scenario)')
+    parser.add_argument('--test_data', type=str, default=test_tfrecord_path,
+                        help='Base directory for TFRecord test data (default: from config)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--max_scenarios', type=int, default=test_max_scenarios,
                         help='Max scenarios to evaluate (None = all)')
+    parser.add_argument('--num_agents', type=int, default=test_num_agents_to_predict,
+                        help='Number of agents to predict per scenario')
     parser.add_argument('--visualize_max', type=int, default=test_visualize_max,
                         help='Max scenarios to visualize')
     parser.add_argument('--no_visualize', action='store_true',
@@ -687,6 +729,7 @@ def main():
         checkpoint_path=args.checkpoint,
         batch_size=args.batch_size,
         max_scenarios=args.max_scenarios,
+        num_agents=args.num_agents,
         visualize=not args.no_visualize,
         visualize_max=args.visualize_max,
         use_wandb=not args.no_wandb

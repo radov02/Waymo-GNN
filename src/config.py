@@ -128,12 +128,14 @@ vectornet_node_completion_ratio = 0.15  # Fraction of nodes to mask
 # ============== Testing Configuration ==============
 # Common testing settings for all models (GCN, GAT, VectorNet)
 test_hdf5_path = 'data/graphs/testing'  # Path to test HDF5 files
+test_tfrecord_path = 'data/scenario'  # Path to TFRecord data (for VectorNet)
 test_num_rollout_steps = 50  # Number of autoregressive steps for testing (5.0s horizon)
 test_max_scenarios = 100  # Maximum scenarios to test
 test_visualize = True  # Generate visualizations during testing
 test_visualize_max = 10  # Maximum scenarios to visualize
 test_use_wandb = True  # Log test metrics to wandb
 test_horizons = [10, 20, 30, 40, 50]  # Evaluation horizons (timesteps) for metrics
+test_num_agents_to_predict = 8  # Number of agents to predict per scenario (VectorNet)
 
 
 # OTHER CONFIGS:
