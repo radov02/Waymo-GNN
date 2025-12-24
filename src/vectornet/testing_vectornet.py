@@ -51,18 +51,13 @@ from config import (
     vectornet_num_heads, vectornet_dropout, project_name,
     vectornet_prediction_horizon, vectornet_history_length,
     vectornet_use_node_completion, vectornet_node_completion_ratio,
-    vectornet_checkpoint_dir, vectornet_viz_dir,
+    vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_viz_dir_testing, POSITION_SCALE,
     use_gradient_checkpointing
 )
 
 
 # ============== TESTING CONFIGURATION ==============
 TEST_HDF5 = 'data/graphs/testing/testing.hdf5'
-DEFAULT_CHECKPOINT = os.path.join(vectornet_checkpoint_dir, 'best_vectornet_model.pt')
-VIZ_DIR = 'visualizations/autoreg/vectornet/testing'
-
-# Constants
-POSITION_SCALE = 100.0  # For denormalizing displacements
 
 
 def get_vectornet_config():
@@ -427,7 +422,7 @@ def run_testing(test_dataset_path=TEST_HDF5,
     
     # Use default checkpoint if not provided
     if checkpoint_path is None:
-        checkpoint_path = DEFAULT_CHECKPOINT
+        checkpoint_path = vectornet_checkpoint_dir + '/' + vectornet_best_model
     
     # Check paths
     if not os.path.exists(checkpoint_path):
@@ -524,19 +519,19 @@ def run_testing(test_dataset_path=TEST_HDF5,
     viz_images = []
     if visualize and predictions:
         print(f"\nGenerating visualizations (max {visualize_max} scenarios)...")
-        os.makedirs(VIZ_DIR, exist_ok=True)
+        os.makedirs(vectornet_viz_dir_testing, exist_ok=True)
         
         # Get scenario IDs from the loader
         scenario_ids = [f"scenario_{i}" for i in range(len(predictions))]
         
         saved_paths, avg_viz_ade = visualize_predictions(
-            predictions, targets, scenario_ids, VIZ_DIR, max_viz=visualize_max
+            predictions, targets, scenario_ids, vectornet_viz_dir_testing, max_viz=visualize_max
         )
         
         print(f"\nVisualization Summary:")
         print(f"  Scenarios visualized: {len(saved_paths)}")
         print(f"  Average ADE: {avg_viz_ade:.2f}m")
-        print(f"  Saved to: {VIZ_DIR}")
+        print(f"  Saved to: {vectornet_viz_dir_testing}")
         
         # Log visualizations to wandb
         if use_wandb:

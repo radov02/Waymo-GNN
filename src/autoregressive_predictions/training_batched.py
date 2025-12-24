@@ -78,7 +78,7 @@ from config import (device, gcn_num_workers, num_layers, num_gru_layers, epochs,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, debug_mode,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta, use_edge_weights,
-                    checkpoint_dir, scheduler_patience, scheduler_factor, min_lr,
+                    gcn_checkpoint_dir, scheduler_patience, scheduler_factor, min_lr,
                     early_stopping_patience, early_stopping_min_delta,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
                     print_gpu_info, pin_memory, gcn_prefetch_factor, use_amp, use_bf16,
@@ -469,7 +469,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Expected speedup: ~{batch_size}x over batch_size=1")
     print(f"{'='*60}\n")
     
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(gcn_checkpoint_dir, exist_ok=True)
     os.makedirs(VIZ_DIR, exist_ok=True)
     
     should_finish_wandb = False
@@ -628,7 +628,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Learning rate: {learning_rate}")
     print(f"Edge weights: {'Enabled' if use_edge_weights else 'Disabled'}")
     print(f"Mixed Precision: {'BF16' if use_bf16 else 'FP16' if use_amp else 'Disabled'}")
-    print(f"Checkpoints: {checkpoint_dir}\n")
+    print(f"Checkpoints: {gcn_checkpoint_dir}\n")
     
     # AMP setup
     scaler = None
@@ -646,7 +646,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     best_optimizer_state = None
     best_epoch = 0
     checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
-    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
+    checkpoint_path = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
     
     for epoch in range(epochs):

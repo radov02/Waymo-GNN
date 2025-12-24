@@ -35,7 +35,7 @@ from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_layers, epochs,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
-                    gradient_clip_value, checkpoint_dir_autoreg, checkpoint_dir, use_edge_weights,
+                    gradient_clip_value, gcn_checkpoint_dir_autoreg, gcn_checkpoint_dir, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
                     autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_viz_dir_finetune, autoreg_skip_map_features,
@@ -753,8 +753,6 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
     
     # Normalization constants (must match graph_creation_functions.py)
     POSITION_SCALE = 100.0  # displacement normalization
-    MAX_SPEED = 30.0  # velocity normalization
-    MAX_ACCEL = 10.0  # acceleration normalization
     MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
     
     # ============== NaN DETECTION AND HANDLING ==============
@@ -1517,7 +1515,7 @@ def run_autoregressive_finetuning(
     # Construct checkpoint filename based on training script's naming convention
     # Format: best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt
     checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
-    pretrained_checkpoint_batched = os.path.join(checkpoint_dir, checkpoint_filename)
+    pretrained_checkpoint_batched = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
     
     # Load pre-trained model - try batched version first, then fallback to simple names
     checkpoint = None
@@ -1680,7 +1678,7 @@ def run_autoregressive_finetuning(
     
     print(f"{'='*80}\n")
     
-    os.makedirs(checkpoint_dir_autoreg, exist_ok=True)
+    os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
     os.makedirs(viz_dir, exist_ok=True)
     
     # Initialize GradScaler for AMP (only if enabled and CUDA available)
@@ -1781,7 +1779,7 @@ def run_autoregressive_finetuning(
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
                 save_filename = f'best_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-                save_path = os.path.join(checkpoint_dir_autoreg, save_filename)
+                save_path = os.path.join(gcn_checkpoint_dir_autoreg, save_filename)
                 model_to_save = get_model_for_saving(model, is_parallel)
                 checkpoint_data = {
                     'epoch': epoch,
@@ -1839,7 +1837,7 @@ def run_autoregressive_finetuning(
     
     # Save final model
     final_filename = f'final_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    final_path = os.path.join(checkpoint_dir_autoreg, final_filename)
+    final_path = os.path.join(gcn_checkpoint_dir_autoreg, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
         'epoch': actual_final_epoch - 1,
@@ -1858,7 +1856,7 @@ def run_autoregressive_finetuning(
     print(f"{'='*80}")
     print(f"Epochs completed: {actual_final_epoch}/{num_epochs}" + (" (early stopped)" if early_stopped else ""))
     best_filename = f'best_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    print(f"Best model: {os.path.join(checkpoint_dir_autoreg, best_filename)}")
+    print(f"Best model: {os.path.join(gcn_checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
     if val_metrics:
         print(f"Best validation loss: {best_val_loss:.4f}")

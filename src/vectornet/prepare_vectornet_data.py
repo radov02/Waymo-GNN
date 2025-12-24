@@ -481,10 +481,10 @@ def verify_setup(target_base=None):
     print(f"\nTotal: {total_files} VectorNet TFRecord files")
     
     if total_files == 0:
-        print("\n⚠️  WARNING: No VectorNet TFRecord files found!")
+        print("\n  WARNING: No VectorNet TFRecord files found!")
         return False
     else:
-        print("\n✅ VectorNet data preparation complete!")
+        print("\n VectorNet data preparation complete!")
         return True
 
 

@@ -31,7 +31,7 @@ from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_layers,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
-                    dropout, checkpoint_dir, checkpoint_dir_autoreg, use_edge_weights,
+                    dropout, gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, load_model_state,
                     autoreg_viz_dir, project_name, print_gpu_info,
                     use_gradient_checkpointing)
@@ -610,8 +610,8 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
         # Try autoregressive checkpoint first, fall back to base checkpoint
-        autoreg_path = os.path.join(checkpoint_dir_autoreg, 'finetuned_scheduled_sampling_best.pt')
-        base_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        autoreg_path = os.path.join(gcn_checkpoint_dir_autoreg, 'finetuned_scheduled_sampling_best.pt')
+        base_path = os.path.join(gcn_checkpoint_dir, 'best_model.pt')
         
         if os.path.exists(autoreg_path):
             checkpoint_path = autoreg_path
@@ -729,8 +729,8 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
             wandb.run.summary["final_fde_2s"] = results['horizons']['2.0s']['fde_mean']
     
     # Save results
-    results_path = os.path.join(checkpoint_dir_autoreg, 'gcn_test_results.pt')
-    os.makedirs(checkpoint_dir_autoreg, exist_ok=True)
+    results_path = os.path.join(gcn_checkpoint_dir_autoreg, 'gcn_test_results.pt')
+    os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
     torch.save(results, results_path)
     print(f"\n✓ Results saved to {results_path}")
     
@@ -743,7 +743,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
         'horizons': results.get('horizons', {}),
         'timestamp': datetime.now().isoformat()
     }
-    json_path = os.path.join(checkpoint_dir_autoreg, 'gcn_test_results.json')
+    json_path = os.path.join(gcn_checkpoint_dir_autoreg, 'gcn_test_results.json')
     with open(json_path, 'w') as f:
         json.dump(json_results, f, indent=2)
     print(f"✓ JSON results saved to {json_path}")

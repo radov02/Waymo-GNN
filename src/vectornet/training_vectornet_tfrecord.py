@@ -70,7 +70,6 @@ from config import (
     vectornet_input_dim, vectornet_hidden_dim, vectornet_output_dim,
     vectornet_num_polyline_layers, vectornet_num_global_layers,
     vectornet_num_heads, vectornet_dropout,
-    vectornet_use_node_completion, vectornet_node_completion_ratio, vectornet_node_completion_weight,
     vectornet_mode, vectornet_prediction_horizon, vectornet_history_length,
     vectornet_num_agents_to_predict,
     vectornet_batch_size, vectornet_learning_rate, vectornet_epochs, vectornet_gradient_clip,
@@ -101,8 +100,6 @@ class Config:
     num_global_layers: int = vectornet_num_global_layers
     num_heads: int = vectornet_num_heads
     dropout: float = vectornet_dropout
-    use_node_completion: bool = vectornet_use_node_completion
-    node_completion_ratio: float = vectornet_node_completion_ratio
     
     # Training
     batch_size: int = vectornet_batch_size
@@ -118,7 +115,6 @@ class Config:
     loss_beta: float = vectornet_loss_beta
     loss_gamma: float = vectornet_loss_gamma
     loss_delta: float = vectornet_loss_delta
-    node_completion_weight: float = vectornet_node_completion_weight
     
     # Scheduler
     scheduler_type: str = 'cosine'  # 'cosine' or 'onecycle'
@@ -893,7 +889,6 @@ def main():
         num_global_layers=config.num_global_layers,
         num_heads=config.num_heads,
         dropout=config.dropout,
-        use_node_completion=config.use_node_completion,
         node_completion_ratio=config.node_completion_ratio,
     ).to(device)
     

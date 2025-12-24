@@ -32,7 +32,7 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, gat_num_heads, project_name, print_gpu_info,
                     num_gpus, use_data_parallel, setup_model_parallel, load_model_state,
-                    use_gradient_checkpointing)
+                    use_gradient_checkpointing, POSITION_SCALE)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from helper_functions.helpers import compute_metrics
@@ -44,12 +44,9 @@ import matplotlib.pyplot as plt
 
 # ============== TESTING CONFIGURATION ==============
 TEST_HDF5_PATH = './data/graphs/testing/testing.hdf5'
-CHECKPOINT_DIR = 'checkpoints/gat'
-CHECKPOINT_DIR_AUTOREG = 'checkpoints/gat/autoregressive'
-VIZ_DIR = 'visualizations/autoreg/gat/testing'
-
-# Constants
-POSITION_SCALE = 100.0
+gat_checkpoint_dir = 'checkpoints/gat'
+gat_checkpoint_dir_autoreg = 'checkpoints/gat/autoregressive'
+gat_viz_dir_testing = 'visualizations/gat/autoreg/testing'
 
 
 def load_trained_model(checkpoint_path, device):
@@ -77,7 +74,7 @@ def load_trained_model(checkpoint_path, device):
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     model.eval()
     
-    print(f"✓ GAT Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f" GAT Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_loss' in checkpoint:
         print(f"  Validation loss: {checkpoint['val_loss']:.6f}")
     if 'train_loss' in checkpoint:
@@ -467,8 +464,8 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
-        autoreg_path = os.path.join(CHECKPOINT_DIR_AUTOREG, 'best_autoregressive_20step.pt')
-        base_path = os.path.join(CHECKPOINT_DIR, 'best_model.pt')
+        autoreg_path = os.path.join(gat_checkpoint_dir_autoreg, 'best_autoregressive_20step.pt')
+        base_path = os.path.join(gat_checkpoint_dir, 'best_model.pt')
         
         if os.path.exists(autoreg_path):
             checkpoint_path = autoreg_path
@@ -583,8 +580,8 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
             wandb.run.summary["final_fde_2s"] = results['horizons']['2.0s']['fde_mean']
     
     # Save results
-    results_path = os.path.join(CHECKPOINT_DIR, 'gat_test_results.pt')
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    results_path = os.path.join(gat_checkpoint_dir, 'gat_test_results.pt')
+    os.makedirs(gat_checkpoint_dir, exist_ok=True)
     torch.save(results, results_path)
     print(f"\n✓ Results saved to {results_path}")
     
@@ -597,7 +594,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
         'horizons': results.get('horizons', {}),
         'timestamp': datetime.now().isoformat()
     }
-    json_path = os.path.join(CHECKPOINT_DIR, 'gat_test_results.json')
+    json_path = os.path.join(gat_checkpoint_dir_autoreg, 'gat_test_results.json')
     with open(json_path, 'w') as f:
         json.dump(json_results, f, indent=2)
     print(f"✓ JSON results saved to {json_path}")

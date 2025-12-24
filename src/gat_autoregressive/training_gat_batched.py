@@ -72,7 +72,7 @@ from config import (device, gat_num_workers, num_layers, num_gru_layers, epochs,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
                     print_gpu_info, pin_memory, gat_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
-                    cache_validation_data, max_validation_scenarios, batch_size)
+                    cache_validation_data, max_validation_scenarios, batch_size, gat_checkpoint_dir)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
@@ -87,7 +87,6 @@ import config as cfg
 BATCHED_BATCH_SIZE = batch_size  # Use batch_size from config.py
 
 # GAT-specific directories
-CHECKPOINT_DIR = 'checkpoints/gat'
 VIZ_DIR = 'visualizations/autoreg/gat'
 cfg.viz_training_dir = VIZ_DIR
 
@@ -454,7 +453,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Expected speedup: ~{batch_size}x over batch_size=1")
     print(f"{'='*60}\n")
     
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(gat_checkpoint_dir, exist_ok=True)
     os.makedirs(VIZ_DIR, exist_ok=True)
     
     should_finish_wandb = False
@@ -611,7 +610,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Sequence length: {sequence_length}")
     print(f"Learning rate: {learning_rate}")
     print(f"Mixed Precision: {'BF16' if use_bf16 else 'FP16' if use_amp else 'Disabled'}")
-    print(f"Checkpoints: {CHECKPOINT_DIR}\n")
+    print(f"Checkpoints: {gat_checkpoint_dir}\n")
     
     # AMP setup
     scaler = None
@@ -629,7 +628,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     best_optimizer_state = None
     best_epoch = 0
     checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt'
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, checkpoint_filename)
+    checkpoint_path = os.path.join(gat_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
     
     for epoch in range(epochs):

@@ -1,4 +1,4 @@
-from config import viz_scenario_dir, number_of_training_tfrecord_files, number_of_validation_tfrecord_files, number_of_testing_tfrecord_files, max_num_scenarios_per_tfrecord_file, sequence_length
+from config import number_of_training_tfrecord_files, number_of_validation_tfrecord_files, number_of_testing_tfrecord_files, max_num_scenarios_per_tfrecord_file, sequence_length
 from helper_functions.cloud_tfrecord_downloader import ensure_shards
 from helper_functions.graph_creation_functions import (initialize, get_data_files, save_scenarios_to_hdf5_streaming, 
                                        test_hdf5_and_lazy_loading, parse_scenario_file)
@@ -18,7 +18,7 @@ if __name__ == '__main__':
     validation_files_filepaths = get_data_files("./data/scenario/validation")
     testing_files_filepaths = get_data_files("./data/scenario/testing")
 
-    #create_graph_sequence_visualization(parse_scenario_file(training_files_filepaths[0])[0], save_dir='./' + viz_scenario_dir, num_timesteps=15)
+    #create_graph_sequence_visualization(parse_scenario_file(training_files_filepaths[0])[0], save_dir='./visualizations/scenario_sequence', num_timesteps=15)
 
     save_scenarios_to_hdf5_streaming(training_files_filepaths, f'./data/graphs/training/training_seqlen{sequence_length}.hdf5', max_num_scenarios_per_tfrecord_file=max_num_scenarios_per_tfrecord_file)
     save_scenarios_to_hdf5_streaming(validation_files_filepaths, f'./data/graphs/validation/validation_seqlen{sequence_length}.hdf5', max_num_scenarios_per_tfrecord_file=max_num_scenarios_per_tfrecord_file)

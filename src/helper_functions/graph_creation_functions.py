@@ -6,7 +6,7 @@ import time
 import math
 import numpy as np
 import tensorflow as tf
-from config import batch_size, gcn_num_workers, sequence_length, radius, graph_creation_method
+from config import batch_size, gcn_num_workers, sequence_length, radius, graph_creation_method, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC, MAX_DIST_NEAREST 
 from torch_geometric.data import Data, Batch
 from torch.utils.data import DataLoader
 
@@ -340,12 +340,6 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
         return torch.zeros(15, dtype=torch.float32)
     
     state = agent.states[timestep]
-    
-    # Normalization constants
-    MAX_SPEED = 30.0        # ~108 km/h, reasonable max speed
-    MAX_ACCEL = 10.0        # ~1g acceleration
-    MAX_DIST_SDC = 100.0    # 100m max distance to SDC for normalization
-    MAX_DIST_NEAREST = 50.0 # 50m max distance to nearest neighbor
     
     # Basic velocity features (normalized)
     vx = state.velocity_x

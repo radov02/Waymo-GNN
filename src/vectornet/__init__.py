@@ -81,17 +81,6 @@ except ImportError as e:
     HAS_TFRECORD_DATASET = False
     print(f"Warning: TFRecord dataset not available: {e}")
 
-from .vectornet_config import (
-    get_vectornet_config,
-    create_vectornet_model,
-    print_vectornet_config,
-    vectornet_input_dim,
-    vectornet_hidden_dim,
-    vectornet_output_dim,
-    vectornet_checkpoint_dir,
-    vectornet_viz_dir,
-)
-
 from .vectornet_helpers import (
     compute_vectornet_metrics,
     compute_ade_fde,

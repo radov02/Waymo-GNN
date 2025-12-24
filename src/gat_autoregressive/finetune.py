@@ -36,7 +36,9 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
                     autoreg_visualize_every_n_epochs, autoreg_viz_dir_finetune_gat,
                     pin_memory, gat_prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
-                    cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz)
+                    gat_checkpoint_dir, gat_checkpoint_dir_autoreg,
+                    cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz,
+                    POSITION_SCALE, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
@@ -54,8 +56,6 @@ AUTOREG_REBUILD_EDGES = True  # Set to False to keep original edge topology (fas
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
 
 # GAT-specific directories
-CHECKPOINT_DIR = 'checkpoints/gat'
-CHECKPOINT_DIR_AUTOREG = 'checkpoints/gat/autoregressive'
 VIZ_DIR = autoreg_viz_dir_finetune_gat  # From config.py
 
 # Warning suppression - only print size mismatch warning once per epoch
@@ -220,12 +220,7 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
         # We'll only update the first num_nodes_to_update nodes
     else:
         num_nodes_to_update = num_nodes_graph
-    
-    # Normalization constants (must match graph_creation_functions.py)
-    POSITION_SCALE = 100.0  # displacement normalization
-    MAX_SPEED = 30.0  # velocity normalization
-    MAX_ACCEL = 10.0  # acceleration normalization
-    MAX_DIST_SDC = 100.0  # max distance to SDC for normalization
+
     
     # ============== NaN DETECTION AND HANDLING ==============
     # Check for NaN in predictions - if found, replace with zeros to prevent cascade
@@ -1664,7 +1659,7 @@ def run_autoregressive_finetuning(
     # Construct checkpoint filename based on training script's naming convention
     # Format: best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt
     checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
-    pretrained_checkpoint_batched = os.path.join(CHECKPOINT_DIR, checkpoint_filename)
+    pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
     
     # Load pre-trained model - try batched version first, then fallback to simple names
     checkpoint = None
@@ -1690,7 +1685,7 @@ def run_autoregressive_finetuning(
 
 
     # Create directories
-    os.makedirs(CHECKPOINT_DIR_AUTOREG, exist_ok=True)
+    os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
     os.makedirs(VIZ_DIR, exist_ok=True)
     
     # Initialize wandb
@@ -1824,7 +1819,7 @@ def run_autoregressive_finetuning(
     print(f"Validation: Disabled (using training visualizations)")
     print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
-    print(f"Checkpoints: {CHECKPOINT_DIR_AUTOREG}")
+    print(f"Checkpoints: {gat_checkpoint_dir_autoreg}")
     print(f"Visualizations: {VIZ_DIR}")
     print(f"{'='*80}\n")
     
@@ -1941,7 +1936,7 @@ def run_autoregressive_finetuning(
         if current_metric < best_val_loss:
             best_val_loss = current_metric
             save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-            save_path = os.path.join(CHECKPOINT_DIR_AUTOREG, save_filename)
+            save_path = os.path.join(gat_checkpoint_dir_autoreg, save_filename)
             model_to_save = get_model_for_saving(model, is_parallel)
             checkpoint_data = {
                 'epoch': epoch,
@@ -1966,7 +1961,7 @@ def run_autoregressive_finetuning(
     
     # Save final model
     final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    final_path = os.path.join(CHECKPOINT_DIR_AUTOREG, final_filename)
+    final_path = os.path.join(gat_checkpoint_dir_autoreg, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
         'epoch': epoch,
@@ -1984,7 +1979,7 @@ def run_autoregressive_finetuning(
     print(f"GAT FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
     best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    print(f"Best model: {os.path.join(CHECKPOINT_DIR_AUTOREG, best_filename)}")
+    print(f"Best model: {os.path.join(gat_checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
     print(f"Best training loss: {best_val_loss:.4f}")
     print(f"Early stopped: {early_stopper.early_stop}")
