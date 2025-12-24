@@ -230,13 +230,10 @@ def visualize_predictions(predictions, targets, scenario_ids, save_dir, max_viz=
         pred = pred.numpy() if isinstance(pred, torch.Tensor) else pred
         target = target.numpy() if isinstance(target, torch.Tensor) else target
         
-        # Denormalize
-        pred = pred * POSITION_SCALE
-        target = target * POSITION_SCALE
-        
-        # Convert to cumulative positions
-        pred_pos = np.cumsum(pred, axis=1)
-        target_pos = np.cumsum(target, axis=1)
+        # Predictions and targets are already absolute positions, not displacements
+        # No denormalization or cumsum needed
+        pred_pos = pred
+        target_pos = target
         
         # Create figure
         fig, ax = plt.subplots(figsize=(12, 10))
@@ -249,19 +246,27 @@ def visualize_predictions(predictions, targets, scenario_ids, save_dir, max_viz=
         for agent_idx in range(num_agents):
             color = colors[agent_idx]
             
-            # Ground truth
+            # Ground truth (solid black line, same as training viz)
             ax.plot(target_pos[agent_idx, :, 0], target_pos[agent_idx, :, 1], 
-                    '-', color=color, linewidth=2, label=f'Agent {agent_idx} GT' if agent_idx < 5 else None)
+                    '-', color='black', linewidth=1.5, alpha=0.8, 
+                    label='Ground Truth' if agent_idx == 0 else None)
             
-            # Prediction
+            # Prediction (dashed colored line)
             ax.plot(pred_pos[agent_idx, :, 0], pred_pos[agent_idx, :, 1], 
-                    '--', color=color, linewidth=2, label=f'Agent {agent_idx} Pred' if agent_idx < 5 else None)
+                    '--', color=color, linewidth=2, alpha=0.9,
+                    label=f'Agent {agent_idx} Pred' if agent_idx < 5 else None)
             
-            # Mark endpoints
+            # Mark start position
+            ax.scatter(target_pos[agent_idx, 0, 0], target_pos[agent_idx, 0, 1], 
+                      color=color, marker='o', s=35, edgecolors='black', linewidths=0.5, zorder=15)
+            
+            # Mark GT endpoint (x marker in black)
             ax.scatter(target_pos[agent_idx, -1, 0], target_pos[agent_idx, -1, 1], 
-                      color=color, marker='x', s=50, zorder=5)
+                      color='black', marker='x', s=60, linewidth=2, zorder=15)
+            
+            # Mark predicted endpoint (square marker)
             ax.scatter(pred_pos[agent_idx, -1, 0], pred_pos[agent_idx, -1, 1], 
-                      color=color, marker='s', s=50, edgecolors='black', linewidths=0.5, zorder=6)
+                      color=color, marker='s', s=30, alpha=0.5, edgecolors='black', linewidths=0.5, zorder=16)
             
             # Compute error
             error = np.linalg.norm(pred_pos[agent_idx] - target_pos[agent_idx], axis=1).mean()
