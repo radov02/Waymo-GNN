@@ -25,7 +25,7 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
                     gradient_clip_value, gat_num_heads,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs, autoreg_viz_dir_finetune_gat,
+                    autoreg_visualize_every_n_epochs, gat_viz_dir_autoreg,
                     pin_memory, gat_prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     gat_checkpoint_dir, gat_checkpoint_dir_autoreg,
@@ -46,9 +46,6 @@ import random
 AUTOREG_REBUILD_EDGES = True  # Set to False to keep original edge topology (faster but less accurate)
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
-
-# GAT-specific directories
-VIZ_DIR = autoreg_viz_dir_finetune_gat  # From config.py
 
 # Warning suppression - only print size mismatch warning once per epoch
 _size_mismatch_warned = False
@@ -445,7 +442,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         total_epochs: Total number of epochs (for computing velocity smoothing)
     """
     if save_dir is None:
-        save_dir = VIZ_DIR
+        save_dir = gat_viz_dir_autoreg
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
@@ -1669,7 +1666,7 @@ def run_autoregressive_finetuning(
 
     # Create directories
     os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
-    os.makedirs(VIZ_DIR, exist_ok=True)
+    os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
     
     # Initialize wandb
     wandb.login()
@@ -1803,7 +1800,7 @@ def run_autoregressive_finetuning(
     print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
     print(f"Checkpoints: {gat_checkpoint_dir_autoreg}")
-    print(f"Visualizations: {VIZ_DIR}")
+    print(f"Visualizations: {gat_viz_dir_autoreg}")
     print(f"{'='*80}\n")
     
     # Initialize GradScaler for AMP (DISABLED for finetuning stability)
@@ -1882,7 +1879,7 @@ def run_autoregressive_finetuning(
                         break
                     result = visualize_autoregressive_rollout(
                         model, viz_batch, epoch, num_rollout_steps, 
-                        device, is_parallel, save_dir=VIZ_DIR, total_epochs=num_epochs
+                        device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
                     )
                     if isinstance(result, tuple):
                         filepath, final_error = result

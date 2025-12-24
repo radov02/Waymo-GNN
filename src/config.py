@@ -120,11 +120,20 @@ vectornet_loss_alpha = 0.2    # Angle loss weight
 vectornet_loss_beta = 0.5     # MSE loss weight (primary)
 vectornet_loss_gamma = 0.1    # Velocity consistency weight
 vectornet_loss_delta = 0.2    # Cosine similarity weight
+# VectorNet auxiliary task settings:
+vectornet_use_node_completion = False  # Node completion pretraining task
+vectornet_node_completion_ratio = 0.15  # Fraction of nodes to mask
 
 
-# TESTING:
-# ============ Testing Visualization Configuration ==============
-# ...
+# ============== Testing Configuration ==============
+# Common testing settings for all models (GCN, GAT, VectorNet)
+test_hdf5_path = 'data/graphs/testing'  # Path to test HDF5 files
+test_num_rollout_steps = 50  # Number of autoregressive steps for testing (5.0s horizon)
+test_max_scenarios = 100  # Maximum scenarios to test
+test_visualize = True  # Generate visualizations during testing
+test_visualize_max = 10  # Maximum scenarios to visualize
+test_use_wandb = True  # Log test metrics to wandb
+test_horizons = [10, 20, 30, 40, 50]  # Evaluation horizons (timesteps) for metrics
 
 
 # OTHER CONFIGS:
@@ -145,6 +154,7 @@ debug_mode = False
 # GCN Model DataLoader Settings:
 gcn_num_workers = 4  # Parallel data loading for GCN (set 0 on Windows if multiprocessing errors)
 gcn_prefetch_factor = 8 if gcn_num_workers > 0 else None  # Batches to prefetch per worker (higher = better GPU utilization)
+prefetch_factor = gcn_prefetch_factor  # Alias for backward compatibility
 # GAT Model DataLoader Settings:
 gat_num_workers = 4
 gat_prefetch_factor = 8 if gat_num_workers > 0 else None
@@ -174,7 +184,8 @@ if torch.cuda.is_available():
 # Automatic Mixed Precision (AMP) for faster training on modern GPUs (Volta+)
 use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7  # Volta or newer
 use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
-torch_compile_mode = "reduce-overhead"  # Compile mode: 'default', 'reduce-overhead', 'max-autotune'
+# torch.compile mode: 'default' is most stable with dynamic shapes, 'reduce-overhead' can cause warnings
+torch_compile_mode = "default"  # Compile mode: 'default', 'reduce-overhead', 'max-autotune'
 use_torch_compile = True  # Enabled for 20-30% speedup on compatible GPUs
 
 # ============== Multi-GPU Configuration ==============

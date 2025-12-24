@@ -147,3 +147,269 @@ def compute_metrics(predictions, targets, features):
         angle_error = torch.abs(angle_diff).mean()
         
     return mse.item(), cos_sim.item(), angle_error.item()
+
+
+# ============== Standardized Metrics for All Models ==============
+# These functions provide consistent metric computation across GCN, GAT, and VectorNet
+
+def compute_trajectory_metrics(pred_positions, target_positions, valid_mask=None, position_scale=100.0):
+    """Compute standardized trajectory metrics for multi-step predictions.
+    
+    Works for both autoregressive rollouts (GCN/GAT finetuning) and 
+    direct trajectory prediction (VectorNet).
+    
+    Args:
+        pred_positions: Predicted positions [N, T, 2] or [T, N, 2] - in NORMALIZED scale
+        target_positions: Ground truth positions [N, T, 2] or [T, N, 2] - in NORMALIZED scale
+        valid_mask: Optional validity mask [N, T] or [T, N]
+        position_scale: Scale factor to convert to meters (default 100.0)
+    
+    Returns:
+        dict with keys: ade, fde, mse, rmse_meters, cosine_similarity, angle_error
+    """
+    with torch.no_grad():
+        # Ensure 3D: [batch, time, 2]
+        if pred_positions.dim() == 2:
+            pred_positions = pred_positions.unsqueeze(0)
+            target_positions = target_positions.unsqueeze(0)
+            if valid_mask is not None:
+                valid_mask = valid_mask.unsqueeze(0)
+        
+        # Handle [T, N, 2] format -> [N, T, 2]
+        if pred_positions.shape[0] < pred_positions.shape[1] and pred_positions.shape[2] == 2:
+            pass  # Already in [N, T, 2] format
+        
+        # Convert to meters for ADE/FDE
+        pred_meters = pred_positions * position_scale
+        target_meters = target_positions * position_scale
+        
+        # Displacement errors in meters
+        displacement_errors = torch.sqrt(
+            (pred_meters[..., 0] - target_meters[..., 0])**2 + 
+            (pred_meters[..., 1] - target_meters[..., 1])**2 + 1e-8
+        )  # [N, T]
+        
+        if valid_mask is not None:
+            # Apply mask
+            valid_mask = valid_mask.float()
+            masked_errors = displacement_errors * valid_mask
+            num_valid = valid_mask.sum(dim=-1).clamp(min=1)  # [N]
+            ade_per_agent = masked_errors.sum(dim=-1) / num_valid  # [N]
+            
+            # FDE: error at last valid timestep
+            # Find last valid index for each agent
+            last_valid_idx = (valid_mask.cumsum(dim=-1) * valid_mask).argmax(dim=-1)  # [N]
+            fde_per_agent = displacement_errors.gather(-1, last_valid_idx.unsqueeze(-1)).squeeze(-1)
+        else:
+            ade_per_agent = displacement_errors.mean(dim=-1)  # [N]
+            fde_per_agent = displacement_errors[..., -1]  # [N]
+        
+        ade = ade_per_agent.mean()
+        fde = fde_per_agent.mean()
+        
+        # MSE in normalized space (for loss comparison)
+        if valid_mask is not None:
+            mask_expanded = valid_mask.unsqueeze(-1).expand_as(pred_positions)
+            mse = ((pred_positions - target_positions)**2 * mask_expanded).sum() / mask_expanded.sum().clamp(min=1)
+        else:
+            mse = F.mse_loss(pred_positions, target_positions)
+        
+        # RMSE in meters
+        rmse_meters = torch.sqrt(mse) * position_scale
+        
+        # Cosine similarity (direction alignment) - compute on displacements between timesteps
+        if pred_positions.shape[1] > 1:
+            pred_vel = pred_positions[:, 1:, :] - pred_positions[:, :-1, :]
+            target_vel = target_positions[:, 1:, :] - target_positions[:, :-1, :]
+            pred_vel_flat = pred_vel.reshape(-1, 2)
+            target_vel_flat = target_vel.reshape(-1, 2)
+        else:
+            pred_vel_flat = pred_positions.reshape(-1, 2)
+            target_vel_flat = target_positions.reshape(-1, 2)
+        
+        pred_norm = F.normalize(pred_vel_flat, p=2, dim=1, eps=1e-6)
+        target_norm = F.normalize(target_vel_flat, p=2, dim=1, eps=1e-6)
+        cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+        
+        # Angle error (radians)
+        pred_angle = torch.atan2(pred_vel_flat[:, 1], pred_vel_flat[:, 0] + 1e-8)
+        target_angle = torch.atan2(target_vel_flat[:, 1], target_vel_flat[:, 0] + 1e-8)
+        angle_diff = pred_angle - target_angle
+        angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+        angle_error = torch.abs(angle_diff).mean()
+        
+        return {
+            'ade': ade.item(),
+            'fde': fde.item(),
+            'mse': mse.item(),
+            'rmse_meters': rmse_meters.item(),
+            'cosine_similarity': cos_sim.item(),
+            'angle_error': angle_error.item(),
+        }
+
+
+def compute_miss_rate(pred_positions, target_positions, valid_mask=None, 
+                      position_scale=100.0, threshold_meters=2.0):
+    """Compute miss rate: fraction of predictions with FDE > threshold.
+    
+    Args:
+        pred_positions: Predicted positions [N, T, 2]
+        target_positions: Ground truth positions [N, T, 2]
+        valid_mask: Optional validity mask [N, T]
+        position_scale: Scale factor to convert to meters
+        threshold_meters: FDE threshold for miss (default 2.0m)
+    
+    Returns:
+        float: Miss rate (0-1)
+    """
+    with torch.no_grad():
+        if pred_positions.dim() == 2:
+            pred_positions = pred_positions.unsqueeze(0)
+            target_positions = target_positions.unsqueeze(0)
+        
+        pred_meters = pred_positions * position_scale
+        target_meters = target_positions * position_scale
+        
+        # FDE for each agent
+        if valid_mask is not None and valid_mask.dim() >= 2:
+            # Find last valid index for each agent
+            valid_mask = valid_mask.float()
+            last_valid_idx = (valid_mask.cumsum(dim=-1) * valid_mask).argmax(dim=-1)
+            pred_final = pred_meters.gather(1, last_valid_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2)).squeeze(1)
+            target_final = target_meters.gather(1, last_valid_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2)).squeeze(1)
+        else:
+            pred_final = pred_meters[:, -1, :]
+            target_final = target_meters[:, -1, :]
+        
+        fde = torch.sqrt(
+            (pred_final[:, 0] - target_final[:, 0])**2 + 
+            (pred_final[:, 1] - target_final[:, 1])**2 + 1e-8
+        )
+        
+        miss_rate = (fde > threshold_meters).float().mean()
+        return miss_rate.item()
+
+
+def format_metrics_for_wandb(metrics, prefix='train', include_epoch=True, epoch=None, 
+                              learning_rate=None, sampling_prob=None):
+    """Format metrics dict for wandb logging with consistent key naming.
+    
+    Args:
+        metrics: dict with keys like 'loss', 'ade', 'fde', 'mse', 'cosine_similarity', etc.
+        prefix: 'train', 'val', or 'test'
+        include_epoch: Whether to include epoch in output
+        epoch: Current epoch number (1-indexed)
+        learning_rate: Optional learning rate to log
+        sampling_prob: Optional sampling probability (for finetuning)
+    
+    Returns:
+        dict formatted for wandb.log()
+    """
+    wandb_dict = {}
+    
+    if include_epoch and epoch is not None:
+        wandb_dict['epoch'] = epoch
+    
+    if learning_rate is not None:
+        wandb_dict['learning_rate'] = learning_rate
+    
+    if sampling_prob is not None:
+        wandb_dict['sampling_probability'] = sampling_prob
+    
+    # Map metric keys to wandb format
+    for key, value in metrics.items():
+        if value is not None:
+            wandb_dict[f'{prefix}/{key}'] = value
+    
+    return wandb_dict
+
+
+def print_epoch_metrics(epoch, train_metrics, val_metrics=None, learning_rate=None, 
+                        sampling_prob=None, model_type='base'):
+    """Print formatted epoch metrics to console.
+    
+    Args:
+        epoch: Current epoch number
+        train_metrics: dict with training metrics
+        val_metrics: Optional dict with validation metrics
+        learning_rate: Current learning rate
+        sampling_prob: Sampling probability (for finetuning)
+        model_type: 'base' for single-step, 'trajectory' for multi-step/finetuning
+    """
+    print(f"\n{'='*60}")
+    print(f"Epoch {epoch} Summary")
+    print(f"{'='*60}")
+    
+    if learning_rate is not None:
+        print(f"Learning Rate: {learning_rate:.6f}")
+    if sampling_prob is not None:
+        print(f"Sampling Prob: {sampling_prob:.4f}")
+    
+    if model_type == 'base':
+        # Single-step prediction (base training)
+        print(f"\nTraining:")
+        print(f"  Loss: {train_metrics.get('loss', 0):.6f}")
+        print(f"  MSE: {train_metrics.get('mse', 0):.6f}")
+        if 'rmse_meters' in train_metrics:
+            print(f"  RMSE: {train_metrics['rmse_meters']:.4f} m")
+        print(f"  CosSim: {train_metrics.get('cosine_similarity', 0):.4f}")
+        print(f"  AngleErr: {train_metrics.get('angle_error', 0):.4f} rad")
+        
+        if val_metrics:
+            print(f"\nValidation:")
+            print(f"  Loss: {val_metrics.get('loss', 0):.6f}")
+            print(f"  MSE: {val_metrics.get('mse', 0):.6f}")
+            if 'rmse_meters' in val_metrics:
+                print(f"  RMSE: {val_metrics['rmse_meters']:.4f} m")
+            print(f"  CosSim: {val_metrics.get('cosine_similarity', 0):.4f}")
+            print(f"  AngleErr: {val_metrics.get('angle_error', 0):.4f} rad")
+    else:
+        # Multi-step trajectory prediction (finetuning/vectornet)
+        print(f"\nTraining:")
+        print(f"  Loss: {train_metrics.get('loss', 0):.6f}")
+        print(f"  ADE: {train_metrics.get('ade', 0):.4f} m")
+        print(f"  FDE: {train_metrics.get('fde', 0):.4f} m")
+        if 'mse' in train_metrics:
+            print(f"  MSE: {train_metrics['mse']:.6f}")
+        if 'cosine_similarity' in train_metrics:
+            print(f"  CosSim: {train_metrics['cosine_similarity']:.4f}")
+        
+        if val_metrics:
+            print(f"\nValidation:")
+            print(f"  Loss: {val_metrics.get('loss', 0):.6f}")
+            print(f"  ADE: {val_metrics.get('ade', 0):.4f} m")
+            print(f"  FDE: {val_metrics.get('fde', 0):.4f} m")
+            if 'mse' in val_metrics:
+                print(f"  MSE: {val_metrics['mse']:.6f}")
+            if 'cosine_similarity' in val_metrics:
+                print(f"  CosSim: {val_metrics['cosine_similarity']:.4f}")
+
+
+def print_test_summary(results, model_name='Model'):
+    """Print formatted test results summary.
+    
+    Args:
+        results: dict with test metrics (ade, fde, miss_rate, per-horizon metrics, etc.)
+        model_name: Name of model for display
+    """
+    print(f"\n{'='*60}")
+    print(f"{model_name} Test Results")
+    print(f"{'='*60}")
+    
+    print(f"\nOverall Metrics:")
+    print(f"  ADE: {results.get('ade', 0):.4f} m")
+    print(f"  FDE: {results.get('fde', 0):.4f} m")
+    if 'miss_rate' in results:
+        print(f"  Miss Rate: {results['miss_rate']*100:.2f}%")
+    if 'cosine_similarity' in results:
+        print(f"  CosSim: {results['cosine_similarity']:.4f}")
+    if 'angle_error' in results:
+        print(f"  AngleErr: {results['angle_error']:.4f} rad")
+    
+    # Per-horizon metrics if available
+    if 'horizons' in results:
+        print(f"\nPer-Horizon Metrics:")
+        for h, h_metrics in results['horizons'].items():
+            print(f"  {h}:")
+            print(f"    ADE: {h_metrics.get('ade_mean', 0):.4f} ± {h_metrics.get('ade_std', 0):.4f} m")
+            print(f"    FDE: {h_metrics.get('fde_mean', 0):.4f} ± {h_metrics.get('fde_std', 0):.4f} m")

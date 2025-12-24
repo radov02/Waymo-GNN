@@ -28,7 +28,7 @@ from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_lay
                     gradient_clip_value, gcn_checkpoint_dir_autoreg, gcn_checkpoint_dir, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs, autoreg_viz_dir, autoreg_viz_dir_finetune, autoreg_skip_map_features,
+                    autoreg_visualize_every_n_epochs, gcn_viz_dir_autoreg, autoreg_skip_map_features,
                     pin_memory, prefetch_factor, use_amp,
                     early_stopping_patience, early_stopping_min_delta,
                     cache_validation_data, max_validation_scenarios,
@@ -165,10 +165,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         num_rollout_steps: Number of steps to roll out
         device: Torch device
         is_parallel: Whether model is wrapped in DataParallel
-        save_dir: Directory to save visualizations (defaults to autoreg_viz_dir from config)
+        save_dir: Directory to save visualizations (defaults to gcn_viz_dir_autoreg from config)
     """
     if save_dir is None:
-        save_dir = os.path.join(autoreg_viz_dir, 'finetuning')
+        save_dir = os.path.join(gcn_viz_dir_autoreg, 'finetuning')
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
@@ -1524,10 +1524,7 @@ def run_autoregressive_finetuning(
     model_uses_gat = checkpoint.get('config', {}).get('use_gat', False) if checkpoint else False
     if model_uses_gat:
         print("Note: Loaded old GAT checkpoint - consider using gat_autoregressive/finetune.py")
-    
-    # Set visualization directory from config.py
-    viz_dir = autoreg_viz_dir_finetune
-    
+      
     # Initialize wandb
     wandb.login()
     run = wandb.init(
@@ -1649,7 +1646,7 @@ def run_autoregressive_finetuning(
     print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
     print(f"Mixed Precision (AMP): {'Enabled' if use_amp and torch.cuda.is_available() else 'Disabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
-    print(f"Visualizations: {viz_dir}")
+    print(f"Visualizations: {gcn_viz_dir_autoreg}")
     
     # Check if rollout fits in sequence length
     if num_rollout_steps >= sequence_length - 1:
@@ -1660,7 +1657,7 @@ def run_autoregressive_finetuning(
     print(f"{'='*80}\n")
     
     os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
-    os.makedirs(viz_dir, exist_ok=True)
+    os.makedirs(gcn_viz_dir_autoreg, exist_ok=True)
     
     # Initialize GradScaler for AMP (only if enabled and CUDA available)
     scaler = None
@@ -1747,7 +1744,7 @@ def run_autoregressive_finetuning(
                             break
                         visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=viz_dir
+                            device, is_parallel, save_dir=gcn_viz_dir_autoreg
                         )
                         viz_count += 1
                     print(f"  Created {viz_count} visualizations\n")
@@ -1797,7 +1794,7 @@ def run_autoregressive_finetuning(
                             break
                         visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=viz_dir
+                            device, is_parallel, save_dir=gcn_viz_dir_autoreg
                         )
                         viz_count += 1
                     print(f"  Created {viz_count} visualizations\n")

@@ -870,10 +870,13 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     
     # torch.compile for speedup (PyTorch 2.0+)
+    # Note: 'reduce-overhead' mode can cause pow_by_natural warnings with dynamic shapes
+    # Using 'default' mode which is more stable with variable batch sizes
     if config.use_torch_compile and hasattr(torch, 'compile'):
         try:
-            print("Compiling model with torch.compile (reduce-overhead mode)...")
-            model = torch.compile(model, mode='reduce-overhead')
+            compile_mode = torch_compile_mode if torch_compile_mode != 'reduce-overhead' else 'default'
+            print(f"Compiling model with torch.compile (mode={compile_mode})...")
+            model = torch.compile(model, mode=compile_mode, dynamic=True)
             print("  Model compiled successfully")
         except Exception as e:
             print(f"  torch.compile failed: {e}")
