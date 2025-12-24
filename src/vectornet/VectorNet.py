@@ -185,37 +185,6 @@ class GlobalInteractionGraph(nn.Module):
         return h
 
 
-class NodeFeatureDecoder(nn.Module):
-    """Decoder for node completion auxiliary task.
-    
-    Predicts masked node features from context as described in the paper.
-    """
-    
-    def __init__(self, hidden_dim, output_dim):
-        super(NodeFeatureDecoder, self).__init__()
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, output_dim)
-        )
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        for module in self.decoder.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-    
-    def forward(self, x):
-        return self.decoder(x)
-
-
 class MultiStepTrajectoryDecoder(nn.Module):
     """MLP decoder for predicting full future trajectory at once.
     
@@ -291,8 +260,6 @@ class VectorNetMultiStep(nn.Module):
         num_global_layers: Number of global interaction graph layers
         num_heads: Number of attention heads in global graph
         dropout: Dropout probability
-        use_node_completion: Whether to use node completion auxiliary task
-        node_completion_ratio: Ratio of nodes to mask for completion task
         use_gradient_checkpointing: Whether to use gradient checkpointing
     """
     
@@ -306,8 +273,6 @@ class VectorNetMultiStep(nn.Module):
         num_global_layers=1,
         num_heads=8,
         dropout=0.1,
-        use_node_completion=True,
-        node_completion_ratio=0.15,
         use_gradient_checkpointing=False
     ):
         super(VectorNetMultiStep, self).__init__()
@@ -316,8 +281,6 @@ class VectorNetMultiStep(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.prediction_horizon = prediction_horizon
-        self.use_node_completion = use_node_completion
-        self.node_completion_ratio = node_completion_ratio
         self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Polyline Subgraph Network
@@ -362,44 +325,11 @@ class VectorNetMultiStep(nn.Module):
             dropout=dropout
         )
         
-        # Node Completion Decoder (for auxiliary task)
-        if use_node_completion:
-            self.node_decoder = NodeFeatureDecoder(
-                hidden_dim=hidden_dim,
-                output_dim=hidden_dim
-            )
-        else:
-            self.node_decoder = None
-        
         # Identifier embedding
         self.id_embedding = nn.Linear(2, hidden_dim)
         
-        # Store masked info for auxiliary loss computation
-        self.masked_indices = None
-        self.masked_features = None
-        self.masked_predictions = None
-        
         # Temporal feature storage for sequence processing
         self._temporal_buffer = []
-    
-    def _mask_polylines(self, polyline_features, unique_polylines):
-        """Randomly mask polyline features for node completion task."""
-        P = polyline_features.shape[0]
-        num_to_mask = max(1, int(P * self.node_completion_ratio))
-        
-        perm = torch.randperm(P, device=polyline_features.device)
-        mask_indices = perm[:num_to_mask]
-        
-        mask = torch.zeros(P, dtype=torch.bool, device=polyline_features.device)
-        mask[mask_indices] = True
-        
-        self.masked_indices = mask_indices
-        self.masked_features = polyline_features[mask].clone()
-        
-        masked_polyline_features = polyline_features.clone()
-        masked_polyline_features[mask] = 0
-        
-        return masked_polyline_features, mask
     
     def _add_identifier_embedding(self, polyline_features, x, polyline_ids, unique_polylines):
         """Add identifier embedding to polyline features."""
@@ -450,27 +380,13 @@ class VectorNetMultiStep(nn.Module):
             polyline_features, x, polyline_ids, unique_polylines
         )
         
-        # Optional masking for node completion
-        if self.training and self.use_node_completion:
-            polyline_features_masked, mask = self._mask_polylines(
-                polyline_features, unique_polylines
-            )
-        else:
-            polyline_features_masked = polyline_features
-            mask = None
-        
         # Global interaction
         if self.use_gradient_checkpointing and self.training:
             global_features = checkpoint(
-                self.global_graph, polyline_features_masked, use_reentrant=False
+                self.global_graph, polyline_features, use_reentrant=False
             )
         else:
-            global_features = self.global_graph(polyline_features_masked)
-        
-        # Node completion prediction
-        if self.training and self.use_node_completion and mask is not None:
-            masked_outputs = global_features[mask]
-            self.masked_predictions = self.node_decoder(masked_outputs)
+            global_features = self.global_graph(polyline_features)
         
         return global_features
     
@@ -609,19 +525,6 @@ class VectorNetMultiStep(nn.Module):
         
         return None
     
-    def get_node_completion_loss(self):
-        """Compute node completion auxiliary loss."""
-        if self.masked_predictions is None or self.masked_features is None:
-            return torch.tensor(0.0)
-        
-        loss = F.huber_loss(self.masked_predictions, self.masked_features)
-        
-        self.masked_predictions = None
-        self.masked_features = None
-        self.masked_indices = None
-        
-        return loss
-    
     def reset_gru_hidden_states(self, **kwargs):
         """Compatibility method - VectorNet doesn't use GRU hidden states."""
         self.reset_temporal_buffer()
@@ -665,16 +568,12 @@ class VectorNetTFRecord(nn.Module):
         num_global_layers: int = 1,
         num_heads: int = 8,
         dropout: float = 0.1,
-        use_node_completion: bool = True,
-        node_completion_ratio: float = 0.15,
     ):
         super(VectorNetTFRecord, self).__init__()
         
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.prediction_horizon = prediction_horizon
-        self.use_node_completion = use_node_completion
-        self.node_completion_ratio = node_completion_ratio
         
         # Separate encoders for agents and map features
         self.agent_encoder = PolylineSubgraphNetwork(
@@ -706,20 +605,6 @@ class VectorNetTFRecord(nn.Module):
             prediction_horizon=prediction_horizon,
             dropout=dropout
         )
-        
-        # Node completion decoder
-        if use_node_completion:
-            self.node_decoder = NodeFeatureDecoder(
-                hidden_dim=hidden_dim,
-                output_dim=hidden_dim
-            )
-        else:
-            self.node_decoder = None
-        
-        # Storage for auxiliary loss
-        self.masked_indices = None
-        self.masked_features = None
-        self.masked_predictions = None
     
     def _scatter_max(self, src, index, dim_size):
         """Vectorized scatter max operation for aggregating vectors to polylines."""
@@ -753,28 +638,6 @@ class VectorNetTFRecord(nn.Module):
         
         polyline_features, unique_ids = encoder(vectors, polyline_ids)
         return polyline_features, unique_ids
-    
-    def _mask_polylines(self, polyline_features):
-        """Randomly mask polyline features for node completion task."""
-        P = polyline_features.shape[0]
-        if P == 0:
-            return polyline_features, None
-            
-        num_to_mask = max(1, int(P * self.node_completion_ratio))
-        
-        perm = torch.randperm(P, device=polyline_features.device)
-        mask_indices = perm[:num_to_mask]
-        
-        mask = torch.zeros(P, dtype=torch.bool, device=polyline_features.device)
-        mask[mask_indices] = True
-        
-        self.masked_indices = mask_indices
-        self.masked_features = polyline_features[mask].clone()
-        
-        masked_polyline_features = polyline_features.clone()
-        masked_polyline_features[mask] = 0
-        
-        return masked_polyline_features, mask
     
     def forward(self, batch):
         """Forward pass for TFRecord batch format.
@@ -826,23 +689,11 @@ class VectorNetTFRecord(nn.Module):
         else:
             all_polylines = agent_polyline_features
         
-        # Masking for node completion
-        if self.training and self.use_node_completion:
-            all_polylines_masked, mask = self._mask_polylines(all_polylines)
-        else:
-            all_polylines_masked = all_polylines
-            mask = None
-        
         # Global interaction (self-attention over all polylines)
-        if all_polylines_masked.numel() > 0:
-            global_features = self.global_graph(all_polylines_masked)  # [P, hidden_dim]
+        if all_polylines.numel() > 0:
+            global_features = self.global_graph(all_polylines)  # [P, hidden_dim]
         else:
             global_features = torch.zeros(0, self.hidden_dim, device=device)
-        
-        # Node completion prediction
-        if self.training and self.use_node_completion and mask is not None and mask.sum() > 0:
-            masked_outputs = global_features[mask]
-            self.masked_predictions = self.node_decoder(masked_outputs)
         
         # Extract target agent features for ALL target agents
         # target_polyline_indices contains indices into agent polylines for all targets
@@ -852,19 +703,6 @@ class VectorNetTFRecord(nn.Module):
         predictions = self.trajectory_decoder(target_features)  # [total_targets, prediction_horizon, output_dim]
         
         return predictions
-    
-    def get_node_completion_loss(self):
-        """Compute node completion auxiliary loss."""
-        if self.masked_predictions is None or self.masked_features is None:
-            return torch.tensor(0.0)
-        
-        loss = F.huber_loss(self.masked_predictions, self.masked_features)
-        
-        self.masked_predictions = None
-        self.masked_features = None
-        self.masked_indices = None
-        
-        return loss
 
 
 # Export all models

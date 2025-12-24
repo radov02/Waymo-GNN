@@ -571,7 +571,6 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
     model.train()
     total_loss = 0.0
     total_traj_loss = 0.0
-    total_node_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     steps = 0
@@ -610,12 +609,7 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
                 delta=config.loss_delta
             )
             
-            # Node completion loss
-            node_loss_val = model.get_node_completion_loss() if hasattr(model, 'get_node_completion_loss') else model._orig_mod.get_node_completion_loss()
-            if isinstance(node_loss_val, torch.Tensor) and node_loss_val.device != device:
-                node_loss_val = node_loss_val.to(device)
-            
-            loss = traj_loss + config.node_completion_weight * node_loss_val
+            loss = traj_loss
             
             # Scale loss for gradient accumulation
             loss = loss / accumulation_steps
@@ -649,7 +643,6 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
         
         total_loss += (loss.item() * accumulation_steps)  # Unscale for logging
         total_traj_loss += traj_loss.item()
-        total_node_loss += node_loss_val.item() if isinstance(node_loss_val, torch.Tensor) else node_loss_val
         total_ade += ade.item()
         total_fde += fde.item()
         steps += 1
@@ -665,7 +658,6 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
     metrics = {
         'loss': total_loss / max(1, steps),
         'traj_loss': total_traj_loss / max(1, steps),
-        'node_loss': total_node_loss / max(1, steps),
         'ade': total_ade / max(1, steps),
         'fde': total_fde / max(1, steps),
     }
@@ -870,7 +862,6 @@ def main():
         num_global_layers=config.num_global_layers,
         num_heads=config.num_heads,
         dropout=config.dropout,
-        node_completion_ratio=config.node_completion_ratio,
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -1003,7 +994,6 @@ def main():
             "epoch": epoch + 1,
             "train/loss": train_metrics['loss'],
             "train/traj_loss": train_metrics['traj_loss'],
-            "train/node_loss": train_metrics['node_loss'],
             "train/ade": train_metrics['ade'],
             "train/fde": train_metrics['fde'],
             "val/loss": val_metrics['loss'],
@@ -1013,7 +1003,6 @@ def main():
             # Per-epoch aggregated metrics for better tracking
             "train_epoch/loss": train_metrics['loss'],
             "train_epoch/traj_loss": train_metrics['traj_loss'],
-            "train_epoch/node_loss": train_metrics['node_loss'],
             "train_epoch/ade": train_metrics['ade'],
             "train_epoch/fde": train_metrics['fde'],
             "val_epoch/loss": val_metrics['loss'],
