@@ -42,7 +42,7 @@ from config import (
     vectornet_use_node_completion, vectornet_node_completion_ratio,
     vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_viz_dir_testing, POSITION_SCALE,
     vectornet_best_model,
-    test_hdf5_path, test_max_scenarios, test_visualize, test_visualize_max, test_use_wandb,
+    test_max_scenarios, test_visualize, test_visualize_max, test_use_wandb,
     use_gradient_checkpointing
 )
 
@@ -293,7 +293,7 @@ def visualize_predictions(predictions, targets, scenario_ids, save_dir, max_viz=
     return saved_paths, avg_ade
 
 
-def run_testing(test_dataset_path=test_hdf5_path,
+def run_testing(test_dataset_path='data/scenario',
                 checkpoint_path=None,
                 batch_size=32,
                 max_scenarios=None,
@@ -495,8 +495,8 @@ def main():
     parser = argparse.ArgumentParser(description='VectorNet Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint (default: auto-detect)')
-    parser.add_argument('--test_data', type=str, default=test_hdf5_path,
-                        help='Path to test HDF5 file')
+    parser.add_argument('--test_data', type=str, default='data/scenario',
+                        help='Base directory for TFRecord test data (default: data/scenario)')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
     parser.add_argument('--max_scenarios', type=int, default=test_max_scenarios,
