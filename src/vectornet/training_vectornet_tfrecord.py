@@ -926,6 +926,9 @@ def main():
     # Resume from checkpoint
     start_epoch = 0
     best_val_loss = float('inf')
+    best_model_state = None
+    best_optimizer_state = None
+    best_epoch = 0
     
     if args.resume:
         print(f"\nResuming from checkpoint: {args.resume}")
@@ -1019,38 +1022,85 @@ def main():
             "learning_rate": current_lr,
         }, commit=True)
         
-        # Save best model
+        # Save best model state in memory
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
-            save_checkpoint(
-                model, optimizer, scheduler, epoch,
-                {'val_loss': val_metrics['loss'], 'val_ade': val_metrics['ade'], 'val_fde': val_metrics['fde']},
-                os.path.join(config.checkpoint_dir, 'best_vectornet_tfrecord.pt')
-            )
-        
-        # Save periodic checkpoint
-        if (epoch + 1) % config.save_every == 0:
-            save_checkpoint(
-                model, optimizer, scheduler, epoch,
-                {'val_loss': val_metrics['loss']},
-                os.path.join(config.checkpoint_dir, f'vectornet_tfrecord_epoch_{epoch+1}.pt')
-            )
+            best_epoch = epoch + 1
+            # Handle DataParallel and torch.compile
+            if hasattr(model, 'module'):
+                save_model = model.module
+            elif hasattr(model, '_orig_mod'):
+                save_model = model._orig_mod
+            else:
+                save_model = model
+            best_model_state = save_model.state_dict().copy()
+            best_optimizer_state = optimizer.state_dict().copy()
+            print(f"   New best validation loss: {val_metrics['loss']:.4f} at epoch {epoch+1}")
         
         # Early stopping
         if early_stopping(val_metrics['loss']):
             print(f"\nEarly stopping triggered at epoch {epoch+1}")
             break
     
-    # Save final model
-    save_checkpoint(
-        model, optimizer, scheduler, epoch,
-        {'val_loss': val_metrics['loss']},
-        os.path.join(config.checkpoint_dir, 'final_vectornet_tfrecord.pt')
-    )
+    # Save best model checkpoint after training completes
+    if best_model_state is not None:
+        print(f"\n{'='*60}")
+        print(f"Saving best model from epoch {best_epoch}...")
+        best_checkpoint_path = os.path.join(config.checkpoint_dir, 'best_vectornet_tfrecord.pt')
+        torch.save({
+            'epoch': best_epoch,
+            'model_state_dict': best_model_state,
+            'optimizer_state_dict': best_optimizer_state,
+            'val_loss': best_val_loss,
+            'config': {
+                'hidden_dim': config.hidden_dim,
+                'num_polyline_layers': config.num_polyline_layers,
+                'num_global_layers': config.num_global_layers,
+                'num_heads': config.num_heads,
+                'dropout': config.dropout,
+                'future_len': config.future_len,
+                'history_len': config.history_len,
+            }
+        }, best_checkpoint_path)
+        print(f"Best VectorNet model saved to best_vectornet_tfrecord.pt")
+        print(f"Epoch: {best_epoch} | Val Loss: {best_val_loss:.4f}")
+        print(f"{'='*60}\n")
+    else:
+        print("\nNo best model checkpoint saved (no improvement detected)\n")
+    
+    # Save final model (current state at last epoch)
+    print(f"\n{'='*60}")
+    print(f"Saving final model from epoch {epoch+1}...")
+    # Handle DataParallel and torch.compile
+    if hasattr(model, 'module'):
+        save_model = model.module
+    elif hasattr(model, '_orig_mod'):
+        save_model = model._orig_mod
+    else:
+        save_model = model
+    final_checkpoint_path = os.path.join(config.checkpoint_dir, 'final_vectornet_tfrecord.pt')
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': save_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_metrics['loss'],
+        'config': {
+            'hidden_dim': config.hidden_dim,
+            'num_polyline_layers': config.num_polyline_layers,
+            'num_global_layers': config.num_global_layers,
+            'num_heads': config.num_heads,
+            'dropout': config.dropout,
+            'future_len': config.future_len,
+            'history_len': config.history_len,
+        }
+    }, final_checkpoint_path)
+    print(f"Final VectorNet model saved to final_vectornet_tfrecord.pt")
+    print(f"Epoch: {epoch+1} | Val Loss: {val_metrics['loss']:.4f}")
+    print(f"{'='*60}\n")
     
     print("\n" + "="*60)
     print("Training complete!")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
     print("="*60)
     
     wandb.finish()

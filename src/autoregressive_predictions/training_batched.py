@@ -751,7 +751,33 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         print(f"Epoch: {best_epoch} | Val Loss: {best_val_loss:.4f}")
         print(f"{'='*60}\n")
     else:
-        print("\nNo checkpoint saved (no validation data or no improvement)\n")
+        print("\nNo best model checkpoint saved (no validation data or no improvement)\n")
+    
+    # Save final model (current state at last epoch)
+    print(f"\n{'='*60}")
+    print(f"Saving final model from epoch {epoch+1}...")
+    save_model = get_model_for_saving(model, is_parallel)
+    final_checkpoint_filename = f'final_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+    final_checkpoint_path = os.path.join(gcn_checkpoint_dir, final_checkpoint_filename)
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': save_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss if val_dataloader is not None else None,
+        'batch_size': batch_size,
+        'config': {
+            'batch_size': batch_size,
+            'hidden_channels': hidden_channels,
+            'learning_rate': learning_rate,
+            'num_layers': num_layers,
+            'num_gru_layers': num_gru_layers,
+            'dropout': dropout,
+            'use_edge_weights': use_edge_weights
+        }
+    }, final_checkpoint_path)
+    print(f"Final GCN model saved to {final_checkpoint_filename}")
+    print(f"Epoch: {epoch+1}")
+    print(f"{'='*60}\n")
     
     if should_finish_wandb:
         wandb_run.finish()
