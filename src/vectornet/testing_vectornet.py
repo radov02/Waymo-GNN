@@ -510,7 +510,9 @@ def run_testing(test_dataset_path=None,
                 num_agents=None,
                 visualize=True,
                 visualize_max=10,
-                use_wandb=True):
+                use_wandb=True,
+                split='training',
+                random_sample=True):
     """Run testing with multi-step VectorNet prediction.
     
     Args:
@@ -522,6 +524,8 @@ def run_testing(test_dataset_path=None,
         visualize: Generate visualizations
         visualize_max: Max scenarios to visualize
         use_wandb: Enable wandb logging
+        split: Data split to use ('training', 'validation', or 'testing')
+        random_sample: If True, randomly sample scenarios instead of taking first N
     """
     # Use config defaults
     if test_dataset_path is None:
@@ -551,6 +555,8 @@ def run_testing(test_dataset_path=None,
                 "max_scenarios": max_scenarios,
                 "num_agents_to_predict": num_agents,
                 "test_dataset": test_dataset_path,
+                "split": split,
+                "random_sample": random_sample,
             },
             tags=["vectornet", "testing", "multi-step"]
         )
@@ -600,17 +606,29 @@ def run_testing(test_dataset_path=None,
     # Load dataset
     print(f"\n--- Loading Test Data ---")
     print(f"Data: {test_dataset_path}")
+    print(f"Split: {split}")
+    print(f"Random sampling: {random_sample}")
     print(f"Agents to predict per scenario: {num_agents}")
     
-    # Use TFRecord dataset to match training
+    # Use TFRecord dataset - load more scenarios if random sampling
+    load_max = max_scenarios * 5 if random_sample else max_scenarios  # Load 5x for random selection
+    
     test_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=test_dataset_path,
-        split='testing',  # or 'validation' if testing data not available
+        split=split,  # Use specified split (training, validation, or testing)
         history_len=history_length,
         future_len=prediction_horizon,
-        max_scenarios=max_scenarios,
-        num_agents_to_predict=num_agents,  # Use config value for multiple agents
+        max_scenarios=load_max,
+        num_agents_to_predict=num_agents,
     )
+    
+    # Random sampling: select random subset of scenarios
+    if random_sample and len(test_dataset) > max_scenarios:
+        all_indices = list(range(len(test_dataset)))
+        random.shuffle(all_indices)
+        selected_indices = all_indices[:max_scenarios]
+        test_dataset = Subset(test_dataset, selected_indices)
+        print(f"Randomly selected {max_scenarios} scenarios from {load_max}")
     
     print(f"Test scenarios: {len(test_dataset)}")
     
@@ -632,6 +650,8 @@ def run_testing(test_dataset_path=None,
     print(f"  Prediction horizon: {prediction_horizon} steps ({prediction_horizon * 0.1:.1f}s)")
     print(f"  History length: {history_length} steps ({history_length * 0.1:.1f}s)")
     print(f"  Agents per scenario: {num_agents}")
+    print(f"  Data split: {split}")
+    print(f"  Random sampling: {random_sample}")
     print(f"  Max scenarios: {max_scenarios if max_scenarios else 'all'}")
     print(f"  W&B logging: {use_wandb}")
     
@@ -738,6 +758,11 @@ def main():
                         help='Number of agents to predict per scenario')
     parser.add_argument('--visualize_max', type=int, default=test_visualize_max,
                         help='Max scenarios to visualize')
+    parser.add_argument('--split', type=str, default='training',
+                        choices=['training', 'validation', 'testing'],
+                        help='Data split to use (default: training)')
+    parser.add_argument('--no_random', action='store_true',
+                        help='Disable random sampling (use first N scenarios)')
     parser.add_argument('--no_visualize', action='store_true',
                         help='Disable visualization')
     parser.add_argument('--no_wandb', action='store_true',
@@ -753,7 +778,9 @@ def main():
         num_agents=args.num_agents,
         visualize=not args.no_visualize,
         visualize_max=args.visualize_max,
-        use_wandb=not args.no_wandb
+        use_wandb=not args.no_wandb,
+        split=args.split,
+        random_sample=not args.no_random
     )
     
     return results
