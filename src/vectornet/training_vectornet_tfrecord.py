@@ -550,6 +550,12 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
     plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     
+    # Log visualization to wandb (per-epoch)
+    try:
+        wandb.log({f"vectornet_visualization": wandb.Image(filepath)})
+    except:
+        pass
+    
     print(f"  Saved visualization: {filepath}")
     return filepath
 
@@ -789,7 +795,7 @@ def main():
     
     # Initialize wandb
     if not args.no_wandb:
-        run_name = config.wandb_name or f"vectornet_tfrecord_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = config.wandb_name or f"vectornet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         wandb.init(
             project=config.wandb_project,
             name=run_name,
@@ -1029,10 +1035,10 @@ def main():
             best_optimizer_state = optimizer.state_dict().copy()
             print(f"   New best validation loss: {val_metrics['loss']:.4f} at epoch {epoch+1}")
         
-        # Early stopping
-        if early_stopping(val_metrics['loss']):
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
+        # Early stopping disabled - let training run for all epochs
+        # if early_stopping(val_metrics['loss']):
+        #     print(f"\nEarly stopping triggered at epoch {epoch+1}")
+        #     break
     
     # Save best model checkpoint after training completes
     if best_model_state is not None:

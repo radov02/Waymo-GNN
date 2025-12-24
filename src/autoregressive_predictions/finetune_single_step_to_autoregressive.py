@@ -1772,12 +1772,12 @@ def run_autoregressive_finetuning(
                 torch.save(checkpoint_data, save_path)
                 print(f"  -> Saved best model to {save_filename} (val_loss: {val_metrics['loss']:.4f})")
             
-            # Early stopping check
-            early_stopper(val_metrics['loss'])
-            if early_stopper.early_stop:
-                print(f"\n Early stopping triggered at epoch {epoch+1}!")
-                print(f"   Best validation loss: {early_stopper.best_loss:.4f}")
-                break
+            # Early stopping disabled - let training run for all epochs
+            # early_stopper(val_metrics['loss'])
+            # if early_stopper.early_stop:
+            #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
+            #     print(f"   Best validation loss: {early_stopper.best_loss:.4f}")
+            #     break
         else:
             print(f"  Train Loss: {train_metrics['loss']:.4f} | Train Cos: {train_metrics['cosine_sim']:.4f}")
             
@@ -1800,11 +1800,11 @@ def run_autoregressive_finetuning(
                     print(f"  Warning: Visualization failed: {e}")
                     traceback.print_exc()
             
-            # Early stopping on train loss if no validation
-            early_stopper(train_metrics['loss'])
-            if early_stopper.early_stop:
-                print(f"\n Early stopping triggered at epoch {epoch+1}!")
-                break
+            # Early stopping disabled - let training run for all epochs
+            # early_stopper(train_metrics['loss'])
+            # if early_stopper.early_stop:
+            #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
+            #     break
     
     # Determine actual final epoch (may be earlier due to early stopping)
     actual_final_epoch = epoch + 1

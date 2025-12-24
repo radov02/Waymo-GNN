@@ -1898,12 +1898,12 @@ def run_autoregressive_finetuning(
                 "max_horizon_error_m": max(epoch_horizon_errors),
             }, commit=True)
             
-            # Early stopping based on horizon error
-            early_stopper(avg_horizon_error)
+            # Early stopping disabled - let training run for all epochs
+            # early_stopper(avg_horizon_error)
         else:
             # Fallback to training loss if no visualizations
             avg_horizon_error = train_metrics['loss'] * 100  # Scale to be comparable
-            early_stopper(avg_horizon_error)
+            # early_stopper(avg_horizon_error)
         
         # Determine metric to use for best model saving
         current_metric = avg_horizon_error
@@ -1928,10 +1928,10 @@ def run_autoregressive_finetuning(
             torch.save(checkpoint_data, save_path)
             print(f"  -> Saved best model to {save_filename} (horizon_error: {best_val_loss:.2f}m)")
         
-        # Check early stopping
-        if early_stopper.early_stop:
-            print(f"\n Early stopping triggered at epoch {epoch+1}!")
-            break
+        # Early stopping disabled - let training run for all epochs
+        # if early_stopper.early_stop:
+        #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
+        #     break
     
     # Save final model
     final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
