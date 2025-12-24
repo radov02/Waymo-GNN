@@ -28,8 +28,8 @@ from torch.utils.data import DataLoader, Subset
 import random
 
 # Import VectorNet modules
-from VectorNet import VectorNetMultiStep
-from vectornet_dataset import VectorNetDataset, collate_vectornet_batch, worker_init_fn
+from VectorNet import VectorNetTFRecord, AGENT_VECTOR_DIM, MAP_VECTOR_DIM
+from vectornet_tfrecord_dataset import VectorNetTFRecordDataset, vectornet_collate_fn
 
 # Import configuration from centralized config.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,17 +79,17 @@ def load_model(checkpoint_path, device):
     # Get config from checkpoint or use defaults
     config = checkpoint.get('config', get_vectornet_config())
     
-    # Create model
-    model = VectorNetMultiStep(
-        input_dim=config.get('input_dim', vectornet_input_dim),
+    # Create model using VectorNetTFRecord (matches training script)
+    model = VectorNetTFRecord(
+        agent_input_dim=AGENT_VECTOR_DIM,
+        map_input_dim=MAP_VECTOR_DIM,
         hidden_dim=config.get('hidden_dim', vectornet_hidden_dim),
         output_dim=config.get('output_dim', vectornet_output_dim),
         prediction_horizon=config.get('prediction_horizon', vectornet_prediction_horizon),
         num_polyline_layers=config.get('num_polyline_layers', vectornet_num_polyline_layers),
         num_global_layers=config.get('num_global_layers', vectornet_num_global_layers),
         num_heads=config.get('num_heads', vectornet_num_heads),
-        dropout=config.get('dropout', vectornet_dropout),
-        use_node_completion=False  # No aux task during testing
+        dropout=config.get('dropout', vectornet_dropout)
     )
     
     # Load weights
@@ -151,7 +151,6 @@ def compute_trajectory_metrics(predictions, targets):
 def evaluate_model(model, dataloader, device, prediction_horizon=50):
     """Evaluate model on test set. Returns aggregate metrics dict."""
     model.eval()
-    base_model = get_module(model)
     
     all_predictions = []
     all_targets = []
@@ -164,69 +163,36 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
     
     print("\n--- Evaluating ---")
     
-    for batch_idx, batch_dict in enumerate(dataloader):
-        batched_sequence = batch_dict["batch"]
-        B = batch_dict["B"]
-        T = batch_dict["T"]
-        scenario_ids = batch_dict.get("scenario_ids", [None] * B)
-        
+    for batch_idx, batch in enumerate(dataloader):
         if batch_idx % 10 == 0:
             print(f"  Batch {batch_idx + 1}/{len(dataloader)}")
         
-        # Move to device
-        for t in range(T):
-            batched_sequence[t] = batched_sequence[t].to(device, non_blocking=True)
-        
-        base_model.reset_temporal_buffer()
-        
-        # Determine history split
-        history_len = min(T - 1, 10)
-        if T <= 1:
-            continue
-        
-        # Process history
-        for t in range(history_len):
-            data = batched_sequence[t]
-            base_model.forward_single_step(
-                data.x, data.edge_index,
-                edge_weight=data.edge_attr,
-                is_last_step=False
-            )
-        
-        # Get predictions
-        last_data = batched_sequence[history_len]
-        predictions = base_model.forward_single_step(
-            last_data.x, last_data.edge_index,
-            edge_weight=last_data.edge_attr,
-            is_last_step=True
-        )
-        
-        if predictions is None:
-            continue
-        
-        # Build targets
-        future_len = min(T - history_len - 1, prediction_horizon)
-        N = last_data.x.shape[0]
-        
-        if future_len <= 0:
-            continue
-        
-        targets = torch.zeros(N, future_len, 2, device=device)
-        for future_t in range(future_len):
-            t_idx = history_len + 1 + future_t
-            if t_idx < T:
-                future_data = batched_sequence[t_idx]
-                if future_data.y is not None and future_data.y.shape[0] >= N:
-                    targets[:, future_t, :] = future_data.y[:N, :]
-        
-        predictions = predictions[:, :future_len, :]
+        # Forward pass through VectorNetTFRecord
+        predictions = model(batch)  # [B, future_len, 2]
+        targets = batch['future_positions'].to(device)  # [B, future_len, 2]
+        valid_mask = batch['future_valid'].to(device)  # [B, future_len]
+        scenario_ids = batch.get('scenario_ids', [None] * batch['batch_size'])
         
         # Compute metrics
-        metrics = compute_trajectory_metrics(predictions, targets)
+        disp = torch.norm(predictions - targets, dim=-1)  # [B, T]
         
-        total_ade += metrics['ade']
-        total_fde += metrics['fde']
-        total_mr += metrics['miss_rate']
+        if valid_mask is not None:
+            valid_count = valid_mask.sum()
+            if valid_count > 0:
+                ade = (disp * valid_mask).sum() / valid_count
+            else:
+                ade = torch.tensor(0.0, device=device)
+            fde = disp[:, -1].mean()
+        else:
+            ade = disp.mean()
+            fde = disp[:, -1].mean()
+        
+        # Miss rate: percentage with FDE > 2.0m
+        miss_rate = (disp[:, -1] > 2.0).float().mean()
+        
+        total_ade += ade.item()
+        total_fde += fde.item()
+        total_mr += miss_rate.item()
         num_batches += 1
         
         # Store for detailed analysis
@@ -370,12 +336,12 @@ def run_testing(test_dataset_path=test_hdf5_path,
         return None
     
     if not os.path.exists(test_dataset_path):
-        print(f"\nERROR: Test data not found at {test_dataset_path}")
+        print(f"\nERROR: Test data directory not found at {test_dataset_path}")
         print("Trying alternative paths...")
         alt_paths = [
-            'data/graphs/testing/testing.hdf5',
-            'data/graphs/testing/scenario_graphs.h5',
-            'data/graphs/validation/scenario_graphs.h5',
+            'data/scenario/testing',
+            'data/scenario/validation',
+            'data/scenario',
         ]
         for alt_path in alt_paths:
             if os.path.exists(alt_path):
@@ -404,16 +370,15 @@ def run_testing(test_dataset_path=test_hdf5_path,
     print(f"\n--- Loading Test Data ---")
     print(f"Data: {test_dataset_path}")
     
-    test_dataset = VectorNetDataset(
-        test_dataset_path,
-        seq_len=prediction_horizon + history_length,
-        cache_in_memory=False
+    # Use TFRecord dataset to match training
+    test_dataset = VectorNetTFRecordDataset(
+        tfrecord_dir=test_dataset_path,
+        split='testing',  # or 'validation' if testing data not available
+        history_len=history_length,
+        future_len=prediction_horizon,
+        max_scenarios=max_scenarios,
+        num_agents_to_predict=1,  # Predict for SDC
     )
-    
-    # Limit scenarios if needed
-    if max_scenarios is not None and len(test_dataset) > max_scenarios:
-        indices = list(range(max_scenarios))
-        test_dataset = Subset(test_dataset, indices)
     
     print(f"Test scenarios: {len(test_dataset)}")
     
@@ -424,8 +389,8 @@ def run_testing(test_dataset_path=test_hdf5_path,
         shuffle=False,
         num_workers=vectornet_num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_vectornet_batch,
-        worker_init_fn=worker_init_fn,
+        collate_fn=vectornet_collate_fn,
+        prefetch_factor=2 if vectornet_num_workers > 0 else None,
         drop_last=False
     )
     
