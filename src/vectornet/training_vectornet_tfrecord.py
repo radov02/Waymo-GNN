@@ -1,17 +1,6 @@
-"""VectorNet Training Script for TFRecord Dataset (Waymo Open Motion Dataset).
+"""VectorNet training with TFRecord dataset. Predicts full trajectory at once.
 
-This is the main training script for VectorNet using direct TFRecord loading.
-It uses VectorNetTFRecordDataset which extracts all necessary data including:
-- Agent trajectory polylines
-- Map feature polylines (lanes, roads, crosswalks)
-- Multi-step future trajectory labels
-
-VectorNet predicts the FULL FUTURE TRAJECTORY at once (not autoregressive).
-
-Usage:
-    python src/vectornet/training_vectornet_tfrecord.py --data_dir data/scenario
-
-Checkpoints: checkpoints/vectornet/
+Usage: python src/vectornet/training_vectornet_tfrecord.py --data_dir data/scenario
 """
 
 import sys
@@ -665,14 +654,6 @@ def train_epoch(model, dataloader, optimizer, config, scaler=None, visualize_cal
         total_fde += fde.item()
         steps += 1
         
-        # Log to wandb periodically
-        if steps % 10 == 0:
-            wandb.log({
-                "train/batch_loss": loss.item(),
-                "train/batch_ade": ade.item(),
-                "train/batch_fde": fde.item(),
-            }, commit=False)
-        
         # Store last batch for visualization
         if batch_idx == len(dataloader) - 1:
             last_batch = {k: v.cpu() if torch.is_tensor(v) else v for k, v in batch.items()}
@@ -902,9 +883,9 @@ def main():
         try:
             print("Compiling model with torch.compile (reduce-overhead mode)...")
             model = torch.compile(model, mode='reduce-overhead')
-            print("  ✓ Model compiled successfully")
+            print("  Model compiled successfully")
         except Exception as e:
-            print(f"  ✗ torch.compile failed: {e}")
+            print(f"  torch.compile failed: {e}")
     
     # Multi-GPU support
     if torch.cuda.device_count() > 1:

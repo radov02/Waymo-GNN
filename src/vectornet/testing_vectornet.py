@@ -1,15 +1,4 @@
-"""VectorNet Multi-Step Testing Script for Waymo Open Motion Dataset.
-
-This script evaluates trained VectorNet models that predict full trajectories
-at once (multi-step, not autoregressive).
-
-Features:
-- Load trained VectorNet checkpoints
-- Evaluate on test set with multi-step prediction
-- Compute trajectory prediction metrics (ADE, FDE, MR)
-- Generate trajectory visualizations
-- Log metrics to Weights & Biases
-- Save results to file
+"""VectorNet testing script - evaluates trained models on test set.
 
 Usage:
     python src/vectornet/testing_vectornet.py
@@ -45,20 +34,17 @@ from vectornet_dataset import VectorNetDataset, collate_vectornet_batch, worker_
 # Import configuration from centralized config.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
-    device, vectornet_num_workers, pin_memory, print_gpu_info, num_workers,
+    device, vectornet_num_workers, pin_memory, print_gpu_info,
     vectornet_input_dim, vectornet_hidden_dim, vectornet_output_dim,
     vectornet_num_polyline_layers, vectornet_num_global_layers,
     vectornet_num_heads, vectornet_dropout, project_name,
     vectornet_prediction_horizon, vectornet_history_length,
     vectornet_use_node_completion, vectornet_node_completion_ratio,
     vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_viz_dir_testing, POSITION_SCALE,
+    vectornet_best_model,
+    test_hdf5_path, test_max_scenarios, test_visualize, test_visualize_max, test_use_wandb,
     use_gradient_checkpointing
 )
-
-
-# ============== TESTING CONFIGURATION ==============
-TEST_HDF5 = 'data/graphs/testing/testing.hdf5'
-
 
 def get_vectornet_config():
     """Get default VectorNet configuration."""
@@ -85,15 +71,7 @@ def get_module(model):
 
 
 def load_model(checkpoint_path, device):
-    """Load trained VectorNet model from checkpoint.
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        device: Target device
-        
-    Returns:
-        Loaded model
-    """
+    """Load trained VectorNet model from checkpoint."""
     print(f"\nLoading model from {checkpoint_path}...")
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -137,16 +115,7 @@ def load_model(checkpoint_path, device):
 
 
 def compute_trajectory_metrics(predictions, targets):
-    """Compute trajectory prediction metrics.
-    
-    Args:
-        predictions: [N, T, 2] predicted trajectories (displacements per step)
-        targets: [N, T, 2] ground truth trajectories
-        
-    Returns:
-        Dictionary of metrics
-    """
-    # Ensure same shape
+    """Compute ADE, FDE, and miss rate from predicted vs target trajectories."""
     min_t = min(predictions.shape[1], targets.shape[1])
     predictions = predictions[:, :min_t, :]
     targets = targets[:, :min_t, :]
@@ -180,17 +149,7 @@ def compute_trajectory_metrics(predictions, targets):
 
 @torch.no_grad()
 def evaluate_model(model, dataloader, device, prediction_horizon=50):
-    """Evaluate model on test set.
-    
-    Args:
-        model: VectorNet model
-        dataloader: Test data loader
-        device: Target device
-        prediction_horizon: Number of timesteps to predict
-        
-    Returns:
-        Dictionary of aggregate metrics
-    """
+    """Evaluate model on test set. Returns aggregate metrics dict."""
     model.eval()
     base_model = get_module(model)
     
@@ -292,18 +251,7 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
 
 
 def visualize_predictions(predictions, targets, scenario_ids, save_dir, max_viz=10):
-    """Generate visualization of predicted vs ground truth trajectories.
-    
-    Args:
-        predictions: List of [N, T, 2] prediction tensors
-        targets: List of [N, T, 2] target tensors
-        scenario_ids: List of scenario IDs
-        save_dir: Directory to save visualizations
-        max_viz: Maximum number of visualizations to generate
-    
-    Returns:
-        List of saved file paths and average ADE
-    """
+    """Generate visualization of predicted vs ground truth trajectories."""
     os.makedirs(save_dir, exist_ok=True)
     saved_paths = []
     total_ade = 0
@@ -379,24 +327,14 @@ def visualize_predictions(predictions, targets, scenario_ids, save_dir, max_viz=
     return saved_paths, avg_ade
 
 
-def run_testing(test_dataset_path=TEST_HDF5,
+def run_testing(test_dataset_path=test_hdf5_path,
                 checkpoint_path=None,
                 batch_size=32,
                 max_scenarios=None,
                 visualize=True,
                 visualize_max=10,
                 use_wandb=True):
-    """Run testing with multi-step prediction using VectorNet model.
-    
-    Args:
-        test_dataset_path: Path to test HDF5 file
-        checkpoint_path: Path to model checkpoint (default: auto-detect best)
-        batch_size: Batch size for evaluation
-        max_scenarios: Maximum scenarios to evaluate (None = all)
-        visualize: Whether to generate visualizations
-        visualize_max: Maximum scenarios to visualize
-        use_wandb: Whether to log results to wandb
-    """
+    """Run testing with multi-step VectorNet prediction."""
     print("\n" + "="*70)
     print("VECTORNET MODEL TESTING - Multi-Step Prediction")
     print("="*70)
@@ -484,7 +422,7 @@ def run_testing(test_dataset_path=TEST_HDF5,
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=vectornet_num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_vectornet_batch,
         worker_init_fn=worker_init_fn,
@@ -506,14 +444,14 @@ def run_testing(test_dataset_path=TEST_HDF5,
     )
     
     # Print results
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("VECTORNET TEST RESULTS")
-    print("=" * 60)
-    print(f"  Average Displacement Error (ADE): {results['ade']:.4f}m")
-    print(f"  Final Displacement Error (FDE):   {results['fde']:.4f}m")
-    print(f"  Miss Rate @ 2.0m:                 {results['miss_rate']:.2%}")
-    print(f"  Number of scenarios:              {results['num_scenarios']}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"  ADE: {results['ade']:.4f} m")
+    print(f"  FDE: {results['fde']:.4f} m")
+    print(f"  Miss Rate @ 2.0m: {results['miss_rate']:.2%}")
+    print(f"  Num scenarios: {results['num_scenarios']}")
+    print("=" * 70)
     
     # Generate visualizations
     viz_images = []
@@ -560,7 +498,7 @@ def run_testing(test_dataset_path=TEST_HDF5,
     os.makedirs(vectornet_checkpoint_dir, exist_ok=True)
     results_path = os.path.join(vectornet_checkpoint_dir, 'vectornet_test_results.pt')
     torch.save(results, results_path)
-    print(f"\n✓ Results saved to {results_path}")
+    print(f"Results saved to {results_path}")
     
     # Also save as JSON for easy reading
     json_results = {
@@ -579,7 +517,7 @@ def run_testing(test_dataset_path=TEST_HDF5,
     json_path = os.path.join(vectornet_checkpoint_dir, 'vectornet_test_results.json')
     with open(json_path, 'w') as f:
         json.dump(json_results, f, indent=2)
-    print(f"✓ JSON results saved to {json_path}")
+    print(f"JSON results saved to {json_path}")
     
     if use_wandb:
         wandb.finish()
@@ -588,20 +526,20 @@ def run_testing(test_dataset_path=TEST_HDF5,
 
 
 def main():
-    """Main entry point with argument parsing."""
-    parser = argparse.ArgumentParser(description='VectorNet Model Testing - Multi-Step Prediction')
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description='VectorNet Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to model checkpoint (default: auto-detect best)')
-    parser.add_argument('--test_data', type=str, default=TEST_HDF5,
+                        help='Path to model checkpoint (default: auto-detect)')
+    parser.add_argument('--test_data', type=str, default=test_hdf5_path,
                         help='Path to test HDF5 file')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size for evaluation')
-    parser.add_argument('--max_scenarios', type=int, default=None,
-                        help='Maximum scenarios to evaluate (default: all)')
-    parser.add_argument('--visualize_max', type=int, default=10,
-                        help='Maximum scenarios to visualize (default: 10)')
+    parser.add_argument('--max_scenarios', type=int, default=test_max_scenarios,
+                        help='Max scenarios to evaluate (None = all)')
+    parser.add_argument('--visualize_max', type=int, default=test_visualize_max,
+                        help='Max scenarios to visualize')
     parser.add_argument('--no_visualize', action='store_true',
-                        help='Disable visualization generation')
+                        help='Disable visualization')
     parser.add_argument('--no_wandb', action='store_true',
                         help='Disable wandb logging')
     

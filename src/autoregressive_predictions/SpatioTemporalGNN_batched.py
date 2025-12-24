@@ -1,14 +1,7 @@
-"""Batched Spatio-Temporal GNN architecture for trajectory prediction.
+"""Batched Spatio-Temporal GNN for trajectory prediction.
 
-This version supports TRUE multi-scenario batching for better GPU utilization.
-Key improvement: Properly handles batch tensor to process multiple scenarios in parallel.
-
-Architecture: Static GCN (spatial) + Batched GRU (temporal) + MLP (decoder)
-
-Performance gains:
-- 2-4x speedup with batch_size=4-8 on modern GPUs
-- Better GPU utilization (more parallel work)
-- Same model quality as batch_size=1
+Architecture: GCN (spatial) + GRU (temporal) + MLP (decoder)
+Supports batch_size > 1 for better GPU utilization.
 """
 
 import sys
@@ -25,17 +18,8 @@ from config import debug_mode
 
 
 class SpatioTemporalGNNBatched(nn.Module):
-    """Batched Spatio-Temporal GNN for trajectory prediction.
-    
-    Key difference from SpatioTemporalGNN:
-    - Supports batch_size > 1 by properly handling the `batch` tensor
-    - Uses to_dense_batch for efficient batched GRU processing
-    - Properly handles variable number of agents per scenario
-    
-    Architecture:
-    1. GCN/GAT layers extract spatial features (already batched via PyG)
-    2. GRU processes temporal sequence for all agents (batched across scenarios)
-    3. MLP decoder produces displacement predictions
+    """GCN/GAT spatial encoder + GRU temporal encoder + MLP decoder.
+    Supports multi-scenario batching via PyG batch tensors.
     """
     
     def __init__(self, input_dim, hidden_dim, output_dim, num_gcn_layers=2, 

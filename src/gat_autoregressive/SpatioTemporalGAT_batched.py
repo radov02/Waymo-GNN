@@ -1,19 +1,7 @@
-"""Batched Spatio-Temporal GAT architecture for trajectory prediction.
+"""Batched Spatio-Temporal GAT for trajectory prediction.
 
-This version supports TRUE multi-scenario batching for better GPU utilization.
-Key improvement: Maintains separate GRU hidden states per (scenario, agent_id),
-allowing parallel processing of multiple scenarios while keeping per-agent temporal memory.
-
-Architecture: Static GAT (spatial) + Per-Agent GRU (temporal) + MLP (decoder)
-
-CRITICAL: The GRU hidden state must be tracked PER AGENT using agent_ids,
-not by position index. This ensures each agent maintains its own temporal memory
-even when agents enter/leave or get reordered between timesteps.
-
-Performance gains:
-- 2-4x speedup with batch_size=4-8 on modern GPUs
-- Better GPU utilization (more parallel work)
-- Same model quality as batch_size=1
+Architecture: GAT (spatial) + Per-Agent GRU (temporal) + MLP (decoder)
+Maintains per-agent hidden states for temporal memory. Supports batch_size > 1.
 """
 
 import sys
@@ -30,18 +18,8 @@ from config import debug_mode
 
 
 class SpatioTemporalGATBatched(nn.Module):
-    """Batched Spatio-Temporal GAT for trajectory prediction.
-    
-    Key difference from SpatioTemporalGAT:
-    - Supports batch_size > 1 by maintaining per-scenario GRU hidden states
-    - Uses to_dense_batch for efficient batched GRU processing
-    - Properly handles variable number of agents per scenario
-    
-    Architecture:
-    1. GAT layers extract spatial features (already batched via PyG)
-    2. to_dense_batch converts to [B, max_nodes, hidden_dim] for GRU
-    3. GRU processes each scenario's agents in parallel across batch
-    4. MLP decoder produces displacement predictions
+    """GAT spatial encoder + Per-Agent GRU temporal encoder + MLP decoder.
+    Supports multi-scenario batching with per-agent hidden state tracking.
     """
     
     def __init__(self, input_dim, hidden_dim, output_dim, num_gat_layers=2, 

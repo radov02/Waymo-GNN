@@ -102,7 +102,7 @@ vectornet_viz_dir_testing = 'visualizations/vectornet/testing'
 vectornet_mode = 'multi_step'     # 'multi_step' - full trajectory at once
 vectornet_prediction_horizon = 50
 vectornet_history_length = 10       # past timesteps to encode (1.0s)
-vectornet_num_agents_to_predict = 12    # Limit predictions per scenario (None = all)
+vectornet_num_agents_to_predict = 14    # Limit predictions per scenario (None = all)
 # ============== VectorNet Training Configuration ==============
 vectornet_epochs = 30
 vectornet_visualize_every_n_epochs = 5
@@ -139,7 +139,7 @@ vectornet_wandb_tags = ['vectornet', 'waymo', 'trajectory-prediction']
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ============== DataLoader Configuration ==============
-pin_memory = torch.cuda.is_available()  # Faster CPU→GPU transfer (CUDA only)
+pin_memory = torch.cuda.is_available()  # Faster CPU->GPU transfer (CUDA only)
 debug_mode = False
 
 # GCN Model DataLoader Settings:

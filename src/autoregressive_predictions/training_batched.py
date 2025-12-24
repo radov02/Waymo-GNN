@@ -1,16 +1,6 @@
-"""Batched Training script for GCN-based autoregressive trajectory prediction.
+"""Batched GCN training for trajectory prediction. Supports batch_size > 1.
 
-This version supports batch_size > 1 for better GPU utilization.
-Key improvements:
-- Process multiple scenarios in parallel
-- 2-4x speedup on modern GPUs
-- Same model quality as batch_size=1
-
-Usage:
-    python src/autoregressive_predictions/training_batched.py
-
-Checkpoints: checkpoints/
-Visualizations: visualizations/autoreg/
+Usage: python src/autoregressive_predictions/training_batched.py
 """
 
 import sys
@@ -154,8 +144,8 @@ class OverfittingDetector:
         if train_improved and val_worsened:
             self.overfit_counter += 1
             if self.verbose:
-                print(f"  Overfitting detected: train↓ {self.prev_train_loss:.4f}→{train_loss:.4f}, "
-                      f"val↑ {self.prev_val_loss:.4f}→{val_loss:.4f} "
+                print(f"  Overfitting detected: train {self.prev_train_loss:.4f}->{train_loss:.4f}, "
+                      f"val {self.prev_val_loss:.4f}->{val_loss:.4f} "
                       f"({self.overfit_counter}/{self.patience})")
             
             if self.overfit_counter >= self.patience:
@@ -192,10 +182,7 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                                 loss_alpha, loss_beta, loss_gamma, loss_delta,
                                 device, epoch, scaler=None, amp_dtype=torch.float16,
                                 visualize_callback=None):
-    """Train for one epoch with BATCHED scenario processing.
-    
-    Key difference from original: Processes B scenarios in parallel per batch.
-    """
+    """Train for one epoch with batched scenario processing."""
     model.train()
     total_loss_epoch = 0.0
     steps = 0
@@ -326,17 +313,6 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             
         total_loss_epoch += accumulated_loss.item()
         steps += 1
-        
-        # Log per-step metrics to wandb for detailed monitoring
-        if steps % 10 == 0:  # Log every 10 steps to avoid too much data
-            wandb.log({
-                "batch": epoch * len(dataloader) + batch_idx,
-                "train/batch_epoch": epoch + 1,  # Which epoch this batch is from
-                "train/batch_loss": accumulated_loss.item(),
-                "train/batch_mse": mse.item() if not torch.isnan(mse) else 0.0,
-                "train/batch_cosine_similarity": cos_sim.item() if not torch.isnan(cos_sim) else 0.0,
-                "train/batch_angle_error": mean_angle_error.item() if not torch.isnan(mean_angle_error) else 0.0,
-            })
         
         last_batch_dict = {
             'batch': [b.cpu() for b in batch_dict['batch']],
@@ -503,7 +479,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     
     # Define custom x-axes for wandb metrics
     wandb.define_metric("epoch")
-    wandb.define_metric("batch")  # Global batch counter across all epochs
     
     # Epoch-based metrics (plotted vs epoch)
     wandb.define_metric("train/loss", step_metric="epoch")
@@ -516,13 +491,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     wandb.define_metric("val/angle_error", step_metric="epoch")
     wandb.define_metric("learning_rate", step_metric="epoch")
     wandb.define_metric("train_val_gap", step_metric="epoch")
-    
-    # Batch-based metrics (plotted vs batch - fine-grained within-epoch progress)
-    wandb.define_metric("train/batch_loss", step_metric="batch")
-    wandb.define_metric("train/batch_mse", step_metric="batch")
-    wandb.define_metric("train/batch_cosine_similarity", step_metric="batch")
-    wandb.define_metric("train/batch_angle_error", step_metric="batch")
-    wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
 
     # Initialize batched model
     model = SpatioTemporalGNNBatched(

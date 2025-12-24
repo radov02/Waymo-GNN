@@ -60,7 +60,7 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.2, beta=0.5, 
     cosine_loss = _compute_cosine_loss(pred, target)
     
     # heading direction alignment
-    heading = node_features[:, 3]   # already computed as node feature (atan2(vy, vx) / pi) → [-1, 1]
+    heading = node_features[:, 3]   # already computed as node feature (atan2(vy, vx) / pi) -> [-1, 1]
     speed = node_features[:, 2] * MAX_SPEED  # Denormalize speed (normalized by MAX_SPEED=30)
     
     moving_mask = speed > 0.5        # filter out stopped/very slow agents (speed < 0.5 m/s)

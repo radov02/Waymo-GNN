@@ -33,8 +33,10 @@ from config import (device, batch_size, gcn_num_workers, num_layers, num_gru_lay
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg, use_edge_weights,
                     num_gpus, use_data_parallel, setup_model_parallel, load_model_state,
-                    autoreg_viz_dir, project_name, print_gpu_info,
-                    use_gradient_checkpointing)
+                    gcn_viz_dir_testing, project_name, print_gpu_info,
+                    use_gradient_checkpointing, POSITION_SCALE,
+                    test_hdf5_path, test_num_rollout_steps, test_max_scenarios,
+                    test_visualize, test_visualize_max, test_use_wandb, test_horizons)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from helper_functions.helpers import compute_metrics
@@ -43,14 +45,6 @@ from helper_functions.visualization_functions import (load_scenario_by_id, draw_
 import matplotlib.pyplot as plt
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/autoregressive_predictions/testing.py
-
-# ============== TESTING CONFIGURATION ==============
-TEST_HDF5_PATH = './data/graphs/testing/testing.hdf5'
-VIZ_DIR = 'visualizations/autoreg/testing/gcn'
-
-# Constants
-POSITION_SCALE = 100.0  # For denormalizing displacements
-
 
 def load_trained_model(checkpoint_path, device):
     """Load a trained model from checkpoint."""
@@ -81,7 +75,7 @@ def load_trained_model(checkpoint_path, device):
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     model.eval()
     
-    print(f"✓ Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f"Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_loss' in checkpoint:
         print(f"  Validation loss: {checkpoint['val_loss']:.6f}")
     if 'train_loss' in checkpoint:
@@ -90,18 +84,7 @@ def load_trained_model(checkpoint_path, device):
     return model, checkpoint
 
 def predict_single_step(model, graph, device, edge_weights=None):
-    """
-    Predict one timestep ahead for all agents in a graph.
-    
-    Args:
-        model: Trained EvolveGCNH model
-        graph: PyG Data object with current state
-        device: Torch device
-        edge_weights: Optional edge weights
-    
-    Returns:
-        predictions: [N, 2] tensor of predicted displacements
-    """
+    """Predict one timestep ahead for all agents. Returns [N, 2] displacements."""
     graph = graph.to(device)
     
     with torch.no_grad():
@@ -120,28 +103,8 @@ def predict_single_step(model, graph, device, edge_weights=None):
 
 
 def autoregressive_rollout(model, initial_graph, num_steps, device, edge_weights=None):
-    """
-    Autoregressive multi-step prediction: predict future trajectory by iteratively
-    feeding predictions back as input.
-    
-    This is the core of trajectory forecasting:
-    1. Start with current state at time t
-    2. Predict displacement for t+1
-    3. Update node positions and velocities
-    4. Use updated state to predict t+2
-    5. Repeat for num_steps
-    
-    Args:
-        model: Trained SpatioTemporalGNN model
-        initial_graph: PyG Data object at time t
-        num_steps: Number of future timesteps to predict
-        device: Torch device
-        edge_weights: Whether to use edge weights
-    
-    Returns:
-        all_predictions: List of [N, 2] predictions for each step
-        updated_graphs: List of graph states (for visualization)
-    """
+    """Multi-step prediction by iteratively feeding predictions back as input.
+    Returns (all_predictions, updated_graphs) lists."""
     model.eval()
     current_graph = initial_graph.clone().to(device)
     
@@ -162,26 +125,7 @@ def autoregressive_rollout(model, initial_graph, num_steps, device, edge_weights
 
 
 def update_graph_features(graph, pred_displacement, device):
-    """
-    Update node features based on predicted displacement.
-    This simulates the agent's state at the next timestep.
-    
-    Key updates:
-    - Position (pos): add predicted displacement
-    - Velocity (features 0-1): compute from displacement / dt
-    - Speed (feature 2): magnitude of velocity
-    - Heading (feature 3): direction of movement
-    - Acceleration (features 5-6): velocity change
-    
-    Args:
-        graph: Current graph state
-        pred_displacement: [N, 2] predicted displacements
-        device: Torch device
-    
-    Returns:
-        updated_graph: Graph with updated features
-    """
-    # Clone to avoid modifying original
+    """Update node features (pos, vel, speed, heading, accel) based on predicted displacement."""
     updated_graph = graph.clone()
     
     # Update positions (stored separately in graph.pos)
@@ -225,29 +169,13 @@ def update_graph_features(graph, pred_displacement, device):
 
 
 def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_scenarios=None):
-    """
-    Evaluate model using autoregressive rollout on test set.
-    
-    For each scenario:
-    1. Use first part of sequence as context (warm-up GRU states)
-    2. From a certain timestep, start autoregressive prediction
-    3. Compare predictions with ground truth
-    4. Compute metrics at different horizons (1s, 3s, 5s, 8s)
-    
-    Args:
-        model: Trained model
-        dataloader: DataLoader for test set
-        num_rollout_steps: How many steps to predict autoregressively
-        device: Torch device
-        max_scenarios: Maximum scenarios to evaluate (None = all)
-    
-    Returns:
-        results: Dictionary with metrics
-    """
+    """Evaluate model using autoregressive rollout. Returns dict with per-horizon metrics."""
     model.eval()
     
-    # Metrics at different horizons (in timesteps: 1s=10 steps, 3s=30, 5s=50, 8s=80)
-    horizons = [10, 30, 50, min(80, num_rollout_steps)]
+    # Use horizons from config, capped at rollout steps
+    horizons = [h for h in test_horizons if h <= num_rollout_steps]
+    if not horizons:
+        horizons = [min(10, num_rollout_steps)]
     horizon_metrics = {h: {'ade': [], 'fde': [], 'angle_error': [], 'cosine_sim': []} for h in horizons}
     
     all_scenario_results = []
@@ -359,14 +287,14 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
                 if h in scenario_metrics.get(f'{h*0.1}s', {}):
                     m = scenario_metrics[f'{h*0.1}s']
                     print(f"    {h*0.1}s: ADE={m['ade']:.2f}m, FDE={m['fde']:.2f}m, "
-                          f"Angle={m['angle_error']:.1f}°, Cos={m['cosine_sim']:.3f}")
+                          f"Angle={m['angle_error']:.1f}deg, Cos={m['cosine_sim']:.3f}")
             
             scenario_count += 1
     
     # Aggregate results
-    print("\n" + "="*80)
-    print("AGGREGATED TEST RESULTS")
-    print("="*80)
+    print("\n" + "="*70)
+    print("GCN TEST RESULTS")
+    print("="*70)
     
     results = {
         'horizons': {},
@@ -388,32 +316,18 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             
             r = results['horizons'][f'{horizon*0.1}s']
             print(f"\n{horizon*0.1}s Horizon ({horizon} steps):")
-            print(f"  ADE: {r['ade_mean']:.2f} ± {r['ade_std']:.2f} m")
-            print(f"  FDE: {r['fde_mean']:.2f} ± {r['fde_std']:.2f} m")
-            print(f"  Angle Error: {r['angle_error_mean']:.1f} ± {r['angle_error_std']:.1f}°")
-            print(f"  Cosine Sim: {r['cosine_sim_mean']:.3f} ± {r['cosine_sim_std']:.3f}")
+            print(f"  ADE: {r['ade_mean']:.2f} +/- {r['ade_std']:.2f} m")
+            print(f"  FDE: {r['fde_mean']:.2f} +/- {r['fde_std']:.2f} m")
+            print(f"  Angle Error: {r['angle_error_mean']:.1f} +/- {r['angle_error_std']:.1f} deg")
+            print(f"  Cosine Sim: {r['cosine_sim_mean']:.3f} +/- {r['cosine_sim_std']:.3f}")
     
-    print("\n" + "="*80)
+    print("="*70)
     
     return results
 
 
 def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
-    """
-    Visualize predictions vs ground truth for a test scenario.
-    
-    Creates a single plot showing all persistent agents with:
-    - Ground truth trajectories (solid lines)
-    - Predicted trajectories (dashed lines)
-    - Error metrics printed
-    
-    Args:
-        model: Trained model
-        batch_dict: Batch dictionary from dataloader
-        scenario_idx: Index for filename
-        save_dir: Directory to save visualization
-        device: Torch device
-    """
+    """Visualize predicted vs ground truth trajectories for a test scenario."""
     os.makedirs(save_dir, exist_ok=True)
     
     batched_graph_sequence = batch_dict["batch"]
@@ -565,25 +479,14 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     return avg_error
 
 
-def run_testing(test_dataset_path=TEST_HDF5_PATH,
+def run_testing(test_dataset_path=test_hdf5_path,
                 checkpoint_path=None,
                 num_rollout_steps=20,
                 max_scenarios=None,
                 visualize=True,
                 visualize_max=10,
                 use_wandb=True):
-    """
-    Run testing with autoregressive multi-step prediction.
-    
-    Args:
-        test_dataset_path: Path to test HDF5 file
-        checkpoint_path: Path to model checkpoint (default: best autoregressive model)
-        num_rollout_steps: Number of steps to predict (default: 20 = 2s)
-        max_scenarios: Max scenarios to evaluate (None = all)
-        visualize: Whether to generate visualizations
-        visualize_max: Max number of scenarios to visualize
-        use_wandb: Whether to log results to wandb
-    """
+    """Run testing with autoregressive multi-step prediction."""
     print("\n" + "="*70)
     print("GCN MODEL TESTING - Autoregressive Multi-Step Prediction")
     print("="*70)
@@ -643,7 +546,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     
     # Determine sequence length from dataset
     test_dataset = HDF5ScenarioDataset(test_dataset_path, seq_len=sequence_length)
-    print(f"\n✓ Loaded test dataset: {len(test_dataset)} scenarios")
+    print(f"Loaded test dataset: {len(test_dataset)} scenarios")
     
     test_dataloader = DataLoader(
         test_dataset,
@@ -666,7 +569,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     print(f"  W&B logging: {use_wandb}")
     
     # Create visualization directory
-    os.makedirs(VIZ_DIR, exist_ok=True)
+    os.makedirs(gcn_viz_dir_testing, exist_ok=True)
     
     # Run evaluation with visualization
     viz_images = []
@@ -679,7 +582,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
             if viz_count >= visualize_max:
                 break
             
-            ade = visualize_test_scenario(model, batch_dict, batch_idx, VIZ_DIR, device)
+            ade = visualize_test_scenario(model, batch_dict, batch_idx, gcn_viz_dir_testing, device)
             if ade is not None:
                 total_ade += ade
                 viz_count += 1
@@ -688,7 +591,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
                 if use_wandb:
                     scenario_ids = batch_dict.get("scenario_ids", [])
                     scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{batch_idx}"
-                    save_path = os.path.join(VIZ_DIR, f'gcn_test_scenario_{batch_idx:04d}_{scenario_id}.png')
+                    save_path = os.path.join(gcn_viz_dir_testing, f'gcn_test_scenario_{batch_idx:04d}_{scenario_id}.png')
                     if os.path.exists(save_path):
                         viz_images.append(wandb.Image(save_path, caption=f"Scenario {scenario_id} (ADE: {ade:.2f}m)"))
         
@@ -696,7 +599,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
             print(f"\nVisualization Summary:")
             print(f"  Scenarios visualized: {viz_count}")
             print(f"  Average ADE: {total_ade / viz_count:.2f}m")
-            print(f"  Saved to: {VIZ_DIR}")
+            print(f"  Saved to: {gcn_viz_dir_testing}")
             
             if use_wandb and viz_images:
                 wandb.log({"test_visualizations": viz_images})
@@ -732,7 +635,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     results_path = os.path.join(gcn_checkpoint_dir_autoreg, 'gcn_test_results.pt')
     os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
     torch.save(results, results_path)
-    print(f"\n✓ Results saved to {results_path}")
+    print(f"Results saved to {results_path}")
     
     # Also save as JSON for easy reading
     json_results = {
@@ -746,7 +649,7 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
     json_path = os.path.join(gcn_checkpoint_dir_autoreg, 'gcn_test_results.json')
     with open(json_path, 'w') as f:
         json.dump(json_results, f, indent=2)
-    print(f"✓ JSON results saved to {json_path}")
+    print(f"JSON results saved to {json_path}")
     
     if use_wandb:
         wandb.finish()
@@ -755,20 +658,20 @@ def run_testing(test_dataset_path=TEST_HDF5_PATH,
 
 
 def main():
-    """Main entry point with argument parsing."""
-    parser = argparse.ArgumentParser(description='GCN Model Testing - Autoregressive Multi-Step Prediction')
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description='GCN Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to model checkpoint (default: auto-detect best)')
-    parser.add_argument('--test_data', type=str, default=TEST_HDF5_PATH,
+                        help='Path to model checkpoint (default: auto-detect)')
+    parser.add_argument('--test_data', type=str, default=test_hdf5_path,
                         help='Path to test HDF5 file')
-    parser.add_argument('--num_rollout_steps', type=int, default=20,
-                        help='Number of autoregressive rollout steps (default: 20 = 2s)')
-    parser.add_argument('--max_scenarios', type=int, default=None,
-                        help='Maximum scenarios to evaluate (default: all)')
-    parser.add_argument('--visualize_max', type=int, default=10,
-                        help='Maximum scenarios to visualize (default: 10)')
+    parser.add_argument('--num_rollout_steps', type=int, default=test_num_rollout_steps,
+                        help='Number of rollout steps')
+    parser.add_argument('--max_scenarios', type=int, default=test_max_scenarios,
+                        help='Max scenarios to evaluate (None = all)')
+    parser.add_argument('--visualize_max', type=int, default=test_visualize_max,
+                        help='Max scenarios to visualize')
     parser.add_argument('--no_visualize', action='store_true',
-                        help='Disable visualization generation')
+                        help='Disable visualization')
     parser.add_argument('--no_wandb', action='store_true',
                         help='Disable wandb logging')
     

@@ -47,7 +47,7 @@ except ImportError:
 try:
     from waymo_open_dataset.protos import scenario_pb2
     HAS_WAYMO_SDK = True
-    print(f"✓ Loaded Waymo SDK from: {src_dir / 'waymo_open_dataset'}")
+    print(f"Loaded Waymo SDK from: {src_dir / 'waymo_open_dataset'}")
 except ImportError as e:
     print("ERROR: Could not import local Waymo Open Dataset SDK.")
     print(f"Expected location: {src_dir / 'waymo_open_dataset'}")
@@ -552,7 +552,7 @@ def main():
     splits = find_tfrecord_files(args.source_dir)
     
     if not splits:
-        print(f"\n❌ ERROR: No TFRecord files found in {args.source_dir}")
+        print(f"ERROR: No TFRecord files found in {args.source_dir}")
         print("\nPlease check:")
         print("1. The path is correct")
         print("2. TFRecord files exist in training/validation/testing subdirectories")
@@ -577,7 +577,7 @@ def main():
                 args.max_scenarios
             )
         else:
-            print(f"\n❌ ERROR: Split '{args.split}' not found in source directory")
+            print(f"ERROR: Split '{args.split}' not found in source directory")
             return 1
     else:
         # Process all splits

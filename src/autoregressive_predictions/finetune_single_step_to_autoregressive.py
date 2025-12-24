@@ -1,16 +1,6 @@
-"""Fine-tune single-step model for autoregressive multi-step prediction.
+"""Fine-tune single-step GCN model for autoregressive prediction using scheduled sampling.
 
-This module takes a pre-trained single-step model (from training.py) and fine-tunes it
-for autoregressive rollout using scheduled sampling.
-
-Scheduled Sampling:
-- Start with teacher forcing (use ground truth as input)
-- Gradually increase probability of using model's own predictions
-- Helps model learn to handle its own prediction errors
-
-This is DIFFERENT from multi_step_prediction.py:
-- multi_step_prediction.py: Predicts K steps simultaneously with separate heads
-- This file: Uses same single-step model autoregressively (predict t+1, feed back, predict t+2, etc.)
+Scheduled sampling gradually transitions from teacher forcing to model predictions.
 """
 
 import sys
@@ -1279,15 +1269,6 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             print(f"  Loss={loss_val/max(1,count):.4f}, Sampling prob={sampling_prob:.2f}")
             print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
-            
-            # Log per-step metrics to wandb
-            wandb.log({
-                "train/batch_loss": loss_val / max(1, count),
-                "train/batch_mse": avg_mse_so_far,
-                "train/batch_rmse_meters": rmse_meters,
-                "train/batch_cosine_sim": avg_cos_so_far,
-                "train/batch_sampling_prob": sampling_prob,
-            }, commit=True)
     
     # Print epoch summary with RMSE in meters
     final_mse = total_mse / max(1, count)

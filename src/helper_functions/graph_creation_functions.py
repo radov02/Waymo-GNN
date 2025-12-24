@@ -606,7 +606,7 @@ def test_hdf5_and_lazy_loading(path):
     # Initialize dataset
     from dataset import HDF5ScenarioDataset
     dataset = HDF5ScenarioDataset(path, seq_len=sequence_length)
-    print(f"\n✓ Dataset loaded: {len(dataset)} total scenarios")
+    print(f"Dataset loaded: {len(dataset)} total scenarios")
 
     # Test 1: Check a few individual scenario sequences
     print("\n" + "-" * 80)
@@ -668,13 +668,13 @@ def test_hdf5_and_lazy_loading(path):
         print(f"    - edge_index: {first_timestep.edge_index.shape}")
         print(f"    - y: {first_timestep.y.shape if first_timestep.y is not None else None}")
         print(f"    - pos: {first_timestep.pos.shape if hasattr(first_timestep, 'pos') and first_timestep.pos is not None else None}")
-        print(f"    - batch: {first_timestep.batch.shape} (node→graph mapping)")
+        print(f"    - batch: {first_timestep.batch.shape} (node->graph mapping)")
         if hasattr(first_timestep, 'agent_ids') and first_timestep.agent_ids:
             print(f"    - agent_ids: {len(first_timestep.agent_ids)} total agents")
         print()
 
     print(f"Total batches processed: {batch_idx + 1}")
-    print("\n✓ This matches training: Each batch has B={batch_size} different scenarios,")
+    print("This matches training: Each batch has B={batch_size} different scenarios,")
     print(f"  and you iterate through T={sequence_length} timesteps sequentially in training loop")
 
     # Test 3: Verify Lazy Loading (memory check)
@@ -688,7 +688,7 @@ def test_hdf5_and_lazy_loading(path):
         data_list = dataset[idx]
         first_graph = data_list[0]
         print(f"  Index {idx}: scenario={first_graph.scenario_id}, timesteps={len(data_list)}, nodes={first_graph.x.shape[0]}")
-    print("✓ If this was fast, lazy loading is working correctly!")
+    print("If this was fast, lazy loading is working correctly!")
 
     print("\n" + "=" * 80)
     print("TESTING COMPLETE")

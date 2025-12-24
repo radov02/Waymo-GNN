@@ -1,12 +1,4 @@
-"""Fine-tune GAT single-step model for autoregressive multi-step prediction.
-
-This module takes a pre-trained GAT single-step model (from training.py) and fine-tunes it
-for autoregressive rollout using scheduled sampling.
-
-Scheduled Sampling:
-- Start with teacher forcing (use ground truth as input)
-- Gradually increase probability of using model's own predictions
-- Helps model learn to handle its own prediction errors
+"""Fine-tune GAT single-step model for autoregressive prediction using scheduled sampling.
 """
 
 import sys
@@ -110,12 +102,12 @@ class EarlyStopping:
             self.best_error = avg_horizon_error
             self.counter = 0
             if self.verbose:
-                print(f"  [EarlyStopping] Improved by {improvement:.2f}m → new best: {avg_horizon_error:.2f}m")
+                print(f"  [EarlyStopping] Improved by {improvement:.2f}m - new best: {avg_horizon_error:.2f}m")
         
         # Check if we've reached target performance
         if avg_horizon_error <= self.target_error:
             if self.verbose:
-                print(f"  [EarlyStopping] 🎯 Reached target error ({avg_horizon_error:.2f}m ≤ {self.target_error}m)!")
+                print(f"  [EarlyStopping] Reached target error ({avg_horizon_error:.2f}m <= {self.target_error}m)!")
             
     def reset(self):
         self.counter = 0
@@ -166,7 +158,7 @@ def load_pretrained_model(checkpoint_path, device):
     # Load weights
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     
-    print(f"✓ Loaded GAT model from epoch {checkpoint['epoch']}")
+    print(f"Loaded GAT model from epoch {checkpoint['epoch']}")
     if 'val_loss' in checkpoint:
         print(f"  Pre-trained val_loss: {checkpoint['val_loss']:.6f}")
     
@@ -476,7 +468,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             print(f"  Loading scenario {scenario_ids[0]} for map visualization...")
             scenario = load_scenario_by_id(scenario_ids[0])
             if scenario is not None:
-                print(f"  ✓ Loaded scenario for map visualization")
+                print(f"  Loaded scenario for map visualization")
             else:
                 print(f"  ⚠ Scenario loaded as None. Proceeding without map features.")
                 print(f"    NOTE: TFRecord files may not exist on this machine. Map features require original Waymo data.")
@@ -812,7 +804,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         if horizon_errors[0] > 0:
             growth_10 = horizon_errors[min(9, len(horizon_errors)-1)] / horizon_errors[0] if len(horizon_errors) > 9 else None
             if growth_10:
-                print(f"    Error growth (step 1 → 10): {growth_10:.1f}x")
+                print(f"    Error growth (step 1 -> 10): {growth_10:.1f}x")
     
     # Print per-agent final errors to identify outliers
     # FINAL ERROR: Euclidean distance |pred_pos - gt_pos| for each agent at the last timestep.
@@ -1332,7 +1324,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 if use_prediction:
                     # NEW APPROACH: Use GT graph from target_t but with position offset
                     # This gives the model correct GT velocity features while being at predicted position
-                    # The model sees: GT velocity/heading/speed but offset position → learns to correct
+                    # The model sees: GT velocity/heading/speed but offset position - learns to correct
                     
                     # Get the GT graph for next timestep (has correct velocity features)
                     gt_graph_next = batched_graph_sequence[target_t]
@@ -1435,15 +1427,6 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             print(f"  Loss={loss_val/max(1,count):.4f}, Sampling prob={sampling_prob:.2f}")
             print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
-            
-            # Log per-step metrics to wandb (no explicit step - let wandb auto-increment)
-            wandb.log({
-                "train/batch_loss": loss_val / max(1, count),
-                "train/batch_mse": avg_mse_so_far,
-                "train/batch_rmse_meters": rmse_meters,
-                "train/batch_cosine_sim": avg_cos_so_far,
-                "train/batch_sampling_prob": sampling_prob,
-            }, commit=True)
     
     # Print epoch summary with RMSE in meters
     final_mse = total_mse / max(1, count)
@@ -1848,13 +1831,13 @@ def run_autoregressive_finetuning(
         # Explain what sampling_prob means for clarity
         if sampling_prob < 0.01:
             print(f"  [TEACHER FORCING] Using GT graphs as input for each step.")
-            print(f"  → Model learns single-step prediction with perfect input.")
-            print(f"  → Visualization (autoregressive) tests multi-step performance.")
+            print(f"  - Model learns single-step prediction with perfect input.")
+            print(f"  - Visualization (autoregressive) tests multi-step performance.")
         elif sampling_prob > 0.49:
             print(f"  [MAX SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input (capped at 50%).")
         else:
             print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted, {(1-sampling_prob)*100:.0f}% GT input.")
-        print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) → target: {num_rollout_steps} steps")
+        print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) - target: {num_rollout_steps} steps")
         
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 

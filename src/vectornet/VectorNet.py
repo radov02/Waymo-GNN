@@ -1,25 +1,10 @@
-"""VectorNet: Encoding HD Maps and Agent Dynamics from Vectorized Representation
+"""VectorNet: Hierarchical GNN for trajectory prediction (Gao et al. 2020).
 
-Implementation based on the paper by Gao et al. (2020):
-https://arxiv.org/abs/2005.04259
+Predicts full future trajectory at once (not autoregressive) using:
+1. Polyline Subgraph Network: Aggregates vectors within each polyline
+2. Global Interaction Graph: Self-attention between all polylines
 
-VectorNet is a hierarchical graph neural network that:
-1. First exploits spatial locality of individual road components represented by vectors
-2. Then models high-order interactions among all components
-
-Key components:
-- Polyline Subgraph Network: Aggregates vectors within each polyline
-- Global Interaction Graph: Models interactions between all polylines using self-attention
-- Node Completion Auxiliary Task: Predicts masked node features for better context modeling
-
-IMPORTANT: VectorNet predicts the FULL FUTURE TRAJECTORY at once (not autoregressive).
-The model encodes history and directly outputs all future timesteps in a single forward pass.
-
-This implementation is designed for the Waymo Open Motion Dataset.
-
-Feature dimensions from VectorNetTFRecordDataset:
-- Agent vectors: 16 features [ds_x, ds_y, ds_z, de_x, de_y, de_z, vx, vy, heading, width, length, type(4), timestamp]
-- Map vectors: 13 features [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7)]
+Feature dims (TFRecord): Agent=16, Map=13
 """
 
 import torch
@@ -33,16 +18,7 @@ MAP_VECTOR_DIM = 13    # [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7)]
 
 
 class PolylineSubgraphNetwork(nn.Module):
-    """Polyline Subgraph Network for encoding vectors within a polyline.
-    
-    Takes vectors belonging to a polyline and produces a single polyline-level feature.
-    Uses MLP + MaxPooling as described in the paper.
-    
-    Architecture per layer:
-    - MLP encoder for each vector node
-    - Max pooling aggregation across neighbors
-    - Concatenation of encoded features with aggregated features
-    """
+    """Encodes vectors within a polyline using MLP + MaxPooling."""
     
     def __init__(self, input_dim, hidden_dim, num_layers=3, dropout=0.1):
         super(PolylineSubgraphNetwork, self).__init__()
@@ -136,11 +112,7 @@ class PolylineSubgraphNetwork(nn.Module):
 
 
 class GlobalInteractionGraph(nn.Module):
-    """Global Interaction Graph using Self-Attention.
-    
-    Models high-order interactions among all polyline features using
-    multi-head self-attention as described in the paper.
-    """
+    """Multi-head self-attention for high-order interactions between polylines."""
     
     def __init__(self, hidden_dim, num_heads=8, num_layers=1, dropout=0.1):
         super(GlobalInteractionGraph, self).__init__()
@@ -188,15 +160,7 @@ class GlobalInteractionGraph(nn.Module):
                         nn.init.zeros_(module.bias)
     
     def forward(self, polyline_features, mask=None):
-        """Forward pass through global interaction graph.
-        
-        Args:
-            polyline_features: [P, hidden_dim] or [B, P, hidden_dim] polyline features
-            mask: Optional attention mask [P, P] or [B, P, P]
-            
-        Returns:
-            Updated polyline features [P, hidden_dim] or [B, P, hidden_dim]
-        """
+        """Apply self-attention to polyline features [P, D] or [B, P, D]."""
         # Handle unbatched input
         if polyline_features.dim() == 2:
             polyline_features = polyline_features.unsqueeze(0)  # [1, P, hidden_dim]
