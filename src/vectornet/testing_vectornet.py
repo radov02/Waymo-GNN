@@ -205,9 +205,13 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         all_targets.append(targets.cpu())
         all_scenario_ids.extend(scenario_ids)
         
-        # Store batch data for visualization (only store first few for memory efficiency)
-        if len(all_batches) < 10:
+        # Store batch data for visualization with proper scenario tracking
+        # Store enough batches to cover max_viz scenarios
+        if len(all_scenario_ids) <= 50:  # Store batches covering first 50 scenarios
             batch_data = {
+                'predictions': predictions.cpu(),
+                'targets': targets.cpu(),
+                'scenario_ids': scenario_ids,
                 'agent_vectors': batch['agent_vectors'].cpu() if 'agent_vectors' in batch else None,
                 'agent_polyline_ids': batch['agent_polyline_ids'].cpu() if 'agent_polyline_ids' in batch else None,
                 'agent_batch_idx': batch['agent_batch_idx'].cpu() if 'agent_batch_idx' in batch else None,
@@ -253,132 +257,129 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
         6: (MAP_FEATURE_GRAY, 'Driveways'),
     }
     
-    # Flatten predictions and targets from batches
-    batch_idx = 0
-    within_batch_idx = 0
+    # Iterate through stored batches and scenarios
+    scenario_counter = 0
     
-    for viz_idx in range(min(max_viz, len(scenario_ids))):
+    for batch_data in batches:
         if viz_count >= max_viz:
             break
         
-        # Get the batch this scenario belongs to
-        while batch_idx < len(predictions) and within_batch_idx >= predictions[batch_idx].shape[0]:
-            within_batch_idx = 0
-            batch_idx += 1
+        batch_predictions = batch_data['predictions']
+        batch_targets = batch_data['targets']
+        batch_scenario_ids = batch_data['scenario_ids']
         
-        if batch_idx >= len(predictions):
-            break
-        
-        pred = predictions[batch_idx][within_batch_idx].numpy() if isinstance(predictions[batch_idx][within_batch_idx], torch.Tensor) else predictions[batch_idx][within_batch_idx]
-        target = targets[batch_idx][within_batch_idx].numpy() if isinstance(targets[batch_idx][within_batch_idx], torch.Tensor) else targets[batch_idx][within_batch_idx]
-        
-        # Get corresponding batch data for map features
-        batch_data = batches[batch_idx] if batch_idx < len(batches) else None
-        
-        # Predictions and targets are already absolute positions
-        pred_pos = pred
-        target_pos = target
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(14, 12))
-        
-        # ===== Plot Map Features (same as training script) =====
-        if batch_data and batch_data['map_vectors'] is not None:
-            map_vectors = batch_data['map_vectors'].numpy() if torch.is_tensor(batch_data['map_vectors']) else batch_data['map_vectors']
-            map_polyline_ids = batch_data['map_polyline_ids'].numpy() if torch.is_tensor(batch_data['map_polyline_ids']) else batch_data['map_polyline_ids']
-            map_batch_idx_arr = batch_data['map_batch_idx'].numpy() if torch.is_tensor(batch_data['map_batch_idx']) else batch_data['map_batch_idx']
+        # Iterate through scenarios in this batch
+        for within_batch_idx in range(batch_data['batch_size']):
+            if viz_count >= max_viz or scenario_counter >= len(scenario_ids):
+                break
             
-            # Filter map features for this scenario within the batch
-            scenario_map_mask = (map_batch_idx_arr == within_batch_idx)
-            scenario_map_vectors = map_vectors[scenario_map_mask]
-            scenario_map_polyline_ids = map_polyline_ids[scenario_map_mask]
+            pred = batch_predictions[within_batch_idx].numpy() if torch.is_tensor(batch_predictions[within_batch_idx]) else batch_predictions[within_batch_idx]
+            target = batch_targets[within_batch_idx].numpy() if torch.is_tensor(batch_targets[within_batch_idx]) else batch_targets[within_batch_idx]
             
-            # Group by polyline ID and plot
-            if len(scenario_map_polyline_ids) > 0:
-                unique_polylines = np.unique(scenario_map_polyline_ids)
-                plotted_types = set()
+            scenario_id = batch_scenario_ids[within_batch_idx] if within_batch_idx < len(batch_scenario_ids) else f"scenario_{scenario_counter}"
+            
+            # Predictions and targets are already absolute positions
+            pred_pos = pred
+            target_pos = target
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(14, 12))
+            
+            # ===== Plot Map Features (same as training script) =====
+            if batch_data['map_vectors'] is not None:
+                map_vectors = batch_data['map_vectors'].numpy() if torch.is_tensor(batch_data['map_vectors']) else batch_data['map_vectors']
+                map_polyline_ids = batch_data['map_polyline_ids'].numpy() if torch.is_tensor(batch_data['map_polyline_ids']) else batch_data['map_polyline_ids']
+                map_batch_idx_arr = batch_data['map_batch_idx'].numpy() if torch.is_tensor(batch_data['map_batch_idx']) else batch_data['map_batch_idx']
                 
-                for poly_id in unique_polylines:
-                    poly_mask = scenario_map_polyline_ids == poly_id
-                    poly_vectors = scenario_map_vectors[poly_mask]
+                # Filter map features for this scenario within the batch
+                scenario_map_mask = (map_batch_idx_arr == within_batch_idx)
+                scenario_map_vectors = map_vectors[scenario_map_mask]
+                scenario_map_polyline_ids = map_polyline_ids[scenario_map_mask]
+                
+                # Group by polyline ID and plot
+                if len(scenario_map_polyline_ids) > 0:
+                    unique_polylines = np.unique(scenario_map_polyline_ids)
+                    plotted_types = set()
                     
-                    if len(poly_vectors) == 0:
-                        continue
-                    
-                    # Get type from one-hot (indices 6:13)
-                    type_onehot = poly_vectors[0, 6:13]
-                    type_idx = np.argmax(type_onehot)
-                    color, label = MAP_COLORS.get(type_idx, ('#CCCCCC', 'Unknown'))
-                    
-                    # Build continuous polyline path
-                    points = []
-                    for i, vec in enumerate(poly_vectors):
-                        if i == 0:
-                            points.append([vec[0], vec[1]])  # First start point
-                        points.append([vec[3], vec[4]])  # End point of each segment
-                    points = np.array(points)
-                    
-                    show_label = type_idx not in plotted_types
-                    ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1.5,
-                           alpha=0.6, label=label if show_label else None, zorder=1)
-                    plotted_types.add(type_idx)
-        
-        # ===== Plot Agent Trajectories =====
-        num_agents = 1  # Only one agent per prediction in test set
-        colors = plt.cm.tab10(np.linspace(0, 1, 10))
-        
-        agent_errors = []
-        for agent_idx in range(num_agents):
-            color = colors[agent_idx]
+                    for poly_id in unique_polylines:
+                        poly_mask = scenario_map_polyline_ids == poly_id
+                        poly_vectors = scenario_map_vectors[poly_mask]
+                        
+                        if len(poly_vectors) == 0:
+                            continue
+                        
+                        # Get type from one-hot (indices 6:13)
+                        type_onehot = poly_vectors[0, 6:13]
+                        type_idx = np.argmax(type_onehot)
+                        color, label = MAP_COLORS.get(type_idx, ('#CCCCCC', 'Unknown'))
+                        
+                        # Build continuous polyline path
+                        points = []
+                        for i, vec in enumerate(poly_vectors):
+                            if i == 0:
+                                points.append([vec[0], vec[1]])  # First start point
+                            points.append([vec[3], vec[4]])  # End point of each segment
+                        points = np.array(points)
+                        
+                        show_label = type_idx not in plotted_types
+                        ax.plot(points[:, 0], points[:, 1], color=color, linewidth=1.5,
+                               alpha=0.6, label=label if show_label else None, zorder=1)
+                        plotted_types.add(type_idx)
             
-            # Ground truth (solid black line)
-            ax.plot(target_pos[:, 0], target_pos[:, 1],
-                    '-', color='black', linewidth=1.5, alpha=0.8,
-                    label='Ground Truth', zorder=10)
+            # ===== Plot Agent Trajectories =====
+            num_agents = 1  # Only one agent per prediction in test set
+            colors = plt.cm.tab10(np.linspace(0, 1, 10))
             
-            # Prediction (dashed colored line)
-            ax.plot(pred_pos[:, 0], pred_pos[:, 1],
-                    '--', color=color, linewidth=2, alpha=0.9,
-                    label='Prediction', zorder=11)
+            agent_errors = []
+            for agent_idx in range(num_agents):
+                color = colors[agent_idx]
+                
+                # Ground truth (solid black line)
+                ax.plot(target_pos[:, 0], target_pos[:, 1],
+                        '-', color='black', linewidth=1.5, alpha=0.8,
+                        label='Ground Truth', zorder=10)
+                
+                # Prediction (dashed colored line)
+                ax.plot(pred_pos[:, 0], pred_pos[:, 1],
+                        '--', color=color, linewidth=2, alpha=0.9,
+                        label='Prediction', zorder=11)
+                
+                # Mark start position
+                ax.scatter(target_pos[0, 0], target_pos[0, 1],
+                          color=color, marker='o', s=35, edgecolors='black', linewidths=0.5, zorder=15)
+                
+                # Mark GT endpoint (x marker in black)
+                ax.scatter(target_pos[-1, 0], target_pos[-1, 1],
+                          color='black', marker='x', s=60, linewidth=2, zorder=15)
+                
+                # Mark predicted endpoint (square marker)
+                ax.scatter(pred_pos[-1, 0], pred_pos[-1, 1],
+                          color=color, marker='s', s=30, alpha=0.5, edgecolors='black', linewidths=0.5, zorder=16)
+                
+                # Compute error
+                error = np.linalg.norm(pred_pos - target_pos, axis=1).mean()
+                agent_errors.append(error)
             
-            # Mark start position
-            ax.scatter(target_pos[0, 0], target_pos[0, 1],
-                      color=color, marker='o', s=35, edgecolors='black', linewidths=0.5, zorder=15)
+            avg_error = np.mean(agent_errors) if agent_errors else 0
+            total_ade += avg_error
             
-            # Mark GT endpoint (x marker in black)
-            ax.scatter(target_pos[-1, 0], target_pos[-1, 1],
-                      color='black', marker='x', s=60, linewidth=2, zorder=15)
+            ax.set_xlabel('X (meters)')
+            ax.set_ylabel('Y (meters)')
+            ax.set_title(f'VectorNet Test Scenario {scenario_id}\n'
+                         f'{pred_pos.shape[0]} prediction steps\n'
+                         f'Average Displacement Error: {avg_error:.2f}m')
+            ax.legend(loc='upper left', fontsize=8)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
             
-            # Mark predicted endpoint (square marker)
-            ax.scatter(pred_pos[-1, 0], pred_pos[-1, 1],
-                      color=color, marker='s', s=30, alpha=0.5, edgecolors='black', linewidths=0.5, zorder=16)
+            save_path = os.path.join(save_dir, f'vectornet_test_scenario_{scenario_counter:04d}_{scenario_id}.png')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
             
-            # Compute error
-            error = np.linalg.norm(pred_pos - target_pos, axis=1).mean()
-            agent_errors.append(error)
-        
-        avg_error = np.mean(agent_errors) if agent_errors else 0
-        total_ade += avg_error
-        
-        scenario_id = scenario_ids[viz_idx] if viz_idx < len(scenario_ids) else f"scenario_{viz_idx}"
-        
-        ax.set_xlabel('X (meters)')
-        ax.set_ylabel('Y (meters)')
-        ax.set_title(f'VectorNet Test Scenario {scenario_id}\n'
-                     f'{pred_pos.shape[0]} prediction steps\n'
-                     f'Average Displacement Error: {avg_error:.2f}m')
-        ax.legend(loc='upper left', fontsize=8)
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
-        
-        save_path = os.path.join(save_dir, f'vectornet_test_scenario_{viz_idx:04d}_{scenario_id}.png')
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        
-        saved_paths.append((save_path, avg_error, scenario_id))
-        viz_count += 1
-        within_batch_idx += 1
-        print(f"  Saved: {save_path} (ADE: {avg_error:.2f}m)")
+            saved_paths.append((save_path, avg_error, scenario_id))
+            viz_count += 1
+            scenario_counter += 1
+            print(f"  Saved: {save_path} (ADE: {avg_error:.2f}m)")
     
     avg_ade = total_ade / max(1, viz_count)
     return saved_paths, avg_ade
