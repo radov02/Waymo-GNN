@@ -274,14 +274,29 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
         first_targets = batches[0]['targets'].numpy() if torch.is_tensor(batches[0]['targets']) else batches[0]['targets']
         first_preds = batches[0]['predictions'].numpy() if torch.is_tensor(batches[0]['predictions']) else batches[0]['predictions']
         print(f"\n[DEBUG] First batch data ranges:")
-        print(f"  Targets: min={first_targets.min():.2f}, max={first_targets.max():.2f}, shape={first_targets.shape}")
+        print(f"  Targets shape: {first_targets.shape} (should be [num_agents, 50, 2] for 5s prediction)")
+        print(f"  Predictions shape: {first_preds.shape}")
+        print(f"  Targets: min={first_targets.min():.2f}, max={first_targets.max():.2f}")
         print(f"  Predictions: min={first_preds.min():.2f}, max={first_preds.max():.2f}")
+        
+        # Check trajectory extent for first few agents
+        for i in range(min(3, first_targets.shape[0])):
+            tgt = first_targets[i]  # [50, 2]
+            pred = first_preds[i]   # [50, 2]
+            # Compute trajectory length (total distance traveled)
+            gt_dists = np.linalg.norm(np.diff(tgt, axis=0), axis=1)
+            pred_dists = np.linalg.norm(np.diff(pred, axis=0), axis=1)
+            gt_total = gt_dists.sum()
+            pred_total = pred_dists.sum()
+            # Displacement from start to end
+            gt_displacement = np.linalg.norm(tgt[-1] - tgt[0])
+            pred_displacement = np.linalg.norm(pred[-1] - pred[0])
+            print(f"  Agent {i}: GT path={gt_total:.1f}m, GT displacement={gt_displacement:.1f}m | "
+                  f"Pred path={pred_total:.1f}m, Pred displacement={pred_displacement:.1f}m")
+        
         if batches[0]['map_vectors'] is not None:
             first_map = batches[0]['map_vectors'].numpy() if torch.is_tensor(batches[0]['map_vectors']) else batches[0]['map_vectors']
             print(f"  Map vectors: shape={first_map.shape}, x-range=[{first_map[:, 0].min():.1f}, {first_map[:, 0].max():.1f}], y-range=[{first_map[:, 1].min():.1f}, {first_map[:, 1].max():.1f}]")
-        if batches[0]['agent_vectors'] is not None:
-            first_agents = batches[0]['agent_vectors'].numpy() if torch.is_tensor(batches[0]['agent_vectors']) else batches[0]['agent_vectors']
-            print(f"  Agent vectors: shape={first_agents.shape}, de_x/de_y (cols 3,4) range=[{first_agents[:, 3].min():.1f}, {first_agents[:, 3].max():.1f}], [{first_agents[:, 4].min():.1f}, {first_agents[:, 4].max():.1f}]")
     
     # Iterate through stored batches and scenarios
     scenario_counter = 0
@@ -403,6 +418,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
             
             # ===== Plot Agent Trajectories =====
             agent_errors = []
+            max_gt_displacement = 0  # Track max displacement for diagnostics
             
             for t_idx in range(num_targets):
                 pred = scenario_predictions[t_idx]  # [T, 2]
@@ -418,6 +434,11 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
                 
                 # Get current position for this agent
                 curr_pos = current_positions[t_idx]
+                
+                # Compute trajectory displacement for diagnostics
+                if len(tgt_valid) > 1:
+                    gt_displacement = np.linalg.norm(tgt_valid[-1] - tgt_valid[0])
+                    max_gt_displacement = max(max_gt_displacement, gt_displacement)
                 
                 # Build complete trajectories starting from current position
                 gt_traj = np.vstack([curr_pos.reshape(1, 2), tgt_valid])    # [T+1, 2]
@@ -463,8 +484,8 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
             ax.set_xlabel('X (meters)')
             ax.set_ylabel('Y (meters)')
             ax.set_title(f'VectorNet Test Scenario {scenario_id}\n'
-                         f'{num_targets} agents | {scenario_predictions.shape[1]} prediction steps\n'
-                         f'Average Displacement Error: {avg_error:.2f}m')
+                         f'{num_targets} agents | {scenario_predictions.shape[1]} prediction steps (5.0s)\n'
+                         f'ADE: {avg_error:.2f}m | Max GT displacement: {max_gt_displacement:.1f}m')
             ax.legend(loc='upper left', fontsize=8)
             ax.set_aspect('equal')
             ax.grid(True, alpha=0.3)
