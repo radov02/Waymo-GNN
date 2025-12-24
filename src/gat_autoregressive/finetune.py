@@ -470,12 +470,12 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             if scenario is not None:
                 print(f"  Loaded scenario for map visualization")
             else:
-                print(f"  ⚠ Scenario loaded as None. Proceeding without map features.")
+                print(f"  Scenario loaded as None. Proceeding without map features.")
                 print(f"    NOTE: TFRecord files may not exist on this machine. Map features require original Waymo data.")
         except Exception as e:
             error_msg = str(e)
             if "No such file or directory" in error_msg or "tfrecord" in error_msg.lower():
-                print(f"  ⚠ TFRecord file not found - map features unavailable.")
+                print(f"  TFRecord file not found - map features unavailable.")
                 print(f"    To enable map features, ensure Waymo TFRecord files are in data/scenario/training/")
             else:
                 print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")

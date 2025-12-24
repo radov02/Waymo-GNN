@@ -195,7 +195,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
         
         if not sdc_valid or not sdc_found:
             # Add red warning banner
-            warning_text = "⚠ SDC INVALID" if not sdc_valid else "⚠ SDC NOT IN GRAPH"
+            warning_text = "SDC INVALID" if not sdc_valid else "SDC NOT IN GRAPH"
             ax.text(0.5, 0.95, warning_text, 
                    transform=ax.transAxes, ha='center', va='top',
                    fontsize=8, fontweight='bold', color='white',
