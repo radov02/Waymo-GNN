@@ -369,30 +369,35 @@ def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoo
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
     """Calculate probability of using model's own prediction vs ground truth.
     
+    Ensures sampling_prob reaches exactly 1.0 at the final epoch (epoch == total_epochs - 1).
+    
     Args:
         epoch: Current epoch (0-indexed)
         total_epochs: Total number of training epochs
         strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
-        warmup_epochs: Number of epochs before increasing scheduled sampling (reduced from 10)
+        warmup_epochs: Number of epochs before increasing scheduled sampling
     
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # Start with teacher forcing and gradually transition to full autoregressive
-    # At final epoch, we want sampling_prob = 1.0 (100% autoregressive)
-    min_sampling = 0.0  # Start with pure teacher forcing
+    # Guarantee final epoch is 1.0 (100% autoregressive)
+    if epoch >= total_epochs - 1:
+        return 1.0
     
+    # During warmup, use small amount of model predictions to start learning
     if epoch < warmup_epochs:
-        # During warmup, use small amount of model predictions to start learning
-        return 0.1
+        # Linear ramp from 0.0 to 0.1 during warmup for smoother transition
+        return 0.1 * (epoch / max(1, warmup_epochs))
     
-    # Adjust progress to account for warmup period
+    # Calculate progress from warmup_epochs to total_epochs-1
+    # At epoch=warmup_epochs: progress=0, at epoch=total_epochs-1: progress=1
+    remaining_epochs = total_epochs - warmup_epochs
     adjusted_epoch = epoch - warmup_epochs
-    adjusted_total = total_epochs - warmup_epochs - 1  # -1 so last epoch reaches max
-    progress = adjusted_epoch / max(1, adjusted_total)
-    progress = min(1.0, progress)  # Cap at 1.0
+    progress = adjusted_epoch / max(1, remaining_epochs - 1)
+    progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
     
-    # Scale from min_sampling to 1.0 (full autoregressive at final epoch)
+    # Scale from 0.1 (end of warmup) to 1.0 (final epoch)
+    min_sampling = 0.1
     max_sampling = 1.0
     
     if strategy == 'linear' or strategy == 'delayed_linear':
@@ -956,10 +961,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     
-    try:
-        wandb.log({f"gat_autoreg_visualization": wandb.Image(filepath)})
-    except:
-        pass
+    # NOTE: Don't log to wandb here - visualization images are logged per-epoch in main loop
+    # to avoid step conflicts. The main loop collects all viz paths and logs them together.
     
     print(f"  -> Saved visualization to {filepath}")
     
@@ -1864,8 +1867,9 @@ def run_autoregressive_finetuning(
             "learning_rate": current_lr
         }
         
-        # Track horizon errors for early stopping
+        # Track horizon errors and visualization paths for logging
         epoch_horizon_errors = []
+        epoch_viz_paths = []
         
         # Visualize using TRAINING data (more reliable than validation)
         if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
@@ -1882,6 +1886,7 @@ def run_autoregressive_finetuning(
                     )
                     if isinstance(result, tuple):
                         filepath, final_error = result
+                        epoch_viz_paths.append(filepath)
                         if final_error != float('inf') and not np.isnan(final_error):
                             epoch_horizon_errors.append(final_error)
                     viz_count += 1
@@ -1900,13 +1905,17 @@ def run_autoregressive_finetuning(
             log_dict["horizon/avg_final_error_m"] = avg_horizon_error
             log_dict["horizon/min_error_m"] = min(epoch_horizon_errors)
             log_dict["horizon/max_error_m"] = max(epoch_horizon_errors)
-            
-            # Early stopping disabled - let training run for all epochs
-            # early_stopper(avg_horizon_error)
         else:
             # Fallback to training loss if no visualizations
             avg_horizon_error = train_metrics['loss'] * 100  # Scale to be comparable
-            # early_stopper(avg_horizon_error)
+        
+        # Add visualizations to log dict (if any were created this epoch)
+        if epoch_viz_paths:
+            # Log only the first visualization per epoch to avoid clutter
+            try:
+                log_dict["visualization"] = wandb.Image(epoch_viz_paths[0])
+            except Exception as e:
+                print(f"  Warning: Could not log visualization to wandb: {e}")
         
         # Log all metrics for this epoch with explicit step parameter
         wandb.log(log_dict, step=epoch)

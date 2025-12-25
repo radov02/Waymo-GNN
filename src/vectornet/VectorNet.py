@@ -1,11 +1,6 @@
-"""VectorNet: Hierarchical GNN for trajectory prediction (Gao et al. 2020).
-
-Predicts full future trajectory at once (not autoregressive) using:
-1. Polyline Subgraph Network: Aggregates vectors within each polyline
-2. Global Interaction Graph: Self-attention between all polylines
-
-Feature dims (TFRecord): Agent=16, Map=13
-"""
+"""VectorNet model: hierarchical GNN for trajectory prediction (Gao et al. 2020).
+Predicts full future trajectory at once using Polyline Subgraph Network which aggregates 
+vectors within each polyline and a Global Interaction Graph that applies self-attention between polylines"""
 
 import torch
 import torch.nn as nn

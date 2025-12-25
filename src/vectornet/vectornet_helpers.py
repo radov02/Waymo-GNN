@@ -1,63 +1,44 @@
-"""VectorNet Helper Functions.
-
-Utility functions for VectorNet training, evaluation, and visualization.
-"""
+"""utility functions for VectorNet training, evaluation, and visualization"""
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 import os
 from datetime import datetime
 import hashlib
-
+from config import POSITION_SCALE
 
 def compute_vectornet_metrics(predictions, targets, prefix=''):
-    """Compute comprehensive metrics for VectorNet predictions.
-    
-    Args:
+    """Compute comprehensive metrics for VectorNet predictions using:
         predictions: [N, 2] or [N, T, 2] predicted displacements
         targets: [N, 2] or [N, T, 2] target displacements
-        prefix: Optional prefix for metric names
-        
-    Returns:
-        Dictionary of metrics
-    """
+        prefix: Optional prefix for metric names"""
     with torch.no_grad():
-        # Handle both single-step and multi-step predictions
+        # for both single-step and multi-step predictions
         if predictions.dim() == 2:
             pred = predictions
             targ = targets
         else:
-            # Flatten for aggregate metrics
+            # flatten for aggregate metrics
             pred = predictions.reshape(-1, 2)
             targ = targets.reshape(-1, 2)
         
-        # MSE
-        mse = F.mse_loss(pred, targ)
-        
-        # RMSE in meters (assuming normalized by 100)
-        rmse_meters = (mse ** 0.5) * 100.0
-        
-        # Cosine similarity
+        mse = F.mse_loss(pred, targ)    # MSE
+        rmse_meters = (mse ** 0.5) * POSITION_SCALE     # RMSE in meters
         pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
         targ_norm = F.normalize(targ, p=2, dim=1, eps=1e-6)
-        cos_sim = F.cosine_similarity(pred_norm, targ_norm, dim=1).mean()
-        
-        # Angular error
+        cos_sim = F.cosine_similarity(pred_norm, targ_norm, dim=1).mean()   # cosine similarity
         pred_angle = torch.atan2(pred[:, 1], pred[:, 0])
         targ_angle = torch.atan2(targ[:, 1], targ[:, 0])
         angle_diff = torch.atan2(
             torch.sin(pred_angle - targ_angle),
             torch.cos(pred_angle - targ_angle)
         )
-        angle_error = torch.abs(angle_diff).mean()
-        
-        # Displacement magnitude error
+        angle_error = torch.abs(angle_diff).mean()  # Mean absolute angle error in radians
         pred_mag = torch.norm(pred, dim=1)
         targ_mag = torch.norm(targ, dim=1)
-        mag_error = torch.abs(pred_mag - targ_mag).mean()
+        mag_error = torch.abs(pred_mag - targ_mag).mean()   # Mean absolute displacement magnitude error
         
     p = f"{prefix}_" if prefix else ""
     
@@ -70,40 +51,30 @@ def compute_vectornet_metrics(predictions, targets, prefix=''):
         f'{p}magnitude_error': mag_error.item(),
     }
 
-
 def compute_ade_fde(predictions, targets):
-    """Compute Average and Final Displacement Errors.
-    
-    Args:
+    """compute Average and Final Displacement Errors using:
         predictions: [N, T, 2] predicted trajectory displacements
-        targets: [N, T, 2] target trajectory displacements
-        
-    Returns:
-        Dictionary with ADE and FDE metrics
-    """
+        targets: [N, T, 2] target trajectory displacements"""
     with torch.no_grad():
-        # Convert to cumulative positions
+        # convert to cumulative positions
         pred_pos = torch.cumsum(predictions, dim=1)
         targ_pos = torch.cumsum(targets, dim=1)
         
-        # Displacement errors at each timestep
+        # displacement errors at each timestep:
         errors = torch.norm(pred_pos - targ_pos, dim=2)  # [N, T]
+        ade = errors.mean()     # ADE: mean over all timesteps and agents
         
-        # ADE: mean over all timesteps and agents
-        ade = errors.mean()
-        
-        # FDE: error at final timestep
+        # FDE: error at final timestep:
         fde = errors[:, -1].mean()
         
         # Miss rate at 2m threshold
-        mr_2m = (errors[:, -1] > 2.0).float().mean() * 100
+        mr_2m = (errors[:, -1] > 2.0).float().mean() * POSITION_SCALE
         
     return {
         'ade': ade.item(),
         'fde': fde.item(),
         'miss_rate_2m': mr_2m.item(),
     }
-
 
 def visualize_vectornet_predictions(predictions, targets, positions,
                                     agent_types=None, save_path=None,
@@ -185,7 +156,6 @@ def visualize_vectornet_predictions(predictions, targets, positions,
     
     return fig
 
-
 def visualize_attention_weights(attention_weights, polyline_labels=None,
                                 save_path=None, title="VectorNet Attention Weights"):
     """Visualize attention weights from global interaction graph.
@@ -232,23 +202,14 @@ def visualize_attention_weights(attention_weights, polyline_labels=None,
     
     return fig
 
-
 def generate_run_id():
-    """Generate a unique run ID based on timestamp."""
+    """generate a unique run ID based on timestamp"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     hash_suffix = hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8]
     return f"{timestamp}_{hash_suffix}"
 
-
 def count_parameters(model):
-    """Count total and trainable parameters in a model.
-    
-    Args:
-        model: PyTorch model
-        
-    Returns:
-        Dictionary with parameter counts
-    """
+    """count total and trainable parameters in a model"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
@@ -260,14 +221,7 @@ def count_parameters(model):
         'trainable_mb': trainable * 4 / (1024 ** 2)
     }
 
-
-def print_model_summary(model, input_dim=15):
-    """Print a summary of the VectorNet model architecture.
-    
-    Args:
-        model: VectorNet model
-        input_dim: Input feature dimension
-    """
+def print_model_summary(model):
     print("\n" + "=" * 60)
     print("VECTORNET MODEL SUMMARY")
     print("=" * 60)
@@ -287,37 +241,17 @@ def print_model_summary(model, input_dim=15):
     
     print("=" * 60 + "\n")
 
-
 def create_checkpoint_name(prefix, epoch, run_id, extension='.pt'):
-    """Create a standardized checkpoint filename.
-    
-    Args:
-        prefix: Model name prefix
-        epoch: Epoch number
-        run_id: Unique run identifier
-        extension: File extension
-        
-    Returns:
-        Checkpoint filename
-    """
+    """create a standardized checkpoint filename"""
     return f"{prefix}_epoch{epoch:03d}_{run_id}{extension}"
 
-
 def load_checkpoint_config(checkpoint_path):
-    """Load only the config from a checkpoint without loading the full model.
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        
-    Returns:
-        Configuration dictionary
-    """
+    """load only the config from a checkpoint without loading the full model"""
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     return checkpoint.get('config', {})
 
-
 class MovingAverage:
-    """Exponential moving average for tracking training metrics."""
+    """exponential moving average for tracking training metrics"""
     
     def __init__(self, alpha=0.1):
         self.alpha = alpha
@@ -333,9 +267,8 @@ class MovingAverage:
     def reset(self):
         self.value = None
 
-
 class MetricTracker:
-    """Track and aggregate metrics during training."""
+    """track and aggregate metrics during training."""
     
     def __init__(self, metric_names):
         self.metric_names = metric_names
@@ -359,7 +292,6 @@ class MetricTracker:
     
     def get_average(self, name):
         return self.sums[name] / max(1, self.counts[name])
-
 
 __all__ = [
     'compute_vectornet_metrics',

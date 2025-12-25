@@ -579,47 +579,6 @@ def vectornet_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         'scenario_ids': scenario_ids,
     }
 
-def create_vectornet_dataloaders(tfrecord_dir: str, batch_size: int = 32, num_workers: int = 4, history_len: int = 10,
-    future_len: int = 50, max_train_scenarios: Optional[int] = None, max_val_scenarios: Optional[int] = None, num_agents_to_predict: Optional[int] = 8) -> Tuple[DataLoader, DataLoader]:
-    """create training and validation dataloaders for VectorNet"""
-    train_dataset = VectorNetTFRecordDataset(
-        tfrecord_dir=tfrecord_dir,
-        split='training',
-        history_len=history_len,
-        future_len=future_len,
-        max_scenarios=max_train_scenarios,
-        num_agents_to_predict=num_agents_to_predict,
-    )
-    
-    val_dataset = VectorNetTFRecordDataset(
-        tfrecord_dir=tfrecord_dir,
-        split='validation',
-        history_len=history_len,
-        future_len=future_len,
-        max_scenarios=max_val_scenarios,
-        num_agents_to_predict=num_agents_to_predict,
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=vectornet_collate_fn,
-        pin_memory=True,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=vectornet_collate_fn,
-        pin_memory=True,
-    )
-    
-    return train_loader, val_loader
-
 # wrapper for compatibility with PyG data format
 class VectorNetDatasetWrapper(Dataset):
     """Wrapper that converts TFRecord dataset output to PyG Data format for using the TFRecord dataset with PyG-based training code."""
@@ -659,7 +618,6 @@ class VectorNetDatasetWrapper(Dataset):
         )
         
         return data
-
 
 if __name__ == '__main__':
     # Test the dataset

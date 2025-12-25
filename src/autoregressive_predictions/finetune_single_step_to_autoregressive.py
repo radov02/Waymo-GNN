@@ -688,14 +688,14 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     
-    # Log to wandb
-    try:
-        wandb.log({f"autoreg_visualization": wandb.Image(filepath)})
-    except:
-        pass
+    # NOTE: Don't log to wandb here - visualization images are logged per-epoch in main loop
+    # to avoid step conflicts. The main loop collects all viz paths and logs them together.
     
     print(f"  -> Saved visualization to {filepath}")
-    return filepath
+    
+    # Return both filepath and final horizon error for epoch-level tracking
+    final_horizon_error = horizon_errors[-1] if horizon_errors else float('inf')
+    return filepath, final_horizon_error
 
 
 def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
@@ -843,30 +843,35 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     """
     Calculate probability of using model's own prediction vs ground truth.
     
+    Ensures sampling_prob reaches exactly 1.0 at the final epoch (epoch == total_epochs - 1).
+    
     Args:
         epoch: Current epoch (0-indexed)
         total_epochs: Total number of training epochs
         strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
-        warmup_epochs: Number of epochs before increasing scheduled sampling (reduced from 10)
+        warmup_epochs: Number of epochs before increasing scheduled sampling
     
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # Start with teacher forcing and gradually transition to full autoregressive
-    # At final epoch, we want sampling_prob = 1.0 (100% autoregressive)
-    min_sampling = 0.0  # Start with pure teacher forcing
+    # Guarantee final epoch is 1.0 (100% autoregressive)
+    if epoch >= total_epochs - 1:
+        return 1.0
     
+    # During warmup, use small amount of model predictions to start learning
     if epoch < warmup_epochs:
-        # During warmup, use small amount of model predictions to start learning
-        return 0.1
+        # Linear ramp from 0.0 to 0.1 during warmup for smoother transition
+        return 0.1 * (epoch / max(1, warmup_epochs))
     
-    # Adjust progress to account for warmup period
+    # Calculate progress from warmup_epochs to total_epochs-1
+    # At epoch=warmup_epochs: progress=0, at epoch=total_epochs-1: progress=1
+    remaining_epochs = total_epochs - warmup_epochs
     adjusted_epoch = epoch - warmup_epochs
-    adjusted_total = total_epochs - warmup_epochs - 1  # -1 so last epoch reaches max
-    progress = adjusted_epoch / max(1, adjusted_total)
-    progress = min(1.0, progress)  # Cap at 1.0
+    progress = adjusted_epoch / max(1, remaining_epochs - 1)
+    progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
     
-    # Scale from min_sampling to 1.0 (full autoregressive at final epoch)
+    # Scale from 0.1 (end of warmup) to 1.0 (final epoch)
+    min_sampling = 0.1
     max_sampling = 1.0
     
     if strategy == 'linear' or strategy == 'delayed_linear':
@@ -1709,7 +1714,7 @@ def run_autoregressive_finetuning(
         # Calculate RMSE in meters for more interpretable logging
         train_rmse_meters = (train_metrics['mse'] ** 0.5) * 100.0
         
-        # Log to wandb - use step parameter to sync with epoch number
+        # Build log dict - will be augmented with viz metrics before logging
         log_dict = {
             "epoch": epoch + 1,  # 1-indexed for readability
             "sampling_probability": sampling_prob,
@@ -1733,8 +1738,9 @@ def run_autoregressive_finetuning(
                 log_dict[f"val/mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
                 log_dict[f"val/cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
         
-        # Log all metrics for this epoch with explicit step parameter
-        wandb.log(log_dict, step=epoch)
+        # Track horizon errors and visualization paths
+        epoch_horizon_errors = []
+        epoch_viz_paths = []
         
         # Print summary
         if val_metrics:
@@ -1746,10 +1752,15 @@ def run_autoregressive_finetuning(
                     for viz_batch in val_loader:
                         if viz_count >= 4:
                             break
-                        visualize_autoregressive_rollout(
+                        result = visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
                             device, is_parallel, save_dir=gcn_viz_dir_autoreg
                         )
+                        if isinstance(result, tuple):
+                            filepath, final_error = result
+                            epoch_viz_paths.append(filepath)
+                            if final_error != float('inf') and not np.isnan(final_error):
+                                epoch_horizon_errors.append(final_error)
                         viz_count += 1
                     print(f"  Created {viz_count} visualizations\n")
                 except Exception as e:
@@ -1778,13 +1789,6 @@ def run_autoregressive_finetuning(
                     checkpoint_data['config'] = checkpoint['config']
                 torch.save(checkpoint_data, save_path)
                 print(f"  -> Saved best model to {save_filename} (val_loss: {val_metrics['loss']:.4f})")
-            
-            # Early stopping disabled - let training run for all epochs
-            # early_stopper(val_metrics['loss'])
-            # if early_stopper.early_stop:
-            #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
-            #     print(f"   Best validation loss: {early_stopper.best_loss:.4f}")
-            #     break
         else:
             print(f"  Train Loss: {train_metrics['loss']:.4f} | Train Cos: {train_metrics['cosine_sim']:.4f}")
             
@@ -1796,22 +1800,41 @@ def run_autoregressive_finetuning(
                     for viz_batch in train_loader:
                         if viz_count >= 4:
                             break
-                        visualize_autoregressive_rollout(
+                        result = visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
                             device, is_parallel, save_dir=gcn_viz_dir_autoreg
                         )
+                        if isinstance(result, tuple):
+                            filepath, final_error = result
+                            epoch_viz_paths.append(filepath)
+                            if final_error != float('inf') and not np.isnan(final_error):
+                                epoch_horizon_errors.append(final_error)
                         viz_count += 1
                     print(f"  Created {viz_count} visualizations\n")
                 except Exception as e:
                     import traceback
                     print(f"  Warning: Visualization failed: {e}")
                     traceback.print_exc()
+        
+        # Calculate average horizon error and add to log_dict
+        if epoch_horizon_errors:
+            avg_horizon_error = np.mean(epoch_horizon_errors)
+            print(f"\n  [EPOCH {epoch+1}] Average Final Horizon Error: {avg_horizon_error:.2f}m (across {len(epoch_horizon_errors)} scenarios)")
             
-            # Early stopping disabled - let training run for all epochs
-            # early_stopper(train_metrics['loss'])
-            # if early_stopper.early_stop:
-            #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
-            #     break
+            # Add horizon error metrics to main log dict
+            log_dict["horizon/avg_final_error_m"] = avg_horizon_error
+            log_dict["horizon/min_error_m"] = min(epoch_horizon_errors)
+            log_dict["horizon/max_error_m"] = max(epoch_horizon_errors)
+        
+        # Add first visualization to log dict (if any were created this epoch)
+        if epoch_viz_paths:
+            try:
+                log_dict["visualization"] = wandb.Image(epoch_viz_paths[0])
+            except Exception as e:
+                print(f"  Warning: Could not log visualization to wandb: {e}")
+        
+        # Log all metrics for this epoch with explicit step parameter
+        wandb.log(log_dict, step=epoch)
     
     # Determine actual final epoch (may be earlier due to early stopping)
     actual_final_epoch = epoch + 1
