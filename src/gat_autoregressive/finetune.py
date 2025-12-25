@@ -1,15 +1,11 @@
-"""Fine-tune GAT single-step model for autoregressive prediction using scheduled sampling.
-"""
+"""Fine-tune GAT single-step model for autoregressive prediction using scheduled sampling."""
 
 import sys
 import os
 # Add parent directory (src/) to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Set matplotlib backend to non-interactive before importing pyplot
 import matplotlib
 matplotlib.use('Agg')
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,13 +18,12 @@ from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name, epochs,
-                    gradient_clip_value, gat_num_heads,
+                    gradient_clip_value, gat_num_heads, gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
-                    autoreg_visualize_every_n_epochs, gat_viz_dir_autoreg,
-                    pin_memory, gat_prefetch_factor, use_amp,
-                    early_stopping_patience, early_stopping_min_delta,
-                    gat_checkpoint_dir, gat_checkpoint_dir_autoreg,
+                    autoreg_visualize_every_n_epochs, gat_viz_dir_autoreg, use_edge_weights,
+                    pin_memory, gat_prefetch_factor, use_amp, gcn_viz_dir_autoreg, autoreg_skip_map_features,
+                    gat_checkpoint_dir, gat_checkpoint_dir_autoreg, use_gradient_checkpointing,
                     cache_validation_data, max_validation_scenarios, radius, max_scenario_files_for_viz,
                     POSITION_SCALE, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC, enable_debug_viz)
 from torch.utils.data import DataLoader, Subset
@@ -38,333 +33,88 @@ from helper_functions.visualization_functions import (load_scenario_by_id, draw_
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 from torch.nn.utils import clip_grad_norm_
 import random
+from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 
-# ============== Autoregressive Edge Rebuilding ==============
-# When enabled, edges are recomputed at each autoregressive step based on updated positions.
-# This captures new spatial relationships as agents move (e.g., agents coming within/out of radius).
-# Slightly slower but more accurate for long rollouts where agents move significantly.
-AUTOREG_REBUILD_EDGES = True  # Set to False to keep original edge topology (faster but less accurate)
+
+AUTOREG_REBUILD_EDGES = True  # when enabled, edges are recomputed at each autoregressive step based on updated positions, which captures new spatial relationships as agents move (e.g., agents coming within/out of radius) - more accurate for long rollouts where agents move significantly
+_size_mismatch_warned = False
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
 
-# Warning suppression - only print size mismatch warning once per epoch
-_size_mismatch_warned = False
-
-# Epoch-level horizon error tracking for early stopping
-_epoch_horizon_errors = []  # List of final horizon errors per visualization
-
-
-class EarlyStopping:
-    """Early stopping based on average final horizon error.
-    
-    Uses average final horizon error instead of training loss because:
-    1. Training loss with teacher forcing doesn't reflect autoregressive performance
-    2. Horizon error directly measures what we care about: prediction accuracy over time
-    """
-    
-    def __init__(self, patience=10, min_delta=0.5, target_error=5.0, verbose=True):
-        """
-        Args:
-            patience: Number of epochs without improvement before stopping
-            min_delta: Minimum improvement to reset counter (in meters)
-            target_error: If average final horizon error drops below this, consider early stopping success
-            verbose: Whether to print progress
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.target_error = target_error
-        self.verbose = verbose
-        self.counter = 0
-        self.best_error = None
-        self.early_stop = False
-        
-    def __call__(self, avg_horizon_error):
-        """Check if training should stop.
-        
-        Args:
-            avg_horizon_error: Average final horizon error across scenarios (in meters)
-        """
-        if self.best_error is None:
-            self.best_error = avg_horizon_error
-            if self.verbose:
-                print(f"  [EarlyStopping] Initial best horizon error: {avg_horizon_error:.2f}m")
-        elif avg_horizon_error > self.best_error - self.min_delta:
-            self.counter += 1
-            if self.verbose:
-                print(f"  [EarlyStopping] No improvement: {avg_horizon_error:.2f}m (best: {self.best_error:.2f}m) - counter: {self.counter}/{self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            improvement = self.best_error - avg_horizon_error
-            self.best_error = avg_horizon_error
-            self.counter = 0
-            if self.verbose:
-                print(f"  [EarlyStopping] Improved by {improvement:.2f}m - new best: {avg_horizon_error:.2f}m")
-        
-        # Check if we've reached target performance
-        if avg_horizon_error <= self.target_error:
-            if self.verbose:
-                print(f"  [EarlyStopping] Reached target error ({avg_horizon_error:.2f}m <= {self.target_error}m)!")
-            
-    def reset(self):
-        self.counter = 0
-        self.best_error = None
-        self.early_stop = False
-
-
-def load_pretrained_model(checkpoint_path, device):
+def load_pretrained_model(checkpoint_path, device, model_type="gat"):
     """Load pre-trained GAT model from checkpoint."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
-    print(f"Loading pre-trained GAT model from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Recreate model with saved config or use defaults
-    # SpatioTemporalGATBatched is architecture-compatible with SpatioTemporalGAT
-    # but supports batch_size > 1 properly
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        model = SpatioTemporalGATBatched(
-            input_dim=config.get('input_dim', input_dim),
-            hidden_dim=config.get('hidden_channels', hidden_channels),
-            output_dim=config.get('output_dim', output_dim),
-            num_gat_layers=config.get('num_layers', num_layers),
-            num_gru_layers=config.get('num_gru_layers', num_gru_layers),
-            dropout=config.get('dropout', dropout),
-            num_heads=config.get('num_heads', gat_num_heads),
-            max_agents_per_scenario=128
-        )
-    else:
-        # Checkpoint doesn't have config - use default values from config.py
-        print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
-        model = SpatioTemporalGATBatched(
-            input_dim=input_dim,
-            hidden_dim=hidden_channels,
-            output_dim=output_dim,
-            num_gat_layers=num_layers,
-            num_gru_layers=num_gru_layers,
-            dropout=dropout,
-            num_heads=4,  # Default value
-            max_agents_per_scenario=128
-        )
+
+    if model_type == "gat":
+        print(f"Loading pre-trained GAT model from {checkpoint_path}...")
+        # Recreate model with saved config or use defaults
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            model = SpatioTemporalGATBatched(
+                input_dim=config.get('input_dim', input_dim),
+                hidden_dim=config.get('hidden_channels', hidden_channels),
+                output_dim=config.get('output_dim', output_dim),
+                num_gat_layers=config.get('num_layers', num_layers),
+                num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+                dropout=config.get('dropout', dropout),
+                num_heads=config.get('num_heads', gat_num_heads),
+                max_agents_per_scenario=128
+            )
+        else:
+            # Checkpoint doesn't have config - use default values from config.py
+            print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
+            model = SpatioTemporalGATBatched(
+                input_dim=input_dim,
+                hidden_dim=hidden_channels,
+                output_dim=output_dim,
+                num_gat_layers=num_layers,
+                num_gru_layers=num_gru_layers,
+                dropout=dropout,
+                num_heads=4,  # Default value
+                max_agents_per_scenario=128
+            )
+        print(f"Loaded GAT model from epoch {checkpoint['epoch']}")
+        
+    elif model_type == "gcn":
+        print(f"Loading pre-trained GCN model from {checkpoint_path}...")
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            model = SpatioTemporalGNNBatched(
+                input_dim=config.get('input_dim', input_dim),
+                hidden_dim=config.get('hidden_channels', hidden_channels),
+                output_dim=config.get('output_dim', output_dim),
+                num_gcn_layers=config.get('num_layers', num_layers),
+                num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+                dropout=config.get('dropout', dropout),
+                use_gat=config.get('use_gat', False),  # Backward compat with old checkpoints
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                max_agents_per_scenario=128
+            )
+        else:
+            print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
+            model = SpatioTemporalGNNBatched(
+                input_dim=input_dim,
+                hidden_dim=hidden_channels,
+                output_dim=output_dim,
+                num_gcn_layers=num_layers,
+                num_gru_layers=num_gru_layers,
+                dropout=dropout,
+                use_gat=False,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                max_agents_per_scenario=128
+            )
+        print(f" Loaded GCN model from epoch {checkpoint['epoch']}")
     
     # Setup multi-GPU if available
     model, is_parallel = setup_model_parallel(model, device)
     
-    # Load weights
+    # Load weights:
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     
-    print(f"Loaded GAT model from epoch {checkpoint['epoch']}")
-    if 'val_loss' in checkpoint:
-        print(f"  Pre-trained val_loss: {checkpoint['val_loss']:.6f}")
-    
     return model, is_parallel, checkpoint
-
-
-def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
-    """
-    Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
-    
-    The model predicts normalized displacement (dx/100, dy/100).
-    
-    Updates:
-    - Position (graph.pos): updated with predicted displacement (* 100)
-    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized (if update_velocity=True)
-    - Speed (feature 2): magnitude of new velocity, normalized (if update_velocity=True)
-    - Heading (feature 3): direction of new velocity (if update_velocity=True)
-    - Relative position to SDC (features 7-8): recalculated based on new positions
-    - Distance to SDC (feature 9): recalculated
-    - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
-    
-    Args:
-        graph: PyG Data object with node features and positions
-        pred_displacement: Predicted normalized displacement [N, 2]
-        device: Torch device
-        velocity_smoothing: EMA smoothing factor for velocity updates (0=no smoothing, 1=full smoothing)
-                           Higher values = more conservative updates, helps stabilize early training
-        update_velocity: If False, keep original velocity features (helps stabilize very early training)
-    
-    NOTE: Previously we preserved velocity features, but this caused trajectory convergence
-    because the model learned to ignore velocity and predict an "average" displacement.
-    Now we update velocity from predictions to maintain agent-specific behavior.
-    """
-    global _size_mismatch_warned
-    updated_graph = graph.clone()
-    dt = 0.1  # 0.1 second timestep
-    
-    # CRITICAL: Handle size mismatch between prediction and graph
-    # This can happen when agents enter/leave between timesteps
-    num_nodes_graph = updated_graph.x.shape[0]
-    num_nodes_pred = pred_displacement.shape[0]
-    
-    if num_nodes_pred != num_nodes_graph:
-        # Size mismatch - only update the overlapping nodes
-        # Only print warning once per epoch to avoid log spam
-        if not _size_mismatch_warned:
-            print(f"  [WARNING] Size mismatch in update_graph_with_prediction: pred={num_nodes_pred}, graph={num_nodes_graph} (suppressing further warnings)")
-            _size_mismatch_warned = True
-        num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
-        pred_displacement = pred_displacement[:num_nodes_to_update]
-        # We'll only update the first num_nodes_to_update nodes
-    else:
-        num_nodes_to_update = num_nodes_graph
-
-    
-    # ============== NaN DETECTION AND HANDLING ==============
-    # Check for NaN in predictions - if found, replace with zeros to prevent cascade
-    if torch.isnan(pred_displacement).any():
-        print(f"  [WARNING] NaN detected in predictions! Replacing with zeros to prevent cascade.")
-        pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
-    
-    # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
-    if update_velocity:
-        # Convert predicted displacement to velocity: velocity = displacement / dt
-        # pred_displacement is normalized (actual_disp / 100)
-        # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
-        # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
-        velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
-        
-        # Get old velocity for acceleration calculation
-        old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
-        old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
-        
-        # New velocity from predictions - but clamp the raw displacement first to prevent explosion
-        # Reasonable single-step displacement: max ~3m (30 m/s * 0.1s), normalized = 0.03
-        # TIGHTER CLAMPING: 3m max to match physical limits (30 m/s * 0.1s = 3m)
-        max_disp_norm = 0.03  # 3m max per step - physically realistic limit
-        pred_disp_clamped = torch.clamp(pred_displacement, -max_disp_norm, max_disp_norm)
-        
-        new_vx_norm_raw = pred_disp_clamped[:, 0] * velocity_scale
-        new_vy_norm_raw = pred_disp_clamped[:, 1] * velocity_scale
-        
-        # Clamp to reasonable ranges (normalized values)
-        # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
-        # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
-        max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
-        new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
-        new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
-        
-        # Apply EMA smoothing to prevent sudden velocity jumps
-        # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
-        # Higher smoothing = more conservative updates (better for early training)
-        new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
-        new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
-        
-        # Calculate speed and heading from smoothed velocity
-        new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
-        new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
-        
-        # Safety: Check for NaN after velocity calculations
-        if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
-            print(f"  [ERROR] NaN in velocity features after smoothing! Keeping old values.")
-            # Keep old velocity instead of clamping to zero
-            new_vx_norm = old_vx_norm
-            new_vy_norm = old_vy_norm
-            new_speed_norm = updated_graph.x[:num_nodes_to_update, 2].clone()
-            new_heading = updated_graph.x[:num_nodes_to_update, 3].clone()
-        
-        # Calculate acceleration from velocity change (using smoothed values)
-        # acceleration = (new_v - old_v) / dt
-        # But we need to be careful: if smoothing is high, acceleration should be low
-        accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
-        ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
-        ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-        # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
-        ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
-        ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
-        
-        # Update velocity/acceleration features
-        updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
-        updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
-        updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
-        updated_graph.x[:num_nodes_to_update, 3] = new_heading
-        updated_graph.x[:num_nodes_to_update, 5] = ax_norm
-        updated_graph.x[:num_nodes_to_update, 6] = ay_norm
-    # Else: keep original velocity features - helps stabilize early training
-    # ========================================================================
-    
-    # Only update positions
-    if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
-        # pred_displacement is normalized, multiply by 100 to get actual displacement
-        actual_displacement = pred_displacement * POSITION_SCALE
-        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
-        
-        # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
-        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
-            batch_ids = updated_graph.batch.unique()
-            for batch_id in batch_ids:
-                batch_mask = (updated_graph.batch == batch_id)
-                batch_positions = updated_graph.pos[batch_mask]
-                
-                # Assume SDC is the first node in each batch
-                sdc_pos = batch_positions[0]
-                
-                # Calculate relative positions for this batch
-                rel_pos = batch_positions - sdc_pos
-                dist_to_sdc = torch.sqrt((rel_pos ** 2).sum(dim=1))
-                
-                # Normalize and clamp
-                rel_x_norm = torch.clamp(rel_pos[:, 0] / MAX_DIST_SDC, -1.0, 1.0)
-                rel_y_norm = torch.clamp(rel_pos[:, 1] / MAX_DIST_SDC, -1.0, 1.0)
-                dist_norm = torch.clamp(dist_to_sdc / MAX_DIST_SDC, 0.0, 1.0)
-                
-                # Update features for this batch
-                batch_indices = torch.where(batch_mask)[0]
-                updated_graph.x[batch_indices, 7] = rel_x_norm
-                updated_graph.x[batch_indices, 8] = rel_y_norm
-                updated_graph.x[batch_indices, 9] = dist_norm
-        
-        # ============== EDGE REBUILDING ==============
-        # Rebuild edges based on updated positions to capture new spatial relationships
-        # This is critical for long rollouts where agents move significantly
-        if AUTOREG_REBUILD_EDGES:
-            if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
-                # Batched graph: rebuild edges per scenario, then combine
-                batch_ids = updated_graph.batch.unique()
-                all_edge_indices = []
-                all_edge_weights = []
-                
-                for batch_id in batch_ids:
-                    batch_mask = (updated_graph.batch == batch_id)
-                    batch_positions = updated_graph.pos[batch_mask]
-                    batch_indices = torch.where(batch_mask)[0]
-                    
-                    # Get valid mask from feature 4 (validity flag)
-                    valid_mask = updated_graph.x[batch_mask, 4] > 0.5
-                    
-                    # Build new edges for this batch
-                    local_edge_index, local_edge_weight = build_edge_index_using_radius(
-                        batch_positions, radius=radius, self_loops=False, 
-                        valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
-                    )
-                    
-                    # Convert local indices to global indices
-                    if local_edge_index.size(1) > 0:
-                        global_edge_index = batch_indices[local_edge_index]
-                        all_edge_indices.append(global_edge_index)
-                        all_edge_weights.append(local_edge_weight.to(device))
-                
-                # Combine all edges
-                if all_edge_indices:
-                    updated_graph.edge_index = torch.cat(all_edge_indices, dim=1)
-                    updated_graph.edge_weight = torch.cat(all_edge_weights, dim=0)
-                else:
-                    # No edges - create empty tensors
-                    updated_graph.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-                    updated_graph.edge_weight = torch.zeros(0, dtype=torch.float32, device=device)
-            else:
-                # Single graph (no batching)
-                valid_mask = updated_graph.x[:, 4] > 0.5
-                new_edge_index, new_edge_weight = build_edge_index_using_radius(
-                    updated_graph.pos, radius=radius, self_loops=False,
-                    valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
-                )
-                updated_graph.edge_index = new_edge_index.to(device)
-                updated_graph.edge_weight = new_edge_weight.to(device)
-    
-    return updated_graph
-
 
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
     """Calculate probability of using model's own prediction vs ground truth.
@@ -383,6 +133,8 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     # Guarantee final epoch is 1.0 (100% autoregressive)
     if epoch >= total_epochs - 1:
         return 1.0
+    
+    # TODO: make scheduled sampling linearly increase from 0.0 to 1.0 over total_epochs...
     
     # During warmup, use small amount of model predictions to start learning
     if epoch < warmup_epochs:
@@ -410,7 +162,6 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     else:
         return min_sampling + progress * (max_sampling - min_sampling)
 
-
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     """Curriculum learning: gradually increase rollout length.
     
@@ -431,9 +182,8 @@ def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     steps = int(min_steps + (max_rollout_steps - min_steps) * progress)
     return min(steps, max_rollout_steps)
 
-
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
-                                     is_parallel, save_dir=None, total_epochs=40):
+                                     is_parallel, save_dir=None, total_epochs=40, model_type="gat"):
     """Visualize autoregressive rollout predictions vs ground truth.
     
     Args:
@@ -447,10 +197,14 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         total_epochs: Total number of epochs (for computing velocity smoothing)
     """
     if save_dir is None:
-        save_dir = gat_viz_dir_autoreg
+        if model_type == "gat":
+            save_dir = gat_viz_dir_autoreg
+        elif model_type == "gcn":
+            save_dir = gcn_viz_dir_autoreg
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
+    # TODO (w.r.t. update_graph_with_prediction)
     # NEW APPROACH: Keep GT velocity features, only update position
     # This matches training and gives model correct kinematic features
     velocity_smoothing = 0.0  # Not used
@@ -465,10 +219,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     # Load scenario for map features (cross-platform compatible)
     scenario = None
-    if scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
+    if not autoreg_skip_map_features and scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
         try:
             print(f"  Loading scenario {scenario_ids[0]} for map visualization...")
-            scenario = load_scenario_by_id(scenario_ids[0])
+            scenario = load_scenario_by_id(scenario_ids[0])     # use indexed loading for speed (index is built once and cached)
             if scenario is not None:
                 print(f"  Loaded scenario for map visualization")
             else:
@@ -482,8 +236,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             else:
                 print(f"  Warning: Could not load scenario ({type(e).__name__}: {e}). Proceeding without map features.")
     
-    # Move to device
-    for t in range(T):
+    for t in range(T):  # move to device
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
     
     # Reset GRU with proper batch info
@@ -505,20 +258,19 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     start_t = T // 3
     actual_rollout_steps = min(num_rollout_steps, T - start_t - 1)
-    
+    if actual_rollout_steps < num_rollout_steps:
+        print(f"  [WARNING] Requested {num_rollout_steps} rollout steps but only {actual_rollout_steps} available (T={T}, start_t={start_t})")
     if actual_rollout_steps < 1:
         print(f"  [ERROR] Not enough timesteps for rollout. T={T}, start_t={start_t}")
-        return None, float('inf')
+        return None
     
-    POSITION_SCALE = 100.0
-    
-    # Find SDC
+    # find SDC:
     sdc_id = None
     if scenario is not None:
         sdc_track = scenario.tracks[scenario.sdc_track_index]
         sdc_id = sdc_track.id
     
-    agent_trajectories = {}
+    agent_trajectories = {}     # Dictionary to track positions by agent_id: {agent_id: {'gt': [(t, pos), ...], 'pred': [(t, pos), ...]}}
     
     with torch.no_grad():
         # WARM UP GRU: Run through timesteps 0 to start_t to build up temporal context
@@ -529,89 +281,47 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             warm_graph = batched_graph_sequence[warm_t]
             if warm_graph.x is not None:
                 agent_ids_warm = getattr(warm_graph, 'agent_ids', None)
-                _ = model(warm_graph.x, warm_graph.edge_index,
+                edge_w = warm_graph.edge_attr if use_edge_weights else None
+                _ = model(warm_graph.x, warm_graph.edge_index, edge_weight=edge_w,
                          batch=warm_graph.batch, batch_size=B, batch_num=0, timestep=warm_t,
                          agent_ids=agent_ids_warm)
         print(f"  [VIZ] GRU warmup complete. Starting rollout from t={start_t}")
         
         start_graph = batched_graph_sequence[start_t]
+        start_scenario_indices, start_agent_ids, start_pos = filter_to_scenario(start_graph, 0, B)   # filter to only first scenario
         
-        # Filter to only first scenario (batch_idx=0) when B > 1
-        if B > 1 and hasattr(start_graph, 'batch'):
-            start_batch_mask = (start_graph.batch == 0)
-            start_scenario_indices = torch.where(start_batch_mask)[0].cpu().numpy()
-        else:
-            start_scenario_indices = np.arange(start_graph.num_nodes)
-        
-        if hasattr(start_graph, 'pos') and start_graph.pos is not None:
-            all_start_pos = start_graph.pos.cpu().numpy()
-            start_pos = all_start_pos[start_scenario_indices]
-        else:
-            start_pos = np.zeros((len(start_scenario_indices), 2))
-        
-        if hasattr(start_graph, 'agent_ids'):
-            all_start_agent_ids = list(start_graph.agent_ids)
-            start_agent_ids = [all_start_agent_ids[i] for i in start_scenario_indices if i < len(all_start_agent_ids)]
-        else:
-            start_agent_ids = [i for i in start_scenario_indices]
-        
-        # Find persistent agents (only from first scenario in batch)
+        # find persistent agents (only from first scenario in batch (batch_idx=0)) - we can only properly track agents that exist at ALL timesteps 
         persistent_agent_ids = set(start_agent_ids)
         for step in range(actual_rollout_steps):
             target_t = start_t + step + 1
             if target_t >= T:
                 break
+
             target_graph = batched_graph_sequence[target_t]
-            
-            # Filter to only first scenario
-            if B > 1 and hasattr(target_graph, 'batch'):
-                target_batch_mask = (target_graph.batch == 0)
-                target_scenario_indices_check = torch.where(target_batch_mask)[0].cpu().numpy()
-            else:
-                target_scenario_indices_check = np.arange(target_graph.num_nodes)
-            
-            if hasattr(target_graph, 'agent_ids'):
-                all_target_agent_ids = list(target_graph.agent_ids)
-                target_agent_ids_set = set(all_target_agent_ids[i] for i in target_scenario_indices_check if i < len(all_target_agent_ids))
-            else:
-                target_agent_ids_set = set(target_scenario_indices_check)
-            
-            persistent_agent_ids = persistent_agent_ids.intersection(target_agent_ids_set)
+            target_scenario_indices, target_agent_ids, target_pos = filter_to_scenario(target_graph, 0, B)   # filter to only first scenario
+
+            persistent_agent_ids = persistent_agent_ids.intersection(set(target_agent_ids))
         
-        # Initialize trajectories
+        if enable_debug_viz:
+            print(f"  [DEBUG VIZ] {len(persistent_agent_ids)} agents persist through all {actual_rollout_steps} steps")
+        
+        # initialize trajectories only for persistent agents
         for agent_id in persistent_agent_ids:
-            if agent_id in start_agent_ids:
+            if agent_id in start_agent_ids:     # find this agent's index in start_graph (first scenario graphs that are not for warmup)
                 local_idx = start_agent_ids.index(agent_id)
                 agent_trajectories[agent_id] = {
                     'gt': [(start_t, start_pos[local_idx].copy())],
                     'pred': [(start_t, start_pos[local_idx].copy())]
                 }
         
-        # Collect GT positions (only from first scenario)
+        # collect GT positions for persistent agents (only from first scenario)
         for step in range(actual_rollout_steps):
             target_t = start_t + step + 1
             if target_t >= T:
                 break
+
             target_graph = batched_graph_sequence[target_t]
-            
-            # Filter to only first scenario
-            if B > 1 and hasattr(target_graph, 'batch'):
-                target_batch_mask = (target_graph.batch == 0)
-                target_scenario_indices = torch.where(target_batch_mask)[0].cpu().numpy()
-            else:
-                target_scenario_indices = np.arange(target_graph.num_nodes)
-            
-            if hasattr(target_graph, 'agent_ids'):
-                all_target_agent_ids = list(target_graph.agent_ids)
-                target_agent_ids = [all_target_agent_ids[i] for i in target_scenario_indices if i < len(all_target_agent_ids)]
-            else:
-                target_agent_ids = [i for i in target_scenario_indices]
-            
-            if hasattr(target_graph, 'pos') and target_graph.pos is not None:
-                all_target_pos = target_graph.pos.cpu().numpy()
-                target_pos = all_target_pos[target_scenario_indices]
-            else:
-                target_pos = None
+            target_scenario_indices, target_agent_ids, target_pos = filter_to_scenario(target_graph, 0, B)   # filter to only first scenario
             
             for local_idx, agent_id in enumerate(target_agent_ids):
                 if agent_id in agent_trajectories:
@@ -619,14 +329,15 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         pos = target_pos[local_idx].copy()
                     else:
                         last_pos = agent_trajectories[agent_id]['gt'][-1][1]
-                        if target_graph.y is not None and local_idx < target_graph.y.shape[0]:
-                            disp = target_graph.y[local_idx].cpu().numpy() * POSITION_SCALE
+                        global_idx = target_scenario_indices[local_idx]
+                        if target_graph.y is not None and global_idx < target_graph.y.shape[0]:
+                            disp = target_graph.y[global_idx].cpu().numpy() * POSITION_SCALE
                             pos = last_pos + disp
                         else:
                             pos = last_pos
                     agent_trajectories[agent_id]['gt'].append((target_t, pos))
         
-        # Autoregressive rollout
+        # autoregressive rollout for predictions - track predicted position per persistent agent:
         agent_pred_positions = {}
         for agent_id in persistent_agent_ids:
             if agent_id in start_agent_ids:
@@ -634,7 +345,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 agent_pred_positions[agent_id] = start_pos[local_idx].copy()
         
         graph_for_prediction = start_graph
+        completed_prediction_steps = 0
         
+        # build agent_id -> GT position mapping for all timesteps (for correct error calculation)
+        # only include agents from batch 0 to avoid mixing up positions from different scenarios
+        gt_positions_by_agent_and_time = {}
         for step in range(actual_rollout_steps):
             target_t = start_t + step + 1
             if target_t >= T:
@@ -642,19 +357,30 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             
             target_graph = batched_graph_sequence[target_t]
             
-            # Filter to only first scenario for predictions
-            if B > 1 and hasattr(graph_for_prediction, 'batch'):
-                pred_batch_mask = (graph_for_prediction.batch == 0)
-                pred_scenario_indices = torch.where(pred_batch_mask)[0].cpu().numpy()
-            else:
-                pred_scenario_indices = np.arange(graph_for_prediction.num_nodes)
+            if hasattr(target_graph, 'pos') and target_graph.pos is not None:
+                pos_at_t = target_graph.pos.cpu().numpy()
+                
+                # Filter to only first scenario (batch_idx=0) when B > 1
+                if B > 1 and hasattr(target_graph, 'batch'):
+                    batch0_mask = (target_graph.batch == 0)
+                    batch0_indices = torch.where(batch0_mask)[0].cpu().numpy()
+                else:
+                    batch0_indices = np.arange(target_graph.num_nodes)
+                
+                if hasattr(target_graph, 'agent_ids'):
+                    all_agent_ids = list(target_graph.agent_ids)
+                    for local_idx, global_idx in enumerate(batch0_indices):
+                        if global_idx < len(all_agent_ids) and global_idx < pos_at_t.shape[0]:
+                            aid = all_agent_ids[global_idx]
+                            if aid not in gt_positions_by_agent_and_time:
+                                gt_positions_by_agent_and_time[aid] = {}
+                            gt_positions_by_agent_and_time[aid][t] = pos_at_t[global_idx].copy()
             
-            if hasattr(graph_for_prediction, 'agent_ids'):
-                all_current_agent_ids = list(graph_for_prediction.agent_ids)
-                current_agent_ids = [all_current_agent_ids[i] for i in pred_scenario_indices if i < len(all_current_agent_ids)]
-            else:
-                current_agent_ids = [i for i in pred_scenario_indices]
-            
+
+
+
+
+
             # Check node count match (no need to check since we're working with batched graphs that should maintain structure)
             # Note: When B > 1, both graphs have nodes from all scenarios, so total count should match
             # if graph_for_prediction.x.shape[0] != target_graph.num_nodes:
@@ -970,7 +696,6 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     final_horizon_error = horizon_errors[-1] if horizon_errors else float('inf')
     return filepath, final_horizon_error
 
-
 def train_epoch_autoregressive(model, dataloader, optimizer, device, 
                                sampling_prob, num_rollout_steps, is_parallel, scaler=None, epoch=0, total_epochs=40):
     """Train one epoch with scheduled sampling for autoregressive prediction (with optional AMP).
@@ -984,15 +709,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_cosine = 0.0
     steps = 0
     count = 0
-    
-    # NEW APPROACH: Keep GT velocity features, only update position
-    # This ensures the model sees correct kinematic features for each agent
-    # while learning to predict displacement from current (possibly offset) position to GT next position
-    velocity_smoothing = 0.0  # Not used anymore since we keep GT features
-    update_velocity = False   # Keep GT velocity features - they're already correct
-    
-    if epoch == 0 or epoch % 5 == 0:
-        print(f"  [GT Features] Using GT velocity features (update_velocity=False) for stable agent differentiation")
+
+    # TODO: velocity smoothing or only position update?    
+
     
     base_model = model.module if is_parallel else model
     use_amp_local = scaler is not None and torch.cuda.is_available()
@@ -1000,9 +719,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     for batch_idx, batch_dict in enumerate(dataloader):
         batched_graph_sequence = batch_dict["batch"]
         B, T = batch_dict["B"], batch_dict["T"]
-        
-        for t in range(T):
-            batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+        for t in range(T): batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
         
         num_nodes = batched_graph_sequence[0].num_nodes
         num_edges = batched_graph_sequence[0].edge_index.size(1)
@@ -1040,14 +757,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         effective_rollout = min(curriculum_steps, T - 1)
         if effective_rollout < 1:
             continue
+        print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
         
-        # Log curriculum progress occasionally
-        if batch_idx == 0 and epoch % 5 == 0:
-            print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
-        
-        # Position scale for computing targets
-        POSITION_SCALE = 100.0
-        
+        # TODO: Do not use simplified method:
         # SIMPLIFIED: Do ONE rollout per batch starting from t=0
         # This is cleaner and more effective than trying many starting points
         # Each batch contains 48 scenarios, so we get plenty of diversity
@@ -1056,16 +768,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         if current_graph.y is None:
             continue
         
-        # GRU hidden states were reset at batch start (line ~973)
-        # No need to reset again here
+        # GRU hidden states were reset at batch start, no need to reset again here
         
         rollout_loss = None
         graph_for_prediction = current_graph
         is_using_predicted_positions = False  # Track if we're using our predictions
-        accumulated_mse = 0.0
-        accumulated_cosine = 0.0
-        num_steps_counted = 0
-        
+
         for step in range(effective_rollout):
             target_t = t + step + 1
             if target_t >= T:
@@ -1156,18 +864,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 pred_indices = None
                 target_indices = None
             
-            # Safety: Check input features for NaN before forward pass
+            # Safety check input features for NaN before forward pass
             if torch.isnan(graph_for_prediction.x).any():
                 print(f"  [ERROR] NaN in input features at batch {batch_idx}, t={t}, step={step}! Skipping rollout.")
-                # Skip this entire rollout
                 break
             
             # GAT forward pass with optional AMP and agent_ids for per-agent GRU tracking
             with torch.amp.autocast('cuda', enabled=use_amp_local):
+                edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
                 agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
                 pred = model(
                     graph_for_prediction.x,
                     graph_for_prediction.edge_index,
+                    edge_weight=edge_w,
                     batch=graph_for_prediction.batch,
                     batch_size=B,
                     batch_num=batch_idx,
@@ -1175,16 +884,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     agent_ids=agent_ids_for_model
                 )
                 
-                # Safety: Check for NaN in model output and reset GRU if needed
+                # Safety check for NaN in model output and reset GRU if needed
                 if torch.isnan(pred).any():
                     print(f"  [ERROR] NaN in model output at batch {batch_idx}, step {step}! Resetting GRU and skipping.")
-                    # Reset GRU to prevent NaN propagation
-                    base_model.reset_gru_hidden_states(
-                        batch_size=B,
-                        agents_per_scenario=agents_per_scenario,
-                        device=device
-                    )
-                    # Skip this rollout
+                    # reset GRU to prevent NaN propagation
+                    base_model.reset_gru_hidden_states(batch_size=B, agents_per_scenario=agents_per_scenario, device=device)
                     break
                 
                 # Apply alignment if needed
@@ -1280,27 +984,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # Check for NaN in predictions or targets before computing loss
                 if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
                     print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
-                    # Skip this step's loss
                     continue
                 
-                # ============== IMPROVED LOSS FUNCTION ==============
-                # MSE between predicted and target displacement (per-agent)
-                mse_loss = F.mse_loss(pred_aligned, target)
+                # loss:
                 
-                # Huber loss (smooth L1) - more robust to outliers
-                huber_loss = F.smooth_l1_loss(pred_aligned, target)
-                
-                # Direction loss: cosine similarity between prediction and target
-                # This helps with direction even when magnitude is off
+                mse_loss = F.mse_loss(pred_aligned, target)     # MSE between predicted and target displacement (per-agent)
+                huber_loss = F.smooth_l1_loss(pred_aligned, target)     # Huber loss (smooth L1) - more robust to outliers
                 pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                 target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
-                cosine_loss = (1 - cos_sim).mean()
-                
-                # Magnitude loss - ensure predicted displacement has correct length
+                cosine_loss = (1 - cos_sim).mean()      # Direction loss: cosine similarity between prediction and target
                 pred_magnitude = torch.norm(pred_aligned, dim=1)
                 target_magnitude = torch.norm(target, dim=1)
-                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
+                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)   # Magnitude loss - ensure predicted displacement has correct length
                 
                 # Final NaN check on loss values
                 if torch.isnan(mse_loss) or torch.isnan(cosine_loss) or torch.isnan(huber_loss):
@@ -1393,26 +1089,23 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     graph_for_prediction = batched_graph_sequence[target_t]
                     is_using_predicted_positions = False  # Back to GT positions
         
-        # End of single rollout - do backward pass immediately
+        # end of single rollout - do backward pass immediately
         if rollout_loss is not None:
             # Check for NaN in loss before backward
             if torch.isnan(rollout_loss):
                 print(f"  [ERROR] NaN in rollout loss at batch {batch_idx}! Skipping backward pass.")
                 continue
             
-            # Normalize by number of rollout steps for consistent gradient magnitudes
-            avg_loss = rollout_loss / max(1, count)
+            avg_loss = rollout_loss / max(1, count)     # Normalize by number of rollout steps for consistent gradient magnitudes
             
             # Backward pass with optional AMP scaling
             if use_amp_local:
                 scaler.scale(avg_loss).backward()
                 scaler.unscale_(optimizer)
-                # Check for NaN in gradients
                 grad_norm = clip_grad_norm_(model.parameters(), gradient_clip_value)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):    # Check for NaN in gradients
                     print(f"  [ERROR] NaN/Inf in gradients (norm={grad_norm})! Skipping optimizer step.")
                     optimizer.zero_grad()
-                    # CRITICAL: Must call scaler.update() to reset scaler state even when skipping step
                     scaler.update()
                     continue
                 scaler.step(optimizer)
@@ -1436,7 +1129,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             print(f"  Loss={loss_val/max(1,count):.4f}, Sampling prob={sampling_prob:.2f}")
             print(f"  [METRICS] MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
     
-    # Print epoch summary with RMSE in meters
+
     final_mse = total_mse / max(1, count)
     final_rmse = (final_mse ** 0.5) * 100.0
     final_loss = total_loss / max(1, steps)
@@ -1455,11 +1148,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         'cosine_sim': final_cosine
     }
 
-
 def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel, epoch=0, total_epochs=40):
     """Evaluate GAT model with full autoregressive rollout (no teacher forcing).
-    
-    Uses fixed velocity smoothing for consistency.
+    Computes:
+    - ADE (Average Displacement Error): mean displacement error across all timesteps
+    - FDE (Final Displacement Error): displacement error at the last timestep
     """
     model.eval()
     total_loss = 0.0
@@ -1468,6 +1161,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     steps = 0
     count = 0
     
+    # TODO: the GT velocity from dataset should not be used for evaluation, model can only know current and previous node features
     # NEW APPROACH: Keep GT velocity features, only update position
     velocity_smoothing = 0.0  # Not used
     update_velocity = False   # Keep GT features
@@ -1475,6 +1169,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     horizon_mse = [0.0] * num_rollout_steps
     horizon_cosine = [0.0] * num_rollout_steps
     horizon_counts = [0] * num_rollout_steps
+    
+    # Track displacement errors per agent per scenario for ADE/FDE calculation
+    all_agent_errors = []  # List of [num_agents, num_steps] arrays
     
     base_model = model.module if is_parallel else model
     
@@ -1486,8 +1183,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             batched_graph_sequence = batch_dict["batch"]
             B, T = batch_dict["B"], batch_dict["T"]
             
-            for t in range(T):
-                batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
+            for t in range(T): batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
             
             num_nodes = batched_graph_sequence[0].num_nodes
             
@@ -1507,12 +1203,10 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             )
             
             start_t = T // 3
-            effective_rollout = min(num_rollout_steps, T - start_t - 1)
+            effective_rollout = min(num_rollout_steps, T - start_t - 1)  # cap rollout to available timesteps
             if effective_rollout < 1:
                 continue
-            
-            # Position scale for computing targets
-            POSITION_SCALE = 100.0
+
             
             # WARM UP GRU: Run through timesteps 0 to start_t to build temporal context
             # This matches training which processes sequences from t=0
@@ -1571,6 +1265,22 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 
                 mse = F.mse_loss(pred, target)
                 
+                # Track per-agent displacement error at each step for ADE/FDE
+                step_errors_meters = torch.norm(pred - target, dim=1) * POSITION_SCALE  # [num_agents]
+                
+                # Initialize or accumulate per-agent errors for this rollout
+                if step == 0:
+                    # Start new rollout tracking: [num_agents, num_steps]
+                    current_rollout_errors = torch.zeros(pred.shape[0], effective_rollout, device=device)
+                
+                # Store errors for this step
+                if step < effective_rollout and step_errors_meters.shape[0] == current_rollout_errors.shape[0]:
+                    current_rollout_errors[:, step] = step_errors_meters
+                
+                # At final step, save rollout errors
+                if step == effective_rollout - 1:
+                    all_agent_errors.append(current_rollout_errors.cpu().numpy())
+                
                 # Debug: print position drift for first batch
                 if batch_idx == 0 and not debug_printed:
                     pos_drift = 0.0
@@ -1609,6 +1319,26 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     
+    # Compute ADE, FDE, and Miss Rate from all_agent_errors
+    # ADE: Average Displacement Error - mean error across all timesteps and agents
+    # FDE: Final Displacement Error - error at the last timestep
+    # Miss Rate: Percentage of endpoints with error > 2.0m
+    if all_agent_errors:
+        # Concatenate all rollout errors: [total_agents, num_steps]
+        all_errors = np.concatenate(all_agent_errors, axis=0)  # [total_agents, num_steps]
+        
+        # ADE: mean across all agents and all timesteps
+        ade = float(np.mean(all_errors))
+        
+        # FDE: mean of final timestep errors across all agents
+        fde = float(np.mean(all_errors[:, -1]))
+        
+        total_agents = all_errors.shape[0]
+    else:
+        ade = 0.0
+        fde = 0.0
+        total_agents = 0
+    
     # Print horizon error progression (every 10th step)
     final_mse = total_mse / max(1, count)
     final_rmse_meters = (final_mse ** 0.5) * 100.0
@@ -1620,64 +1350,82 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             print(f"t{h+1}={rmse_h:.1f}m ", end="")
     print()
     
+    # Print key metrics (ADE/FDE like VectorNet)
+    print(f"\n[VALIDATION] ADE: {ade:.2f}m | FDE: {fde:.2f}m (across {total_agents} agents)")
+    
     return {
         'loss': total_loss / max(1, steps),
         'mse': total_mse / max(1, count),
         'cosine_sim': total_cosine / max(1, count),
         'horizon_mse': horizon_avg_mse,
-        'horizon_cosine': horizon_avg_cosine
+        'horizon_cosine': horizon_avg_cosine,
+        'ade': ade,
+        'fde': fde
     }
 
-
 def run_autoregressive_finetuning(
-    pretrained_checkpoint="./checkpoints/gat/best_model.pt",
-    pretrained_checkpoint_2="./checkpoints/gat/best_model_batched.pt",
-    train_path="./data/graphs/training/training_seqlen90.hdf5",
-    val_path="./data/graphs/validation/validation_seqlen90.hdf5",
-    num_rollout_steps=5,
-    num_epochs=50,
-    sampling_strategy='linear'
-):
-    """Fine-tune pre-trained GAT model for autoregressive multi-step prediction."""
+        model_type="gat",
+        pretrained_checkpoint="./checkpoints/gat/best_model.pt",
+        pretrained_checkpoint_2="./checkpoints/gat/best_model_batched.pt",
+        pretrained_checkpoint_3="./checkpoints/gcn/best_model.pt",
+        pretrained_checkpoint_4="./checkpoints/gcn/best_model_batched.pt",
+        train_path="./data/graphs/training/training_seqlen90.hdf5",
+        val_path="./data/graphs/validation/validation_seqlen90.hdf5",
+        num_rollout_steps=5,
+        num_epochs=50,
+        sampling_strategy='linear'
+    ):
+    """Fine-tune pre-trained model for autoregressive multi-step prediction."""
     
-    # Construct checkpoint filename based on training script's naming convention
-    # Format: best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt
+    # construct checkpoint filename based on training script's naming convention:
     checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
-    pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
-    
-    # Load pre-trained model - try batched version first, then fallback to simple names
+    if model_type == "gat":
+        pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
+        os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
+        os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
+    elif model_type == "gcn":
+        pretrained_checkpoint_batched = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
+        os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
+        os.makedirs(gcn_viz_dir_autoreg, exist_ok=True)
+
+    # Load pre-trained model:
     checkpoint = None
     model = None
     is_parallel = False
-    
     if os.path.exists(pretrained_checkpoint_batched):
         print(f"Found batched checkpoint: {pretrained_checkpoint_batched}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched, device)
+        pretrained_checkpoint = pretrained_checkpoint_batched
     elif pretrained_checkpoint is not None and os.path.exists(pretrained_checkpoint):
         print(f"Found checkpoint: {pretrained_checkpoint}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint, device)
     elif pretrained_checkpoint_2 is not None and os.path.exists(pretrained_checkpoint_2):
         print(f"Found checkpoint: {pretrained_checkpoint_2}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_2, device)
+        pretrained_checkpoint = pretrained_checkpoint_2
+    elif pretrained_checkpoint_3 is not None and os.path.exists(pretrained_checkpoint_3):
+        print(f"Found checkpoint: {pretrained_checkpoint_3}")
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_3, device)
+        pretrained_checkpoint = pretrained_checkpoint_3
+    elif pretrained_checkpoint_4 is not None and os.path.exists(pretrained_checkpoint_4):
+        print(f"Found checkpoint: {pretrained_checkpoint_4}")
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_4, device)
+        pretrained_checkpoint = pretrained_checkpoint_4
     else:
         raise FileNotFoundError(
             f"No valid checkpoint found. Checked:\n"
             f"  - {pretrained_checkpoint_batched}\n"
             f"  - {pretrained_checkpoint}\n"
-            f"  - {pretrained_checkpoint_2}"
+            f"  - {pretrained_checkpoint_2}\n"
+            f"  - {pretrained_checkpoint_3}\n"
+            f"  - {pretrained_checkpoint_4}"
         )
-
-
-    # Create directories
-    os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
-    os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
     
-    # Initialize wandb
     wandb.login()
     run = wandb.init(
         project=project_name,
         config={
-            "model": "SpatioTemporalGATBatched_Autoregressive",
+            "model": "SpatioTemporalGATBatched_Autoregressive" if model_type == "gat" else "SpatioTemporalGCNBatched_Autoregressive",
             "pretrained_from": pretrained_checkpoint,
             "batch_size": batch_size,
             "learning_rate": learning_rate * 0.1,
@@ -1686,37 +1434,19 @@ def run_autoregressive_finetuning(
             "prediction_horizon": f"{num_rollout_steps * 0.1}s",
             "sampling_strategy": sampling_strategy,
             "epochs": num_epochs,
-            "use_gat": True,
-            "early_stopping_patience": early_stopping_patience
+            "use_gat": model_type == "gat"
         },
-        name=f"GAT_Autoregressive_finetune_{num_rollout_steps}steps",
+        name=f"GAT_Autoregressive_finetune_{num_rollout_steps}steps" if model_type == "gat" else f"GCN_Autoregressive_finetune_{num_rollout_steps}steps",
         dir="../wandb"
     )
     
     wandb.watch(model, log='all', log_freq=10)
     
-    # Define custom x-axes for wandb metrics
-    # Use simple wandb logging - no custom step metrics to avoid step conflicts
-    # All metrics will be plotted against wandb's internal step counter
-    # Epoch is logged as a value, not as a step metric
-    
-    # Use lower learning rate to prevent NaN gradients during scheduled sampling
-    # Original was learning_rate * 0.1, now using learning_rate * 0.01 for stability
-    finetune_lr = learning_rate * 0.01  # 10x smaller for stable finetuning
+    finetune_lr = learning_rate * 0.05      # make lower to help with stability (prevent NaN gradients during scheduled sampling)
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
-                                   min_lr=1e-7)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7)
     
-    # Initialize early stopping - now based on horizon error, not training loss
-    early_stopper = EarlyStopping(
-        patience=early_stopping_patience,
-        min_delta=1.0,  # 1 meter minimum improvement in horizon error
-        target_error=5.0,  # Target: 5m final horizon error
-        verbose=True
-    )
-    
-    # Load datasets
-    try:
+    try:        # Load datasets
         train_dataset = HDF5ScenarioDataset(train_path, seq_len=sequence_length)
         print(f"Loaded training dataset: {len(train_dataset)} scenarios")
     except FileNotFoundError:
@@ -1724,7 +1454,6 @@ def run_autoregressive_finetuning(
         run.finish()
         return None
     
-    # Load validation dataset with optional caching and subsampling
     val_dataset = None
     try:
         val_dataset_full = HDF5ScenarioDataset(
@@ -1734,8 +1463,8 @@ def run_autoregressive_finetuning(
             max_cache_size=max_validation_scenarios
         )
         
-        # Subsample validation set for faster evaluation during finetuning
-        max_val_scenarios = max_validation_scenarios  # From config.py
+        # subsample validation set for faster evaluation during finetuning
+        max_val_scenarios = max_validation_scenarios
         if len(val_dataset_full) > max_val_scenarios:
             val_indices = random.sample(range(len(val_dataset_full)), max_val_scenarios)
             val_dataset = Subset(val_dataset_full, val_indices)
@@ -1780,14 +1509,7 @@ def run_autoregressive_finetuning(
             print(f"  [WARNING] Validation loader is empty! Disabling validation.")
             val_loader = None
     
-    # ============== DISABLE AMP FOR FINETUNING ==============
-    # AMP (float16) causes NaN in long autoregressive rollouts due to:
-    # 1. Accumulated numerical errors over 89 steps
-    # 2. Velocity feedback amplifying small FP16 errors
-    # 3. GradScaler having issues with inconsistent loss magnitudes
-    # OVERRIDE: Force AMP off for stability during autoregressive finetuning
     use_amp_finetune = False  # DISABLED - use float32 for stability
-    
     print(f"\n{'='*80}")
     print(f"GAT AUTOREGRESSIVE FINE-TUNING (BATCHED)")
     print(f"{'='*80}")
@@ -1799,15 +1521,18 @@ def run_autoregressive_finetuning(
     print(f"Sampling strategy: {sampling_strategy} (with 5-epoch warmup)")
     print(f"Fine-tuning LR: {finetune_lr}")
     print(f"Epochs: {num_epochs}")
-    print(f"Early stopping: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
-    print(f"Validation: Disabled (using training visualizations)")
+    print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
     print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
     print(f"Checkpoints: {gat_checkpoint_dir_autoreg}")
     print(f"Visualizations: {gat_viz_dir_autoreg}")
     print(f"{'='*80}\n")
+
+    if num_rollout_steps >= sequence_length - 1:
+        print(f"\n[WARNING] Requested {num_rollout_steps} rollout steps but sequence length is only {sequence_length}!")
+        print(f"          Training will use at most {sequence_length - 2} steps (T-1 timesteps).")
+        print(f"          Consider reducing rollout steps or increasing sequence length.")
     
-    # Initialize GradScaler for AMP (DISABLED for finetuning stability)
     scaler = None
     if use_amp_finetune and torch.cuda.is_available():
         scaler = torch.amp.GradScaler('cuda')
@@ -1840,14 +1565,22 @@ def run_autoregressive_finetuning(
             print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted, {(1-sampling_prob)*100:.0f}% GT input.")
         print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) - target: {num_rollout_steps} steps")
         
+
         train_metrics = train_epoch_autoregressive(
             model, train_loader, optimizer, device, 
             sampling_prob, num_rollout_steps, is_parallel, scaler=scaler, epoch=epoch, total_epochs=num_epochs
         )
         
-        # Skip validation - evaluate autoregressive performance via visualization on training data
-        # The per-step training metrics with teacher forcing don't reflect true autoregressive performance
-        scheduler.step(train_metrics['loss'])
+        # Validation (always full autoregressive)
+        val_metrics = None
+        if val_loader is not None:
+            print(f"  Running validation...")
+            val_metrics = evaluate_autoregressive(
+                model, val_loader, device, num_rollout_steps, is_parallel, epoch=epoch, total_epochs=num_epochs
+            )
+            scheduler.step(val_metrics['loss'])
+        else:
+            scheduler.step(train_metrics['loss'])
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -1865,36 +1598,99 @@ def run_autoregressive_finetuning(
             "learning_rate": current_lr
         }
         
+        if val_metrics:
+            val_rmse_meters = (val_metrics['mse'] ** 0.5) * 100.0
+            log_dict.update({
+                "val/loss": val_metrics['loss'],
+                "val/mse": val_metrics['mse'],
+                "val/rmse_meters": val_rmse_meters,
+                "val/cosine_sim": val_metrics['cosine_sim'],
+                "val/ade": val_metrics['ade'],
+                "val/fde": val_metrics['fde']
+            })
+            # Per-horizon metrics
+            for h in range(num_rollout_steps):
+                log_dict[f"val/mse_horizon_{h+1}"] = val_metrics['horizon_mse'][h]
+                log_dict[f"val/cosine_horizon_{h+1}"] = val_metrics['horizon_cosine'][h]
+        
         # Track horizon errors and visualization paths for logging
         epoch_horizon_errors = []
         epoch_viz_paths = []
         
-        # Visualize using TRAINING data (more reliable than validation)
-        if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
-            try:
-                print(f"\n  Creating visualizations for epoch {epoch+1} (using training data)...")
-                # Create visualizations for up to max_scenario_files_for_viz scenarios from training set
-                viz_count = 0
-                for viz_batch in train_loader:
-                    if viz_count >= max_scenario_files_for_viz:
-                        break
-                    result = visualize_autoregressive_rollout(
-                        model, viz_batch, epoch, num_rollout_steps, 
-                        device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
-                    )
-                    if isinstance(result, tuple):
-                        filepath, final_error = result
-                        epoch_viz_paths.append(filepath)
-                        if final_error != float('inf') and not np.isnan(final_error):
-                            epoch_horizon_errors.append(final_error)
-                    viz_count += 1
-                print(f"  Created {viz_count} visualizations\n")
-            except Exception as e:
-                import traceback
-                print(f"  Warning: Visualization failed: {e}")
-                traceback.print_exc()
+        # Visualize using validation data if available, otherwise training data
+        if val_metrics:
+            # Visualization every N epochs or on first/last epoch (4 scenarios)
+            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
+                try:
+                    print(f"\n  Creating visualizations for epoch {epoch+1}...")
+                    viz_count = 0
+                    for viz_batch in val_loader:
+                        if viz_count >= 4:
+                            break
+                        result = visualize_autoregressive_rollout(
+                            model, viz_batch, epoch, num_rollout_steps, 
+                            device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
+                        )
+                        if isinstance(result, tuple):
+                            filepath, final_error = result
+                            epoch_viz_paths.append(filepath)
+                            if final_error != float('inf') and not np.isnan(final_error):
+                                epoch_horizon_errors.append(final_error)
+                        viz_count += 1
+                    print(f"  Created {viz_count} visualizations\n")
+                except Exception as e:
+                    import traceback
+                    print(f"  Warning: Visualization failed: {e}")
+                    traceback.print_exc()
+            
+            # Save best model based on validation loss
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+                save_path = os.path.join(gat_checkpoint_dir_autoreg, save_filename)
+                model_to_save = get_model_for_saving(model, is_parallel)
+                checkpoint_data = {
+                    'epoch': epoch,
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'val_loss': val_metrics['loss'],
+                    'train_loss': train_metrics['loss'],
+                    'num_rollout_steps': num_rollout_steps,
+                    'sampling_strategy': sampling_strategy
+                }
+                # Preserve original config if it exists
+                if 'config' in checkpoint:
+                    checkpoint_data['config'] = checkpoint['config']
+                torch.save(checkpoint_data, save_path)
+                print(f"  -> Saved best model to {save_filename} (val_loss: {val_metrics['loss']:.4f})")
+            
+        else:
+            # No validation - use training data for visualization
+            if (epoch % autoreg_visualize_every_n_epochs == 0) or (epoch == num_epochs - 1) or (epoch == 0):
+                try:
+                    print(f"\n  Creating visualizations for epoch {epoch+1} (using TRAINING data)...")
+                    viz_count = 0
+                    for viz_batch in train_loader:
+                        if viz_count >= max_scenario_files_for_viz:
+                            break
+                        result = visualize_autoregressive_rollout(
+                            model, viz_batch, epoch, num_rollout_steps, 
+                            device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
+                        )
+                        if isinstance(result, tuple):
+                            filepath, final_error = result
+                            epoch_viz_paths.append(filepath)
+                            if final_error != float('inf') and not np.isnan(final_error):
+                                epoch_horizon_errors.append(final_error)
+                        viz_count += 1
+                    print(f"  Created {viz_count} visualizations\n")
+                except Exception as e:
+                    import traceback
+                    print(f"  Warning: Visualization failed: {e}")
+                    traceback.print_exc()
         
-        # Calculate average horizon error and add to log_dict
+        # Calculate average horizon error and add to log_dict (for visualization-based tracking)
         if epoch_horizon_errors:
             avg_horizon_error = np.mean(epoch_horizon_errors)
             print(f"\n  [EPOCH {epoch+1}] Average Final Horizon Error: {avg_horizon_error:.2f}m (across {len(epoch_horizon_errors)} scenarios)")
@@ -1903,9 +1699,6 @@ def run_autoregressive_finetuning(
             log_dict["horizon/avg_final_error_m"] = avg_horizon_error
             log_dict["horizon/min_error_m"] = min(epoch_horizon_errors)
             log_dict["horizon/max_error_m"] = max(epoch_horizon_errors)
-        else:
-            # Fallback to training loss if no visualizations
-            avg_horizon_error = train_metrics['loss'] * 100  # Scale to be comparable
         
         # Add visualizations to log dict (if any were created this epoch)
         if epoch_viz_paths:
@@ -1917,45 +1710,19 @@ def run_autoregressive_finetuning(
         
         # Log all metrics for this epoch with explicit step parameter
         wandb.log(log_dict, step=epoch)
-        
-        # Determine metric to use for best model saving
-        current_metric = avg_horizon_error
-        if current_metric < best_val_loss:
-            best_val_loss = current_metric
-            save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-            save_path = os.path.join(gat_checkpoint_dir_autoreg, save_filename)
-            model_to_save = get_model_for_saving(model, is_parallel)
-            checkpoint_data = {
-                'epoch': epoch,
-                'model_state_dict': model_to_save.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': train_metrics['loss'],
-                'avg_horizon_error': avg_horizon_error if epoch_horizon_errors else None,
-                'num_rollout_steps': num_rollout_steps,
-                'sampling_strategy': sampling_strategy
-            }
-            # Preserve original config if it exists
-            if 'config' in checkpoint:
-                checkpoint_data['config'] = checkpoint['config']
-            torch.save(checkpoint_data, save_path)
-            print(f"  -> Saved best model to {save_filename} (horizon_error: {best_val_loss:.2f}m)")
-        
-        # Early stopping disabled - let training run for all epochs
-        # if early_stopper.early_stop:
-        #     print(f"\n Early stopping triggered at epoch {epoch+1}!")
-        #     break
+    
+    # Determine actual final epoch (may be earlier due to early stopping)
+    actual_final_epoch = epoch + 1
     
     # Save final model
     final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
     final_path = os.path.join(gat_checkpoint_dir_autoreg, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
-        'epoch': epoch,
+        'epoch': actual_final_epoch - 1,
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'num_rollout_steps': num_rollout_steps,
-        'early_stopped': early_stopper.early_stop
     }
     # Preserve original config if it exists
     if 'config' in checkpoint:
@@ -1965,15 +1732,237 @@ def run_autoregressive_finetuning(
     print(f"\n{'='*80}")
     print(f"GAT FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
+    print(f"Epochs completed: {actual_final_epoch}/{num_epochs}" + (" (early stopped)" if early_stopped else ""))
     best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
     print(f"Best model: {os.path.join(gat_checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
-    print(f"Best training loss: {best_val_loss:.4f}")
-    print(f"Early stopped: {early_stopper.early_stop}")
+    print(f"Best val_loss: {best_val_loss:.4f}")
     print(f"{'='*80}\n")
     
     run.finish()
     return model
+
+def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
+    """
+    Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
+    
+    The model predicts normalized displacement (dx/100, dy/100).
+    
+    Updates:
+    - Position (graph.pos): updated with predicted displacement (* 100)
+    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized (if update_velocity=True)
+    - Speed (feature 2): magnitude of new velocity, normalized (if update_velocity=True)
+    - Heading (feature 3): direction of new velocity (if update_velocity=True)
+    - Relative position to SDC (features 7-8): recalculated based on new positions
+    - Distance to SDC (feature 9): recalculated
+    - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
+    
+    Args:
+        graph: PyG Data object with node features and positions
+        pred_displacement: Predicted normalized displacement [N, 2]
+        device: Torch device
+        velocity_smoothing: EMA smoothing factor for velocity updates (0=no smoothing, 1=full smoothing)
+                           Higher values = more conservative updates, helps stabilize early training
+        update_velocity: If False, keep original velocity features (helps stabilize very early training)
+    
+    NOTE: Previously we preserved velocity features, but this caused trajectory convergence
+    because the model learned to ignore velocity and predict an "average" displacement.
+    Now we update velocity from predictions to maintain agent-specific behavior.
+    """
+    global _size_mismatch_warned
+    updated_graph = graph.clone()
+    dt = 0.1  # 0.1 second timestep
+    
+    # CRITICAL: Handle size mismatch between prediction and graph
+    # This can happen when agents enter/leave between timesteps
+    num_nodes_graph = updated_graph.x.shape[0]
+    num_nodes_pred = pred_displacement.shape[0]
+    
+    if num_nodes_pred != num_nodes_graph:
+        # Size mismatch - only update the overlapping nodes
+        # Only print warning once per epoch to avoid log spam
+        if not _size_mismatch_warned:
+            print(f"  [WARNING] Size mismatch in update_graph_with_prediction: pred={num_nodes_pred}, graph={num_nodes_graph} (suppressing further warnings)")
+            _size_mismatch_warned = True
+        num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
+        pred_displacement = pred_displacement[:num_nodes_to_update]
+        # We'll only update the first num_nodes_to_update nodes
+    else:
+        num_nodes_to_update = num_nodes_graph
+
+    # Check for NaN in predictions - if found, replace with zeros to prevent cascade
+    if torch.isnan(pred_displacement).any():
+        print(f"  [WARNING] NaN detected in predictions! Replacing with zeros to prevent cascade.")
+        pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
+        # TODO: set this displacement invalid...
+    
+    # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
+    if update_velocity:
+        # Convert predicted displacement to velocity: velocity = displacement / dt
+        # pred_displacement is normalized (actual_disp / 100)
+        # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
+        # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
+        velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
+        
+        # Get old velocity for acceleration calculation
+        old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
+        old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
+        
+        # New velocity from predictions - but clamp the raw displacement first to prevent explosion
+        # Reasonable single-step displacement: max ~3m (30 m/s * 0.1s), normalized = 0.03
+        # TIGHTER CLAMPING: 3m max to match physical limits (30 m/s * 0.1s = 3m)
+        max_disp_norm = 0.03  # 3m max per step - physically realistic limit
+        pred_disp_clamped = torch.clamp(pred_displacement, -max_disp_norm, max_disp_norm)
+        
+        new_vx_norm_raw = pred_disp_clamped[:, 0] * velocity_scale
+        new_vy_norm_raw = pred_disp_clamped[:, 1] * velocity_scale
+        
+        # Clamp to reasonable ranges (normalized values)
+        # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
+        # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
+        max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
+        new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
+        new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
+        
+        # Apply EMA smoothing to prevent sudden velocity jumps
+        # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
+        # Higher smoothing = more conservative updates (better for early training)
+        new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
+        new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
+        
+        # Calculate speed and heading from smoothed velocity
+        new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
+        new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
+        
+        # Safety: Check for NaN after velocity calculations
+        if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
+            print(f"  [ERROR] NaN in velocity features after smoothing! Keeping old values.")
+            # Keep old velocity instead of clamping to zero
+            new_vx_norm = old_vx_norm
+            new_vy_norm = old_vy_norm
+            new_speed_norm = updated_graph.x[:num_nodes_to_update, 2].clone()
+            new_heading = updated_graph.x[:num_nodes_to_update, 3].clone()
+        
+        # Calculate acceleration from velocity change (using smoothed values)
+        # acceleration = (new_v - old_v) / dt
+        # But we need to be careful: if smoothing is high, acceleration should be low
+        accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
+        ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
+        ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
+        # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
+        ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
+        ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
+        
+        # Update velocity/acceleration features
+        updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
+        updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
+        updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
+        updated_graph.x[:num_nodes_to_update, 3] = new_heading
+        updated_graph.x[:num_nodes_to_update, 5] = ax_norm
+        updated_graph.x[:num_nodes_to_update, 6] = ay_norm
+    # Else: keep original velocity features - helps stabilize early training
+    # ========================================================================
+    
+    # Only update positions
+    if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
+        # pred_displacement is normalized, multiply by 100 to get actual displacement
+        actual_displacement = pred_displacement * POSITION_SCALE
+        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
+        
+        # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
+        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
+            batch_ids = updated_graph.batch.unique()
+            for batch_id in batch_ids:
+                batch_mask = (updated_graph.batch == batch_id)
+                batch_positions = updated_graph.pos[batch_mask]
+                
+                # Assume SDC is the first node in each batch
+                sdc_pos = batch_positions[0]
+                
+                # Calculate relative positions for this batch
+                rel_pos = batch_positions - sdc_pos
+                dist_to_sdc = torch.sqrt((rel_pos ** 2).sum(dim=1))
+                
+                # Normalize and clamp
+                rel_x_norm = torch.clamp(rel_pos[:, 0] / MAX_DIST_SDC, -1.0, 1.0)
+                rel_y_norm = torch.clamp(rel_pos[:, 1] / MAX_DIST_SDC, -1.0, 1.0)
+                dist_norm = torch.clamp(dist_to_sdc / MAX_DIST_SDC, 0.0, 1.0)
+                
+                # Update features for this batch
+                batch_indices = torch.where(batch_mask)[0]
+                updated_graph.x[batch_indices, 7] = rel_x_norm
+                updated_graph.x[batch_indices, 8] = rel_y_norm
+                updated_graph.x[batch_indices, 9] = dist_norm
+        
+        # ============== EDGE REBUILDING ==============
+        # Rebuild edges based on updated positions to capture new spatial relationships
+        # This is critical for long rollouts where agents move significantly
+        if AUTOREG_REBUILD_EDGES:
+            if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
+                # Batched graph: rebuild edges per scenario, then combine
+                batch_ids = updated_graph.batch.unique()
+                all_edge_indices = []
+                all_edge_weights = []
+                
+                for batch_id in batch_ids:
+                    batch_mask = (updated_graph.batch == batch_id)
+                    batch_positions = updated_graph.pos[batch_mask]
+                    batch_indices = torch.where(batch_mask)[0]
+                    
+                    # Get valid mask from feature 4 (validity flag)
+                    valid_mask = updated_graph.x[batch_mask, 4] > 0.5
+                    
+                    # Build new edges for this batch
+                    local_edge_index, local_edge_weight = build_edge_index_using_radius(
+                        batch_positions, radius=radius, self_loops=False, 
+                        valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
+                    )
+                    
+                    # Convert local indices to global indices
+                    if local_edge_index.size(1) > 0:
+                        global_edge_index = batch_indices[local_edge_index]
+                        all_edge_indices.append(global_edge_index)
+                        all_edge_weights.append(local_edge_weight.to(device))
+                
+                # Combine all edges
+                if all_edge_indices:
+                    updated_graph.edge_index = torch.cat(all_edge_indices, dim=1)
+                    updated_graph.edge_weight = torch.cat(all_edge_weights, dim=0)
+                else:
+                    # No edges - create empty tensors
+                    updated_graph.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                    updated_graph.edge_weight = torch.zeros(0, dtype=torch.float32, device=device)
+            else:
+                # Single graph (no batching)
+                valid_mask = updated_graph.x[:, 4] > 0.5
+                new_edge_index, new_edge_weight = build_edge_index_using_radius(
+                    updated_graph.pos, radius=radius, self_loops=False,
+                    valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
+                )
+                updated_graph.edge_index = new_edge_index.to(device)
+                updated_graph.edge_weight = new_edge_weight.to(device)
+    
+    return updated_graph
+
+def filter_to_scenario(graph, scenario_idx, B):
+    if B > 1 and hasattr(graph, 'batch'):
+        graph_batch_mask = (graph.batch == scenario_idx)
+        graph_scenario_indices = torch.where(graph_batch_mask)[0].cpu().numpy()
+    else:
+        graph_scenario_indices = np.arange(graph.num_nodes)
+            
+    if hasattr(graph, 'agent_ids'):
+        all_graph_agent_ids = list(graph.agent_ids)
+        graph_agent_ids = [all_graph_agent_ids[i] for i in graph_scenario_indices if i < len(all_graph_agent_ids)]
+    else:
+        graph_agent_ids = [i for i in graph_scenario_indices]
+            
+    if hasattr(graph, 'pos') and graph.pos is not None:
+        all_graph_pos = graph.pos.cpu().numpy()
+        graph_pos = all_graph_pos[graph_scenario_indices]
+    else:
+        graph_pos = np.zeros((len(graph_scenario_indices), 2))
+    return graph_scenario_indices, graph_agent_ids, graph_pos
 
 
 if __name__ == '__main__':
@@ -1983,3 +1972,382 @@ if __name__ == '__main__':
         num_epochs=autoreg_num_epochs,
         sampling_strategy=autoreg_sampling_strategy
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
+    
+    # NEW APPROACH: Keep GT velocity features, don't update them
+    # This maintains correct agent-specific kinematic features
+    # The model learns: given current position + GT velocity, predict displacement to GT next position
+    
+    # Only update positions (keep all other features from GT)
+    if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
+        # pred_displacement is normalized, multiply by 100 to get actual displacement
+        actual_displacement = pred_displacement * POSITION_SCALE
+        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
+        
+        # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
+        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
+            batch_ids = updated_graph.batch.unique()
+            for batch_id in batch_ids:
+                batch_mask = (updated_graph.batch == batch_id)
+                batch_positions = updated_graph.pos[batch_mask]
+                
+                # Assume SDC is the first node in each batch
+                sdc_pos = batch_positions[0]
+                
+                # Calculate relative positions for this batch
+                rel_pos = batch_positions - sdc_pos
+                dist_to_sdc = torch.sqrt((rel_pos ** 2).sum(dim=1))
+                
+                # Normalize and clamp
+                rel_x_norm = torch.clamp(rel_pos[:, 0] / MAX_DIST_SDC, -1.0, 1.0)
+                rel_y_norm = torch.clamp(rel_pos[:, 1] / MAX_DIST_SDC, -1.0, 1.0)
+                dist_norm = torch.clamp(dist_to_sdc / MAX_DIST_SDC, 0.0, 1.0)
+                
+                # Update features for this batch
+                batch_indices = torch.where(batch_mask)[0]
+                updated_graph.x[batch_indices, 7] = rel_x_norm
+                updated_graph.x[batch_indices, 8] = rel_y_norm
+                updated_graph.x[batch_indices, 9] = dist_norm
+
+def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
+                                     is_parallel, save_dir=None):
+
+
+    
+    with torch.no_grad():
+        
+        
+        for step in range(actual_rollout_steps):
+            target_t = start_t + step + 1
+            if target_t >= T:
+                break
+            
+            target_graph = batched_graph_sequence[target_t]
+            
+            # Get agent IDs for the graph we're predicting from (filter to first scenario only)
+            if B > 1 and hasattr(graph_for_prediction, 'batch'):
+                pred_batch_mask = (graph_for_prediction.batch == 0)
+                pred_scenario_indices = torch.where(pred_batch_mask)[0].cpu().numpy()
+            else:
+                pred_scenario_indices = np.arange(graph_for_prediction.num_nodes)
+            
+            if hasattr(graph_for_prediction, 'agent_ids'):
+                all_current_agent_ids = list(graph_for_prediction.agent_ids)
+                current_agent_ids = [all_current_agent_ids[i] for i in pred_scenario_indices if i < len(all_current_agent_ids)]
+            else:
+                current_agent_ids = [i for i in pred_scenario_indices]
+            
+            edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
+            pred = model(graph_for_prediction.x, graph_for_prediction.edge_index,
+                        edge_weight=edge_w, batch=graph_for_prediction.batch,
+                        batch_size=B, batch_num=0, timestep=start_t + step)
+            
+            pred_disp = pred.cpu().numpy() * POSITION_SCALE
+            
+            # DEBUG: Print prediction stats on first step only
+            if step == 0 and enable_debug_viz:
+                pred_batch0 = pred_disp[pred_scenario_indices]
+                print(f"  [DEBUG VIZ] Step 0 pred disp range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]m")
+            
+            # Map predictions to persistent agents using current graph's agent ordering (only first scenario)
+            step_errors = []
+            for local_idx, agent_id in enumerate(current_agent_ids):
+                if agent_id in agent_pred_positions:
+                    # Get global index in the full batched graph
+                    global_idx = pred_scenario_indices[local_idx]
+                    if global_idx < pred_disp.shape[0]:
+                        pred_d = pred_disp[global_idx]
+                        current_pred_pos = agent_pred_positions[agent_id].copy()
+                        new_pos = current_pred_pos + pred_d
+                        agent_pred_positions[agent_id] = new_pos
+                        agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
+                        
+                        # Calculate error if GT available
+                        if agent_id in gt_positions_by_agent_and_time and target_t in gt_positions_by_agent_and_time[agent_id]:
+                            gt_next_pos = gt_positions_by_agent_and_time[agent_id][target_t]
+                            correct_target_disp = gt_next_pos - current_pred_pos
+                            step_err = np.linalg.norm(pred_d - correct_target_disp)
+                            step_errors.append(step_err)
+            
+            # Print average step error on first step only
+            if step_errors and step == 0 and enable_debug_viz:
+                print(f"  [DEBUG VIZ] Step 0 avg displacement error: {np.mean(step_errors):.2f}m")
+            
+            completed_steps = step + 1
+            
+            # NEW APPROACH: Use GT graph from next timestep with only position offset
+            # This gives the model correct GT velocity features for each agent
+            next_target_t = start_t + step + 2
+            if next_target_t < T:
+                next_gt_graph = batched_graph_sequence[next_target_t]
+                # Start with GT graph (all correct features)
+                graph_for_prediction = next_gt_graph.clone()
+                
+                # But offset position by our prediction to teach error correction
+                # Find common agents between current and next graph
+                if hasattr(next_gt_graph, 'agent_ids') and hasattr(next_gt_graph, 'batch'):
+                    next_agent_ids = list(next_gt_graph.agent_ids)
+                    next_batch = next_gt_graph.batch.cpu().numpy()
+                    
+                    # Filter to first scenario only
+                    if B > 1:
+                        next_batch0_mask = (next_gt_graph.batch == 0)
+                        next_batch0_indices = torch.where(next_batch0_mask)[0].cpu().numpy()
+                    else:
+                        next_batch0_indices = np.arange(next_gt_graph.num_nodes)
+                    
+                    # Apply position offset to common agents
+                    for local_idx, agent_id in enumerate(current_agent_ids):
+                        if agent_id in agent_pred_positions:
+                            # Find this agent in next graph
+                            for next_idx in next_batch0_indices:
+                                if next_idx < len(next_agent_ids) and next_agent_ids[next_idx] == agent_id:
+                                    global_idx = pred_scenario_indices[local_idx]
+                                    if global_idx < pred_disp.shape[0]:
+                                        # Offset position by our prediction
+                                        pred_offset = pred_disp[global_idx]
+                                        graph_for_prediction.pos[next_idx] = graph_for_prediction.pos[next_idx] + torch.from_numpy(pred_offset).to(device)
+                                    break
+            else:
+                # Fallback: use prediction-based update
+                graph_for_prediction = update_graph_with_prediction(
+                    graph_for_prediction, pred, device, update_velocity=False
+                )
+        
+        if enable_debug_viz:
+            print(f"  [DEBUG VIZ] Completed {completed_steps} prediction steps")
+        
+        # Store agent_ids_list for later use
+        agent_ids_list = list(persistent_agent_ids)
+    
+    # Calculate horizon errors using agent_trajectories
+    horizon_errors = []
+    for step in range(actual_rollout_steps):
+        target_t = start_t + step + 1
+        errors_at_step = []
+        for agent_id, traj in agent_trajectories.items():
+            gt_at_t = [pos for t, pos in traj['gt'] if t == target_t]
+            pred_at_t = [pos for t, pos in traj['pred'] if t == target_t]
+            if gt_at_t and pred_at_t:
+                error = np.sqrt(((gt_at_t[0] - pred_at_t[0]) ** 2).sum())
+                errors_at_step.append(error)
+        if errors_at_step:
+            horizon_errors.append(np.mean(errors_at_step))
+    
+    # Select agents to visualize (max 10, prioritizing SDC and moving agents)
+    max_agents_viz = 10
+    
+    # Calculate movement for each agent using the trajectory dictionary
+    agent_movements = {}
+    for agent_id, traj in agent_trajectories.items():
+        gt_positions_list = sorted(traj['gt'], key=lambda x: x[0])
+        total_movement = 0.0
+        for i in range(len(gt_positions_list) - 1):
+            pos1 = gt_positions_list[i][1]
+            pos2 = gt_positions_list[i + 1][1]
+            dist = np.sqrt(((pos2 - pos1) ** 2).sum())
+            total_movement += dist
+        agent_movements[agent_id] = total_movement
+    
+    # Select agents: SDC first, then most moving agents  
+    selected_agent_ids = []
+    if sdc_id is not None and sdc_id in agent_trajectories:
+        selected_agent_ids.append(sdc_id)
+    
+    # Add other agents sorted by movement
+    other_agent_ids = [aid for aid in agent_trajectories.keys() if aid != sdc_id]
+    other_agent_ids_sorted = sorted(other_agent_ids, key=lambda aid: agent_movements.get(aid, 0), reverse=True)
+    remaining_slots = max_agents_viz - len(selected_agent_ids)
+    selected_agent_ids.extend(other_agent_ids_sorted[:remaining_slots])
+    
+    # Assign colors by agent ID
+    agent_colors = {}
+    color_idx = 0
+    for agent_id in selected_agent_ids:
+        if agent_id == sdc_id:
+            agent_colors[agent_id] = SDC_COLOR
+        else:
+            agent_colors[agent_id] = VIBRANT_COLORS[color_idx % len(VIBRANT_COLORS)]
+            color_idx += 1
+    
+    # Calculate axis limits based on all trajectory positions
+    all_x_coords = []
+    all_y_coords = []
+    for agent_id in selected_agent_ids:
+        traj = agent_trajectories[agent_id]
+        for t, pos in traj['gt']:
+            all_x_coords.append(pos[0])
+            all_y_coords.append(pos[1])
+        for t, pos in traj['pred']:
+            all_x_coords.append(pos[0])
+            all_y_coords.append(pos[1])
+    
+    if all_x_coords and all_y_coords:
+        x_min, x_max = min(all_x_coords), max(all_x_coords)
+        y_min, y_max = min(all_y_coords), max(all_y_coords)
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_padding = max(x_range * 0.2, 15.0)
+        y_padding = max(y_range * 0.2, 15.0)
+        x_lim = (x_min - x_padding, x_max + x_padding)
+        y_lim = (y_min - y_padding, y_max + y_padding)
+    else:
+        x_lim, y_lim = None, None
+    
+    # Calculate final error for return value
+    final_error = horizon_errors[-1] if horizon_errors else 0
+    
+    # Create visualization - single plot
+    fig, ax1 = plt.subplots(1, 1, figsize=(12, 10))
+    
+    # Draw map features using shared function from visualization_functions.py
+    if scenario is not None:
+        map_features_drawn = draw_map_features(ax1, scenario, x_lim, y_lim)
+        print(f"  Drew {map_features_drawn} map features")
+    
+    # Draw trajectories for selected agents
+    from matplotlib.lines import Line2D
+    agent_legend_elements = []
+    print(f"Drawing trajectories for {len(selected_agent_ids)} agents:")
+    for agent_id in selected_agent_ids:
+        color = agent_colors[agent_id]
+        is_sdc = (agent_id == sdc_id)
+        agent_label = 'SDC' if is_sdc else f'Agent {agent_id}'
+        
+        traj = agent_trajectories[agent_id]
+        
+        # Sort by timestep
+        gt_sorted = sorted(traj['gt'], key=lambda x: x[0])
+        pred_sorted = sorted(traj['pred'], key=lambda x: x[0])
+        
+        # Extract coordinates
+        gt_traj_x = [pos[0] for t, pos in gt_sorted]
+        gt_traj_y = [pos[1] for t, pos in gt_sorted]
+        pred_traj_x = [pos[0] for t, pos in pred_sorted]
+        pred_traj_y = [pos[1] for t, pos in pred_sorted]
+        
+        # Debug: print trajectory info
+        if len(gt_sorted) > 1:
+            start_pos = gt_sorted[0][1]
+            end_pos = gt_sorted[-1][1]
+            dist = np.sqrt(((end_pos - start_pos) ** 2).sum())
+            print(f"  Agent {agent_id} ({'SDC' if is_sdc else 'other'}): {len(gt_sorted)} GT pts, {len(pred_sorted)} pred pts, GT movement length: {dist:.2f}m")
+        
+        # Draw predicted trajectory (colored dashed line) - draw first so GT is on top
+        # This is ONE continuous line connecting all predicted positions
+        if len(pred_traj_x) > 1:
+            ax1.plot(pred_traj_x, pred_traj_y, '--', color=color, linewidth=2.5, alpha=0.9, zorder=3)
+            # Mark predicted trajectory endpoint (same color, square marker)
+            ax1.scatter(pred_traj_x[-1], pred_traj_y[-1], c=color, marker='s', s=50, 
+                       edgecolors='black', linewidths=0.5, zorder=6)
+        
+        # Draw GT trajectory (black solid line) - on top
+        if len(gt_traj_x) > 1:
+            ax1.plot(gt_traj_x, gt_traj_y, '-', color='black', linewidth=1.5, alpha=0.8, zorder=4)
+            # Mark ground truth endpoint (black x marker)
+            ax1.scatter(gt_traj_x[-1], gt_traj_y[-1], c='black', marker='x', s=50, zorder=6)
+        
+        # Mark start position only (small colored circle)
+        if len(gt_traj_x) > 0:
+            ax1.scatter(gt_traj_x[0], gt_traj_y[0], c=color, marker='o', s=40, 
+                       edgecolors='black', linewidths=0.5, zorder=5)
+        
+        # Add agent to legend (colored for prediction)
+        if len(agent_legend_elements) < 10:
+            agent_legend_elements.append(Line2D([0], [0], color=color, linewidth=2, 
+                                                linestyle='--', label=agent_label))
+    
+    # Add trajectory type indicators to legend
+    line_legend_elements = [
+        Line2D([0], [0], color='black', linewidth=1.5, linestyle='-', label='Ground Truth'),
+        Line2D([0], [0], marker='o', color='gray', markersize=6, linestyle='None', 
+               markeredgecolor='black', label='Start position'),
+        Line2D([0], [0], marker='s', color='gray', markersize=6, linestyle='None', 
+               markeredgecolor='black', label='Predicted endpoint'),
+        Line2D([0], [0], marker='x', color='black', markersize=6, linestyle='None', 
+               label='GT endpoint'),
+    ]
+    
+    ax1.set_xlabel('X position (meters)', fontsize=11)
+    ax1.set_ylabel('Y position (meters)', fontsize=11)
+    ax1.set_title(f'Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)\n'
+                  f'Epoch {epoch+1}', fontsize=12, fontweight='bold')
+    
+    # Single legend with agents and line types
+    all_legend_elements = agent_legend_elements + line_legend_elements
+    ax1.legend(handles=all_legend_elements, loc='upper left', fontsize=7, 
+               framealpha=0.9, ncol=2)
+    
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal')
+    if x_lim and y_lim:
+        ax1.set_xlim(x_lim)
+        ax1.set_ylim(y_lim)
+    
+    plt.tight_layout()
+    
+    # Save
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    scenario_str = scenario_ids[0] if scenario_ids else "unknown"
+    filename = f'autoreg_epoch{epoch+1:03d}_{scenario_str}_{timestamp}.png'
+    filepath = os.path.join(save_dir, filename)
+    plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    
+    # NOTE: Don't log to wandb here - visualization images are logged per-epoch in main loop
+    # to avoid step conflicts. The main loop collects all viz paths and logs them together.
+    
+    print(f"  -> Saved visualization to {filepath}")
+    
+    # Return both filepath and final horizon error for epoch-level tracking
+    final_horizon_error = horizon_errors[-1] if horizon_errors else float('inf')
+    return filepath, final_horizon_error
