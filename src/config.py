@@ -90,7 +90,6 @@ vectornet_output_dim = 2
 vectornet_num_polyline_layers = 3  # Polyline Subgraph Network layers
 vectornet_num_global_layers = 1      # Global Interaction Graph layers
 vectornet_num_heads = 8             # Attention heads in global graph
-vectornet_num_gru_layers = 1         # GRU layers for VectorNetTemporal variant
 vectornet_dropout = 0.1
 vectornet_checkpoint_dir = 'checkpoints/vectornet'
 vectornet_checkpoint_prefix = 'vectornet'

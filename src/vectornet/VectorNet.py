@@ -1,5 +1,5 @@
-"""VectorNet model: hierarchical GNN for trajectory prediction (Gao et al. 2020).
-Predicts full future trajectory at once using Polyline Subgraph Network which aggregates 
+"""VectorNet model: hierarchical GNN for trajectory prediction,
+predicts full future trajectory at once using Polyline Subgraph Network which aggregates 
 vectors within each polyline and a Global Interaction Graph that applies self-attention between polylines"""
 
 import torch
@@ -105,7 +105,6 @@ class PolylineSubgraphNetwork(nn.Module):
         
         return polyline_features, unique_polylines
 
-
 class GlobalInteractionGraph(nn.Module):
     """Multi-head self-attention for high-order interactions between polylines."""
     
@@ -179,7 +178,6 @@ class GlobalInteractionGraph(nn.Module):
         
         return h
 
-
 class MultiStepTrajectoryDecoder(nn.Module):
     """MLP decoder for predicting full future trajectory at once.
     
@@ -232,303 +230,6 @@ class MultiStepTrajectoryDecoder(nn.Module):
         out = self.decoder(x)  # [num_agents, output_dim * prediction_horizon]
         out = out.view(batch_size, self.prediction_horizon, self.output_dim)
         return out
-
-
-class VectorNetMultiStep(nn.Module):
-    """VectorNet for Multi-Step Trajectory Prediction.
-    
-    This model predicts the FULL future trajectory at once, not autoregressively.
-    It encodes history snapshots, aggregates temporal information, and directly
-    outputs all future positions in a single forward pass.
-    
-    The model processes sequences of graph snapshots using:
-    1. Per-timestep VectorNet encoding (Polyline + Global Attention)
-    2. Temporal aggregation via attention
-    3. Multi-step trajectory decoding
-    
-    Args:
-        input_dim: Dimension of input vector features (default: 15)
-        hidden_dim: Hidden dimension throughout the network (default: 128)
-        output_dim: Output dimension per timestep (default: 2 for dx, dy)
-        prediction_horizon: Number of future timesteps to predict (default: 50)
-        num_polyline_layers: Number of layers in polyline subgraph network
-        num_global_layers: Number of global interaction graph layers
-        num_heads: Number of attention heads in global graph
-        dropout: Dropout probability
-        use_gradient_checkpointing: Whether to use gradient checkpointing
-    """
-    
-    def __init__(
-        self,
-        input_dim=15,
-        hidden_dim=128,
-        output_dim=2,
-        prediction_horizon=50,
-        num_polyline_layers=3,
-        num_global_layers=1,
-        num_heads=8,
-        dropout=0.1,
-        use_gradient_checkpointing=False
-    ):
-        super(VectorNetMultiStep, self).__init__()
-        
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.prediction_horizon = prediction_horizon
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        
-        # Polyline Subgraph Network
-        self.polyline_net = PolylineSubgraphNetwork(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_polyline_layers,
-            dropout=dropout
-        )
-        
-        # Global Interaction Graph
-        self.global_graph = GlobalInteractionGraph(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_layers=num_global_layers,
-            dropout=dropout
-        )
-        
-        # Temporal aggregation (for processing history sequence)
-        self.temporal_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.temporal_norm = nn.LayerNorm(hidden_dim)
-        
-        # FFN after temporal attention
-        self.temporal_ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-        # Multi-step trajectory decoder
-        self.trajectory_decoder = MultiStepTrajectoryDecoder(
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            prediction_horizon=prediction_horizon,
-            dropout=dropout
-        )
-        
-        # Identifier embedding
-        self.id_embedding = nn.Linear(2, hidden_dim)
-        
-        # Temporal feature storage for sequence processing
-        self._temporal_buffer = []
-    
-    def _add_identifier_embedding(self, polyline_features, x, polyline_ids, unique_polylines):
-        """Add identifier embedding to polyline features."""
-        P = polyline_features.shape[0]
-        id_embeds = torch.zeros(P, self.hidden_dim, device=polyline_features.device)
-        
-        for i, poly_id in enumerate(unique_polylines):
-            mask = polyline_ids == poly_id
-            if mask.sum() > 0:
-                # Use positions from node features (indices 7, 8 are relative positions)
-                if x.shape[1] > 8:
-                    positions = x[mask, 7:9]
-                else:
-                    positions = x[mask, :2]
-                min_pos = positions.min(dim=0)[0]
-                id_embeds[i] = self.id_embedding(min_pos)
-        
-        return polyline_features + id_embeds
-    
-    def encode_timestep(self, x, polyline_ids=None):
-        """Encode a single timestep using VectorNet.
-        
-        Args:
-            x: [N, input_dim] node features
-            polyline_ids: Optional [N] polyline membership
-            
-        Returns:
-            global_features: [N, hidden_dim] node features after encoding
-        """
-        device = x.device
-        N = x.shape[0]
-        
-        if polyline_ids is None:
-            polyline_ids = torch.arange(N, device=device)
-        
-        # Polyline encoding
-        if self.use_gradient_checkpointing and self.training:
-            polyline_features, unique_polylines = checkpoint(
-                self.polyline_net, x, polyline_ids, use_reentrant=False
-            )
-        else:
-            polyline_features, unique_polylines = self.polyline_net(x, polyline_ids)
-        
-        polyline_features = F.normalize(polyline_features, p=2, dim=-1)
-        
-        # Add position embedding
-        polyline_features = self._add_identifier_embedding(
-            polyline_features, x, polyline_ids, unique_polylines
-        )
-        
-        # Global interaction
-        if self.use_gradient_checkpointing and self.training:
-            global_features = checkpoint(
-                self.global_graph, polyline_features, use_reentrant=False
-            )
-        else:
-            global_features = self.global_graph(polyline_features)
-        
-        return global_features
-    
-    def reset_temporal_buffer(self):
-        """Clear the temporal feature buffer."""
-        self._temporal_buffer = []
-    
-    def forward_single_step(self, x, edge_index, edge_weight=None, 
-                            is_last_step=False, batch=None, **kwargs):
-        """Process a single timestep and optionally predict.
-        
-        This method accumulates temporal features. Call with is_last_step=True
-        on the final history timestep to get trajectory predictions.
-        
-        Args:
-            x: [N, input_dim] node features
-            edge_index: Edge indices (for compatibility, not used directly)
-            edge_weight: Optional edge weights
-            is_last_step: If True, aggregate temporal features and predict
-            batch: Optional batch tensor
-            
-        Returns:
-            If is_last_step=True: [N, prediction_horizon, output_dim] predictions
-            Otherwise: None (features stored in buffer)
-        """
-        # Encode this timestep
-        global_features = self.encode_timestep(x)
-        self._temporal_buffer.append(global_features)
-        
-        if not is_last_step:
-            return None
-        
-        # Aggregate temporal features and predict
-        N = x.shape[0]
-        device = x.device
-        T = len(self._temporal_buffer)
-        
-        # Stack temporal features
-        if T == 1:
-            agent_features = self._temporal_buffer[0]
-        else:
-            # Check if all timesteps have same number of nodes
-            if all(f.shape[0] == N for f in self._temporal_buffer):
-                temporal_stack = torch.stack(self._temporal_buffer, dim=0)  # [T, N, H]
-                temporal_stack = temporal_stack.permute(1, 0, 2)  # [N, T, H]
-                
-                # Query from last timestep
-                query = self._temporal_buffer[-1].unsqueeze(1)  # [N, 1, H]
-                
-                # Temporal attention
-                attn_out, _ = self.temporal_attention(
-                    query, temporal_stack, temporal_stack
-                )
-                attn_out = attn_out.squeeze(1)  # [N, H]
-                
-                # Residual connection
-                agent_features = self.temporal_norm(
-                    self._temporal_buffer[-1] + attn_out
-                )
-            else:
-                # Fallback: just use last timestep
-                agent_features = self._temporal_buffer[-1]
-        
-        # FFN for final processing
-        agent_features = agent_features + self.temporal_ffn(agent_features)
-        
-        # Clear buffer
-        self.reset_temporal_buffer()
-        
-        # Decode full trajectory
-        predictions = self.trajectory_decoder(agent_features)
-        
-        return predictions
-    
-    def forward(self, x, edge_index, edge_weight=None, batch=None,
-                batch_size=None, **kwargs):
-        """Single-step forward for compatibility.
-        
-        Encodes features and directly predicts full trajectory.
-        For sequence processing, use forward_single_step() iteratively.
-        
-        Args:
-            x: [N, input_dim] node features
-            edge_index: Edge indices (for compatibility)
-            edge_weight: Optional edge weights
-            batch: Optional batch tensor
-            batch_size: Number of scenarios in batch
-            
-        Returns:
-            predictions: [N, prediction_horizon, output_dim]
-        """
-        # Single-step encoding
-        global_features = self.encode_timestep(x)
-        
-        # Temporal processing (single step = just FFN)
-        agent_features = global_features + self.temporal_ffn(global_features)
-        
-        # Decode full trajectory
-        predictions = self.trajectory_decoder(agent_features)
-        
-        return predictions
-    
-    def forward_sequence(self, sequence):
-        """Process a sequence of graphs and predict full future trajectory.
-        
-        This is the main method for multi-step prediction from history.
-        
-        Args:
-            sequence: List of PyG Data objects or dict with 'x', 'edge_index'
-            
-        Returns:
-            predictions: [N, prediction_horizon, output_dim] trajectory predictions
-        """
-        self.reset_temporal_buffer()
-        
-        T = len(sequence)
-        
-        for t in range(T):
-            data = sequence[t]
-            
-            if hasattr(data, 'x'):
-                x = data.x
-            else:
-                x = data['x']
-            
-            if hasattr(data, 'edge_index'):
-                edge_index = data.edge_index
-            else:
-                edge_index = data.get('edge_index', None)
-            
-            is_last = (t == T - 1)
-            result = self.forward_single_step(x, edge_index, is_last_step=is_last)
-            
-            if is_last:
-                return result
-        
-        return None
-    
-    def reset_gru_hidden_states(self, **kwargs):
-        """Compatibility method - VectorNet doesn't use GRU hidden states."""
-        self.reset_temporal_buffer()
-
-
-# Backward compatibility aliases
-VectorNet = VectorNetMultiStep
-VectorNetTemporal = VectorNetMultiStep
-
 
 class VectorNetTFRecord(nn.Module):
     """VectorNet model designed for VectorNetTFRecordDataset.
@@ -700,12 +401,9 @@ class VectorNetTFRecord(nn.Module):
         return predictions
 
 
-# Export all models
+# Export:
 __all__ = [
-    'VectorNet',
-    'VectorNetMultiStep',
-    'VectorNetTemporal',  # Alias for compatibility
-    'VectorNetTFRecord',  # New model for TFRecord dataset
+    'VectorNetTFRecord',
     'PolylineSubgraphNetwork',
     'GlobalInteractionGraph',
     'MultiStepTrajectoryDecoder',

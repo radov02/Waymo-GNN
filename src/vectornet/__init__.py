@@ -1,7 +1,4 @@
 from .VectorNet import (
-    VectorNet,
-    VectorNetMultiStep,
-    VectorNetTemporal,
     VectorNetTFRecord,
     PolylineSubgraphNetwork,
     GlobalInteractionGraph,
@@ -36,8 +33,6 @@ __version__ = '3.0.0'  # TFRecord dataset version with map features
 __all__ = [
     # Models
     'VectorNet',
-    'VectorNetMultiStep',
-    'VectorNetTemporal',
     'VectorNetTFRecord',
     'PolylineSubgraphNetwork',
     'GlobalInteractionGraph',

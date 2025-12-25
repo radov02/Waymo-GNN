@@ -44,7 +44,7 @@ from config import (
     vectornet_num_agents_to_predict, vectornet_min_lr,
     vectornet_loss_alpha, vectornet_loss_beta, vectornet_loss_gamma, vectornet_loss_delta,
     vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_visualize_every_n_epochs, 
-    vectornet_wandb_project, vectornet_wandb_name)
+    vectornet_wandb_project, vectornet_wandb_name, vectornet_gradient_clip)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train VectorNet on TFRecord data')
@@ -401,20 +401,7 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
 
 def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma, loss_delta,
                 gradient_clip, scaler=None, visualize_callback=None):
-    """Train for one epoch with gradient accumulation support.
-    
-    Args:
-        model: VectorNetTFRecord model
-        dataloader: Training DataLoader
-        optimizer: Optimizer
-        loss_alpha, loss_beta, loss_gamma, loss_delta: Loss weights
-        gradient_clip: Max gradient norm
-        scaler: GradScaler for AMP
-        visualize_callback: Optional callback for visualization
-        
-    Returns:
-        Dictionary with training metrics
-    """
+    """Train for one epoch with gradient accumulation"""
     model.train()
     total_loss = 0.0
     total_traj_loss = 0.0
@@ -429,8 +416,7 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
     
     log_every = max(1, len(dataloader) // 10)
     
-    # Zero gradients at start
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)   # zero gradients at start
     
     for batch_idx, batch in enumerate(dataloader):
         if batch_idx % log_every == 0:
@@ -439,14 +425,14 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
                   f"Map: {batch['map_vectors'].shape[0]}")
         
         with torch.amp.autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
-            # Forward pass
-            predictions = model(batch)  # [B, future_len, 2]
             
-            # Get targets
+            predictions = model(batch)  # forward pass, get [B, future_len, 2]
+            
+            # Get targets:
             targets = batch['future_positions'].to(predictions.device)  # [B, future_len, 2]
             valid_mask = batch['future_valid'].to(predictions.device)   # [B, future_len]
             
-            # Trajectory loss
+            # use trajectory loss
             traj_loss = multistep_trajectory_loss(
                 predictions, targets, valid_mask,
                 alpha=loss_alpha,
@@ -456,21 +442,18 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
             )
             
             loss = traj_loss
-            
-            # Scale loss for gradient accumulation
-            loss = loss / accumulation_steps
-            
+            loss = loss / accumulation_steps      # scale loss for gradient accumulation
             if torch.isnan(loss):
                 print(f"  Warning: NaN loss at batch {batch_idx}")
                 continue
         
-        # Backward pass (accumulate gradients)
+        # backward pass (accumulate gradients)
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
         
-        # Step optimizer every accumulation_steps batches
+        # Step optimizer every accumulation_steps batches:
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -481,19 +464,18 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
                 clip_grad_norm_(model.parameters(), gradient_clip)
                 optimizer.step()
             
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)   # zero gradients after optimizer step
         
-        # Compute metrics (use unscaled loss)
         with torch.no_grad():
-            ade, fde = compute_metrics(predictions, targets, valid_mask)
+            ade, fde = compute_metrics(predictions, targets, valid_mask)    # compute metrics using unscaled loss
         
-        total_loss += (loss.item() * accumulation_steps)  # Unscale for logging
+        total_loss += (loss.item() * accumulation_steps)  # unscale for logging
         total_traj_loss += traj_loss.item()
         total_ade += ade.item()
         total_fde += fde.item()
         steps += 1
         
-        # Store last batch for visualization
+        # store last batch for visualization:
         if batch_idx == len(dataloader) - 1:
             last_batch = {k: v.cpu() if torch.is_tensor(v) else v for k, v in batch.items()}
         
@@ -508,28 +490,16 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
         'fde': total_fde / max(1, steps),
     }
     
-    # Call visualization callback after epoch completes
+    # call visualization callback after epoch completes
     if visualize_callback is not None and last_batch is not None:
         try:
             visualize_callback(last_batch)
         except Exception as e:
             print(f"  WARNING: Visualization failed: {e}")
-    
     return metrics
-
 
 @torch.no_grad()
 def validate(model, dataloader, loss_alpha, loss_beta, loss_gamma, loss_delta):
-    """Validate the model.
-    
-    Args:
-        model: VectorNetTFRecord model
-        dataloader: Validation DataLoader
-        loss_alpha, loss_beta, loss_gamma, loss_delta: Loss weights
-        
-    Returns:
-        Dictionary with validation metrics
-    """
     model.eval()
     total_loss = 0.0
     total_ade = 0.0
@@ -566,24 +536,6 @@ def validate(model, dataloader, loss_alpha, loss_beta, loss_gamma, loss_delta):
         'fde': total_fde / max(1, steps),
     }
 
-
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics, path):
-    """Save training checkpoint."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    # Handle DataParallel
-    model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-    
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model_state,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'metrics': metrics,
-    }, path)
-    print(f"  Saved checkpoint: {path}")
-
-
 def load_checkpoint(path, model, optimizer=None, scheduler=None):
     """Load training checkpoint."""
     checkpoint = torch.load(path, map_location='cpu')
@@ -602,12 +554,9 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     
     return checkpoint.get('epoch', 0), checkpoint.get('metrics', {})
 
-
 def main():
-    """Main training loop."""
+    """main training loop"""
     args = parse_args()
-    
-    # Use config values directly, override with args if provided
     data_dir = args.data_dir if args.data_dir else os.path.join(os.path.dirname(__file__), 'data')
     max_train_scenarios = args.max_train
     max_val_scenarios = args.max_val
@@ -620,7 +569,6 @@ def main():
     epochs = args.epochs
     num_workers = args.num_workers
     
-    # Set device
     train_device = torch.device(str(device))
     print(f"Using device: {train_device}")
     
@@ -628,7 +576,6 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Initialize wandb
     if not args.no_wandb:
         run_name = vectornet_wandb_name or f"vectornet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         wandb.init(
@@ -651,11 +598,10 @@ def main():
     else:
         wandb.init(mode='disabled')
     
-    # Create datasets
+
     print("\n" + "="*60)
     print("Loading TFRecord datasets...")
     print("="*60)
-    
     train_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=data_dir,
         split='training',
@@ -664,7 +610,6 @@ def main():
         max_scenarios=max_train_scenarios,
         num_agents_to_predict=vectornet_num_agents_to_predict,
     )
-    
     val_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=data_dir,
         split='validation',
@@ -673,11 +618,10 @@ def main():
         max_scenarios=max_val_scenarios,
         num_agents_to_predict=vectornet_num_agents_to_predict,
     )
-    
     print(f"Training scenarios: {len(train_dataset)}")
     print(f"Validation scenarios: {len(val_dataset)}")
     
-    # Create dataloaders with persistent workers for speed
+    # Create dataloaders with persistent workers for speed:
     persistent_workers = True
     train_loader = DataLoader(
         train_dataset,
@@ -689,7 +633,6 @@ def main():
         persistent_workers=persistent_workers and num_workers > 0,
         prefetch_factor=vectornet_prefetch_factor if num_workers > 0 else None,
     )
-    
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -701,11 +644,9 @@ def main():
         prefetch_factor=vectornet_prefetch_factor if num_workers > 0 else None,
     )
     
-    # Create model
     print("\n" + "="*60)
     print("Creating VectorNet model...")
     print("="*60)
-    
     model = VectorNetTFRecord(
         agent_input_dim=AGENT_VECTOR_DIM,
         map_input_dim=MAP_VECTOR_DIM,
@@ -740,32 +681,17 @@ def main():
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     
-    # Optimizer
     weight_decay = 1e-5
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay,)
     
     # Scheduler
     scheduler_type = 'cosine'
     if scheduler_type == 'cosine':
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=epochs,
-            eta_min=vectornet_min_lr
-        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=vectornet_min_lr)
     else:
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=learning_rate,
-            epochs=epochs,
-            steps_per_epoch=len(train_loader),
-        )
+        scheduler = OneCycleLR(optimizer, max_lr=learning_rate, epochs=epochs, steps_per_epoch=len(train_loader),)
     
-    # AMP scaler
-    scaler = torch.amp.GradScaler() if use_amp and torch.cuda.is_available() else None
+    scaler = torch.amp.GradScaler() if use_amp and torch.cuda.is_available() else None  # AMP scaler
     
     # Resume from checkpoint
     start_epoch = 0
@@ -773,27 +699,25 @@ def main():
     best_model_state = None
     best_optimizer_state = None
     best_epoch = 0
-    
     if args.resume:
         print(f"\nResuming from checkpoint: {args.resume}")
         start_epoch, metrics = load_checkpoint(args.resume, model, optimizer, scheduler)
         best_val_loss = metrics.get('val_loss', float('inf'))
         print(f"Resuming from epoch {start_epoch+1}")
     
-    # Training loop
+    
+    # training loop:
     print("\n" + "="*60)
     print("Starting training...")
     print("="*60)
-    
     os.makedirs(vectornet_checkpoint_dir, exist_ok=True)
     os.makedirs(vectornet_viz_dir, exist_ok=True)
-    
     for epoch in range(start_epoch, epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
-        # Visualization callback - run every epoch
+        # visualization callback - run every epoch
         viz_callback = None
         if (epoch + 1) % vectornet_visualize_every_n_epochs == 0 or epoch == 0:
             def viz_callback(batch):
@@ -825,7 +749,7 @@ def main():
                     )
                 model.train()
         
-        # Train
+        # train:
         train_metrics = train_epoch(model, train_loader, optimizer,
                                    vectornet_loss_alpha, vectornet_loss_beta,
                                    vectornet_loss_gamma, vectornet_loss_delta,
@@ -833,21 +757,18 @@ def main():
         print(f"\nTrain - Loss: {train_metrics['loss']:.4f} | "
               f"ADE: {train_metrics['ade']:.4f} | FDE: {train_metrics['fde']:.4f}")
         
-        # Validate
+        # validate:
         val_metrics = validate(model, val_loader,
                               vectornet_loss_alpha, vectornet_loss_beta,
                               vectornet_loss_gamma, vectornet_loss_delta)
         print(f"Val   - Loss: {val_metrics['loss']:.4f} | "
               f"ADE: {val_metrics['ade']:.4f} | FDE: {val_metrics['fde']:.4f}")
         
-        # Update scheduler
+        # update scheduler
         if scheduler_type == 'cosine':
             scheduler.step()
-        
-        # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Log per-epoch metrics to wandb
         wandb.log({
             "epoch": epoch + 1,
             "train/loss": train_metrics['loss'],
@@ -869,7 +790,7 @@ def main():
             "learning_rate": current_lr,
         }, commit=True)
         
-        # Save best model state in memory
+        # Save best model state in memory:
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             best_epoch = epoch + 1
@@ -883,13 +804,8 @@ def main():
             best_model_state = save_model.state_dict().copy()
             best_optimizer_state = optimizer.state_dict().copy()
             print(f"   New best validation loss: {val_metrics['loss']:.4f} at epoch {epoch+1}")
-        
-        # Early stopping disabled - let training run for all epochs
-        # if early_stopping(val_metrics['loss']):
-        #     print(f"\nEarly stopping triggered at epoch {epoch+1}")
-        #     break
     
-    # Save best model checkpoint after training completes
+    # Save best model checkpoint after training completes:
     if best_model_state is not None:
         print(f"\n{'='*60}")
         print(f"Saving best model from epoch {best_epoch}...")
@@ -915,7 +831,7 @@ def main():
     else:
         print("\nNo best model checkpoint saved (no improvement detected)\n")
     
-    # Save final model (current state at last epoch)
+    # Save final model (current state at last epoch):
     print(f"\n{'='*60}")
     print(f"Saving final model from epoch {epoch+1}...")
     # Handle DataParallel and torch.compile

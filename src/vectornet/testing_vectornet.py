@@ -1,21 +1,13 @@
-"""VectorNet testing script - evaluates trained models on test set.
-
-Usage:
+"""VectorNet testing script - evaluates trained models on test set, use:
     python src/vectornet/testing_vectornet.py
     python src/vectornet/testing_vectornet.py --checkpoint path/to/model.pt
-    python src/vectornet/testing_vectornet.py --max_scenarios 50 --no_wandb
-"""
-
+    python src/vectornet/testing_vectornet.py --max_scenarios 50 --no_wandb"""
 import sys
 import os
-
-# Set matplotlib backend to non-interactive before importing pyplot
 import matplotlib
 matplotlib.use('Agg')
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -26,34 +18,26 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 import random
-
-# Import VectorNet modules
 from VectorNet import VectorNetTFRecord, AGENT_VECTOR_DIM, MAP_VECTOR_DIM
 from vectornet_tfrecord_dataset import VectorNetTFRecordDataset, vectornet_collate_fn
-
-# Import visualization functions
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'helper_functions'))
 from helper_functions.visualization_functions import VIBRANT_COLORS, SDC_COLOR, MAP_FEATURE_GRAY
-
-# Import configuration from centralized config.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     device, vectornet_num_workers, pin_memory, print_gpu_info,
     vectornet_input_dim, vectornet_hidden_dim, vectornet_output_dim,
     vectornet_num_polyline_layers, vectornet_num_global_layers,
     vectornet_num_heads, vectornet_dropout, project_name,
-    vectornet_prediction_horizon, vectornet_history_length,
-    vectornet_use_node_completion, vectornet_node_completion_ratio,
-    vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_viz_dir_testing, POSITION_SCALE,
-    vectornet_best_model,
-    test_max_scenarios, test_visualize, test_visualize_max, test_use_wandb,
-    test_num_agents_to_predict, test_tfrecord_path,
-    use_gradient_checkpointing
-)
+    vectornet_prediction_horizon, vectornet_history_length, test_visualize_max,
+    vectornet_checkpoint_dir, vectornet_viz_dir_testing, vectornet_best_model,
+    test_max_scenarios, test_visualize_max, test_num_agents_to_predict, test_tfrecord_path)
 
-def get_vectornet_config():
-    """Get default VectorNet configuration."""
-    return {
+def load_model(checkpoint_path, device):
+    """load trained VectorNet model from checkpoint and assign the state_dict weights to currently instantiated model"""
+    print(f"\nLoading model from {checkpoint_path}...")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = checkpoint.get('config', {
         'input_dim': vectornet_input_dim,
         'hidden_dim': vectornet_hidden_dim,
         'output_dim': vectornet_output_dim,
@@ -63,28 +47,8 @@ def get_vectornet_config():
         'num_heads': vectornet_num_heads,
         'dropout': vectornet_dropout,
         'history_length': vectornet_history_length,
-    }
-
-
-def get_module(model):
-    """Get underlying model (unwrap DataParallel/compiled)."""
-    if hasattr(model, 'module'):
-        return model.module
-    if hasattr(model, '_orig_mod'):
-        return model._orig_mod
-    return model
-
-
-def load_model(checkpoint_path, device):
-    """Load trained VectorNet model from checkpoint."""
-    print(f"\nLoading model from {checkpoint_path}...")
+    })
     
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    # Get config from checkpoint or use defaults
-    config = checkpoint.get('config', get_vectornet_config())
-    
-    # Create model using VectorNetTFRecord (matches training script)
     model = VectorNetTFRecord(
         agent_input_dim=AGENT_VECTOR_DIM,
         map_input_dim=MAP_VECTOR_DIM,
@@ -97,15 +61,12 @@ def load_model(checkpoint_path, device):
         dropout=config.get('dropout', vectornet_dropout)
     )
     
-    # Load weights
-    state_dict = checkpoint['model_state_dict']
+    state_dict = checkpoint['model_state_dict']     # load weights
     
-    # Handle DataParallel prefix
-    if any(k.startswith('module.') for k in state_dict.keys()):
+    if any(k.startswith('module.') for k in state_dict.keys()):  # Handle DataParallel prefix
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     
-    # Handle torch.compile prefix
-    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):      # Handle torch.compile prefix
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     
     model.load_state_dict(state_dict, strict=False)
@@ -118,35 +79,21 @@ def load_model(checkpoint_path, device):
     
     return model, config
 
-
 def compute_trajectory_metrics(predictions, targets):
-    """Compute ADE, FDE, and miss rate from predicted vs target trajectories.
-    
-    Note: VectorNet outputs ABSOLUTE positions (relative to SDC at history_len-1),
-    not displacements. No cumsum needed.
-    """
+    """compute ADE, FDE, and miss rate from predicted vs target trajectories. Since
+    VectorNet outputs positions relative to SDC at history_len-1, and not displacements no cumulative sum is needed"""
     min_t = min(predictions.shape[1], targets.shape[1])
     predictions = predictions[:, :min_t, :]
     targets = targets[:, :min_t, :]
     
-    # Predictions are already absolute positions (no cumsum needed)
     pred_pos = predictions
     target_pos = targets
     
-    # Compute per-timestep displacement errors
-    errors = torch.sqrt(((pred_pos - target_pos) ** 2).sum(dim=-1))  # [N, T]
-    
-    # ADE: Average Displacement Error (mean over all timesteps)
-    ade = errors.mean()
-    
-    # FDE: Final Displacement Error (error at last timestep)
-    fde = errors[:, -1].mean()
-    
-    # Miss Rate: percentage of endpoints with error > 2.0 meters
-    miss_rate = (errors[:, -1] > 2.0).float().mean()
-    
-    # Per-timestep ADE
-    ade_per_step = errors.mean(dim=0)  # [T]
+    errors = torch.sqrt(((pred_pos - target_pos) ** 2).sum(dim=-1))  # per-timestep displacement errors: [N, T]
+    ade = errors.mean()     # Average Displacement Error over all timesteps
+    fde = errors[:, -1].mean()  # Final Displacement Error at last timestep
+    miss_rate = (errors[:, -1] > 2.0).float().mean()        # Miss Rate: percentage of endpoints with error > 2.0 meters
+    ade_per_step = errors.mean(dim=0)  # per-timestep ADE: [T]
     
     return {
         'ade': ade.item(),
@@ -155,12 +102,9 @@ def compute_trajectory_metrics(predictions, targets):
         'ade_per_step': ade_per_step.cpu().numpy().tolist(),
     }
 
-
 @torch.no_grad()
 def evaluate_model(model, dataloader, device, prediction_horizon=50):
-    """Evaluate model on test set. Returns aggregate metrics dict."""
     model.eval()
-    
     all_predictions = []
     all_targets = []
     all_scenario_ids = []
@@ -177,15 +121,13 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         if batch_idx % 10 == 0:
             print(f"  Batch {batch_idx + 1}/{len(dataloader)}")
         
-        # Forward pass through VectorNetTFRecord
-        predictions = model(batch)  # [B, future_len, 2]
+        predictions = model(batch)  # fwd pass: [B, future_len, 2]
         targets = batch['future_positions'].to(device)  # [B, future_len, 2]
         valid_mask = batch['future_valid'].to(device)  # [B, future_len]
         scenario_ids = batch.get('scenario_ids', [None] * batch['batch_size'])
         
-        # Compute metrics
-        disp = torch.norm(predictions - targets, dim=-1)  # [B, T]
-        
+        # compute metrics:
+        disp = torch.norm(predictions - targets, dim=-1)  # displacement errors: [B, T]
         if valid_mask is not None:
             valid_count = valid_mask.sum()
             if valid_count > 0:
@@ -196,8 +138,6 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         else:
             ade = disp.mean()
             fde = disp[:, -1].mean()
-        
-        # Miss rate: percentage with FDE > 2.0m
         miss_rate = (disp[:, -1] > 2.0).float().mean()
         
         total_ade += ade.item()
@@ -205,14 +145,12 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         total_mr += miss_rate.item()
         num_batches += 1
         
-        # Store for detailed analysis and visualization
+        # store for detailed analysis and visualization
         all_predictions.append(predictions.cpu())
         all_targets.append(targets.cpu())
         all_scenario_ids.extend(scenario_ids)
         
-        # Store batch data for visualization with proper scenario tracking
-        # Store enough batches to cover max_viz scenarios
-        if len(all_scenario_ids) <= 50:  # Store batches covering first 50 scenarios
+        if len(all_scenario_ids) <= test_visualize_max:  # store batches covering first test_visualize_max scenarios for visualization
             batch_data = {
                 'predictions': predictions.cpu(),
                 'targets': targets.cpu(),
@@ -231,7 +169,7 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
             }
             all_batches.append(batch_data)
     
-    # Aggregate metrics
+    # aggregate metrics across all batches of this testing epoch
     avg_ade = total_ade / max(1, num_batches)
     avg_fde = total_fde / max(1, num_batches)
     avg_mr = total_mr / max(1, num_batches)
@@ -243,22 +181,14 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         'num_scenarios': len(all_scenario_ids),
         'num_batches': num_batches,
     }
-    
     return results, all_predictions, all_targets, all_batches
 
-
-def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir, max_viz=10):
-    """Generate visualization of predicted vs ground truth trajectories with map features.
-    
-    VectorNet predictions and targets are ABSOLUTE positions in normalized coordinates
-    (relative to SDC at history_len-1). The coordinate system is centered on SDC.
-    """
+def visualize_predictions(batches, save_dir, max_viz=10):
+    """generate visualization of predicted vs ground truth trajectories with map features"""
     os.makedirs(save_dir, exist_ok=True)
     saved_paths = []
     total_ade = 0
     viz_count = 0
-    
-    # Map feature type colors (matching training script)
     MAP_COLORS = {
         0: (MAP_FEATURE_GRAY, 'Lanes'),
         1: (MAP_FEATURE_GRAY, 'Road Lines'),
@@ -269,7 +199,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
         6: (MAP_FEATURE_GRAY, 'Driveways'),
     }
     
-    # Debug: print data ranges for first batch
+    # Debug print data ranges for first batch:
     if len(batches) > 0 and batches[0]['targets'] is not None:
         first_targets = batches[0]['targets'].numpy() if torch.is_tensor(batches[0]['targets']) else batches[0]['targets']
         first_preds = batches[0]['predictions'].numpy() if torch.is_tensor(batches[0]['predictions']) else batches[0]['predictions']
@@ -298,14 +228,14 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
             first_map = batches[0]['map_vectors'].numpy() if torch.is_tensor(batches[0]['map_vectors']) else batches[0]['map_vectors']
             print(f"  Map vectors: shape={first_map.shape}, x-range=[{first_map[:, 0].min():.1f}, {first_map[:, 0].max():.1f}], y-range=[{first_map[:, 1].min():.1f}, {first_map[:, 1].max():.1f}]")
     
-    # Iterate through stored batches and scenarios
+
+    # iterate through stored batches and scenarios
     scenario_counter = 0
-    
     for batch_data in batches:
         if viz_count >= max_viz:
             break
         
-        # Convert all tensors to numpy
+        # convert all tensors to numpy
         batch_predictions = batch_data['predictions'].numpy() if torch.is_tensor(batch_data['predictions']) else batch_data['predictions']
         batch_targets = batch_data['targets'].numpy() if torch.is_tensor(batch_data['targets']) else batch_data['targets']
         batch_valid = batch_data['valid_mask'].numpy() if torch.is_tensor(batch_data['valid_mask']) else batch_data['valid_mask']
@@ -322,7 +252,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
         target_polyline_indices = batch_data['target_polyline_indices'].numpy() if batch_data['target_polyline_indices'] is not None and torch.is_tensor(batch_data['target_polyline_indices']) else batch_data['target_polyline_indices']
         target_scenario_batch = batch_data['target_scenario_batch'].numpy() if batch_data['target_scenario_batch'] is not None and torch.is_tensor(batch_data['target_scenario_batch']) else batch_data['target_scenario_batch']
         
-        # Iterate through scenarios in this batch
+        # iterate through scenarios in this batch
         for scenario_idx in range(batch_data['batch_size']):
             if viz_count >= max_viz:
                 break
@@ -331,7 +261,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
             if isinstance(scenario_id, bytes):
                 scenario_id = scenario_id.decode('utf-8')
             
-            # Get targets for this scenario
+            # get targets for this scenario
             if target_scenario_batch is not None:
                 target_mask = target_scenario_batch == scenario_idx
                 scenario_predictions = batch_predictions[target_mask]
@@ -339,7 +269,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
                 scenario_valid = batch_valid[target_mask]
                 scenario_target_polylines = target_polyline_indices[target_mask] if target_polyline_indices is not None else None
             else:
-                # Fallback: single target per scenario
+                # fallback: single target per scenario
                 scenario_predictions = batch_predictions[scenario_idx:scenario_idx+1]
                 scenario_targets = batch_targets[scenario_idx:scenario_idx+1]
                 scenario_valid = batch_valid[scenario_idx:scenario_idx+1] if batch_valid is not None else None
@@ -350,7 +280,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
                 scenario_counter += 1
                 continue
             
-            # Get agent vectors for this scenario
+            # get agent vectors for this scenario
             if agent_batch_idx is not None:
                 scenario_agent_mask = agent_batch_idx == scenario_idx
                 scenario_agent_vectors = agent_vectors[scenario_agent_mask]
@@ -359,7 +289,7 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
                 scenario_agent_vectors = None
                 scenario_agent_polyline_ids = None
             
-            # Get current positions for each target agent from their polylines
+            # get current positions for each target agent from their polylines
             current_positions = []
             for t_idx in range(num_targets):
                 if scenario_target_polylines is not None and scenario_agent_vectors is not None:
@@ -374,11 +304,11 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
                         # Fallback: use first target position
                         current_positions.append(scenario_targets[t_idx, 0, :2])
                 else:
-                    # Fallback: use (0, 0) as origin
+                    # fallback: use (0, 0) as origin
                     current_positions.append(np.array([0.0, 0.0]))
             current_positions = np.array(current_positions)
             
-            # Create figure
+            # create figure
             fig, ax = plt.subplots(figsize=(14, 12))
             
             # ===== Plot Map Features =====
@@ -502,32 +432,9 @@ def visualize_predictions(predictions, targets, scenario_ids, batches, save_dir,
     avg_ade = total_ade / max(1, viz_count)
     return saved_paths, avg_ade
 
-
-def run_testing(test_dataset_path=None,
-                checkpoint_path=None,
-                batch_size=32,
-                max_scenarios=None,
-                num_agents=None,
-                visualize=True,
-                visualize_max=10,
-                use_wandb=True,
-                split='training',
-                random_sample=True):
-    """Run testing with multi-step VectorNet prediction.
-    
-    Args:
-        test_dataset_path: Path to TFRecord data (default: from config)
-        checkpoint_path: Path to model checkpoint (default: auto-detect)
-        batch_size: Batch size for evaluation
-        max_scenarios: Max scenarios to test (default: from config)
-        num_agents: Number of agents to predict per scenario (default: from config)
-        visualize: Generate visualizations
-        visualize_max: Max scenarios to visualize
-        use_wandb: Enable wandb logging
-        split: Data split to use ('training', 'validation', or 'testing')
-        random_sample: If True, randomly sample scenarios instead of taking first N
-    """
-    # Use config defaults
+def run_testing(test_dataset_path=None, checkpoint_path=None, batch_size=32, max_scenarios=None, num_agents=None,
+                visualize=True, visualize_max=10, use_wandb=True, split='testing', random_sample=True):
+    """run testing with multi-step VectorNet prediction"""
     if test_dataset_path is None:
         test_dataset_path = test_tfrecord_path
     if max_scenarios is None:
@@ -538,11 +445,7 @@ def run_testing(test_dataset_path=None,
     print("\n" + "="*70)
     print("VECTORNET MODEL TESTING - Multi-Step Prediction")
     print("="*70)
-    
-    # Print GPU info
     print_gpu_info()
-    
-    # Initialize wandb
     if use_wandb:
         wandb.login()
         run = wandb.init(
@@ -560,18 +463,13 @@ def run_testing(test_dataset_path=None,
             },
             tags=["vectornet", "testing", "multi-step"]
         )
-    
-    # Use default checkpoint if not provided
     if checkpoint_path is None:
         checkpoint_path = vectornet_checkpoint_dir + '/' + vectornet_best_model
-    
-    # Check paths
     if not os.path.exists(checkpoint_path):
         print(f"\nERROR: Checkpoint not found at {checkpoint_path}")
         if use_wandb:
             wandb.finish(exit_code=1)
         return None
-    
     if not os.path.exists(test_dataset_path):
         print(f"\nERROR: Test data directory not found at {test_dataset_path}")
         print("Trying alternative paths...")
@@ -591,7 +489,7 @@ def run_testing(test_dataset_path=None,
                 wandb.finish(exit_code=1)
             return None
     
-    # Load model
+    # load model from checkpoint:
     model, config = load_model(checkpoint_path, device)
     prediction_horizon = config.get('prediction_horizon', vectornet_prediction_horizon)
     history_length = config.get('history_length', vectornet_history_length)
@@ -603,16 +501,13 @@ def run_testing(test_dataset_path=None,
             "history_length": history_length,
         })
     
-    # Load dataset
+    # load dataset:
     print(f"\n--- Loading Test Data ---")
     print(f"Data: {test_dataset_path}")
     print(f"Split: {split}")
     print(f"Random sampling: {random_sample}")
     print(f"Agents to predict per scenario: {num_agents}")
-    
-    # Use TFRecord dataset - load more scenarios if random sampling
-    load_max = max_scenarios * 5 if random_sample else max_scenarios  # Load 5x for random selection
-    
+    load_max = max_scenarios * 5 if random_sample else max_scenarios  # Load 5x for random sampling selection
     test_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=test_dataset_path,
         split=split,  # Use specified split (training, validation, or testing)
@@ -622,17 +517,15 @@ def run_testing(test_dataset_path=None,
         num_agents_to_predict=num_agents,
     )
     
-    # Random sampling: select random subset of scenarios
+    # random sampling - select random subset of scenarios:
     if random_sample and len(test_dataset) > max_scenarios:
         all_indices = list(range(len(test_dataset)))
         random.shuffle(all_indices)
         selected_indices = all_indices[:max_scenarios]
         test_dataset = Subset(test_dataset, selected_indices)
         print(f"Randomly selected {max_scenarios} scenarios from {load_max}")
-    
     print(f"Test scenarios: {len(test_dataset)}")
     
-    # Create dataloader
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -655,13 +548,9 @@ def run_testing(test_dataset_path=None,
     print(f"  Max scenarios: {max_scenarios if max_scenarios else 'all'}")
     print(f"  W&B logging: {use_wandb}")
     
-    # Evaluate
-    results, predictions, targets, batches = evaluate_model(
-        model, test_loader, device,
-        prediction_horizon=prediction_horizon
-    )
+    # evaluate model:
+    results, predictions, targets, batches = evaluate_model(model, test_loader, device, prediction_horizon=prediction_horizon)
     
-    # Print results
     print("\n" + "=" * 70)
     print("VECTORNET TEST RESULTS")
     print("=" * 70)
@@ -670,26 +559,20 @@ def run_testing(test_dataset_path=None,
     print(f"  Miss Rate @ 2.0m: {results['miss_rate']:.2%}")
     print(f"  Num scenarios: {results['num_scenarios']}")
     print("=" * 70)
-    
-    # Generate visualizations
+    # generate visualizations
     viz_images = []
     if visualize and predictions:
         print(f"\nGenerating visualizations (max {visualize_max} scenarios)...")
         os.makedirs(vectornet_viz_dir_testing, exist_ok=True)
         
-        # Get scenario IDs from the loader
-        scenario_ids = [f"scenario_{i}" for i in range(len(predictions))]
-        
-        saved_paths, avg_viz_ade = visualize_predictions(
-            predictions, targets, scenario_ids, batches, vectornet_viz_dir_testing, max_viz=visualize_max
-        )
+        saved_paths, avg_viz_ade = visualize_predictions(batches, vectornet_viz_dir_testing, max_viz=visualize_max)
         
         print(f"\nVisualization Summary:")
         print(f"  Scenarios visualized: {len(saved_paths)}")
         print(f"  Average ADE: {avg_viz_ade:.2f}m")
         print(f"  Saved to: {vectornet_viz_dir_testing}")
         
-        # Log visualizations to wandb
+        # log visualizations to wandb
         if use_wandb:
             for save_path, ade, scenario_id in saved_paths:
                 if os.path.exists(save_path):
@@ -698,7 +581,7 @@ def run_testing(test_dataset_path=None,
             if viz_images:
                 wandb.log({"test_visualizations": viz_images})
     
-    # Log results to wandb
+    # log results to wandb
     if use_wandb:
         wandb.log({
             "test/ade": results['ade'],
@@ -707,18 +590,18 @@ def run_testing(test_dataset_path=None,
             "test/num_scenarios": results['num_scenarios'],
         })
         
-        # Log summary metrics
+        # log summary metrics
         wandb.run.summary["final_ade"] = results['ade']
         wandb.run.summary["final_fde"] = results['fde']
         wandb.run.summary["final_miss_rate"] = results['miss_rate']
     
-    # Save results
+    # save results:
     os.makedirs(vectornet_checkpoint_dir, exist_ok=True)
     results_path = os.path.join(vectornet_checkpoint_dir, 'vectornet_test_results.pt')
     torch.save(results, results_path)
     print(f"Results saved to {results_path}")
     
-    # Also save as JSON for easy reading
+    # also save as JSON for easy reading:
     json_results = {
         'model_type': 'vectornet',
         'checkpoint': checkpoint_path,
@@ -742,9 +625,7 @@ def run_testing(test_dataset_path=None,
     
     return results
 
-
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(description='VectorNet Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint (default: auto-detect)')
@@ -784,7 +665,6 @@ def main():
     )
     
     return results
-
 
 if __name__ == "__main__":
     main()
