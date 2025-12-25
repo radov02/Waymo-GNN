@@ -150,7 +150,9 @@ def evaluate_model(model, dataloader, device, prediction_horizon=50):
         all_targets.append(targets.cpu())
         all_scenario_ids.extend(scenario_ids)
         
-        if len(all_scenario_ids) <= test_visualize_max:  # store batches covering first test_visualize_max scenarios for visualization
+        # Store batches until we have enough scenarios for visualization
+        scenarios_in_batches = sum(b['batch_size'] for b in all_batches)
+        if scenarios_in_batches < test_visualize_max:  # store batches covering first test_visualize_max scenarios for visualization
             batch_data = {
                 'predictions': predictions.cpu(),
                 'targets': targets.cpu(),
