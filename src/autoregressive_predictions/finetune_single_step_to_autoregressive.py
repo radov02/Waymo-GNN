@@ -602,7 +602,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     # Draw trajectories for selected agents
     from matplotlib.lines import Line2D
     agent_legend_elements = []
-    
+    print(f"Drawing trajectories for {len(selected_agent_ids)} agents:")
     for agent_id in selected_agent_ids:
         color = agent_colors[agent_id]
         is_sdc = (agent_id == sdc_id)
@@ -625,7 +625,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             start_pos = gt_sorted[0][1]
             end_pos = gt_sorted[-1][1]
             dist = np.sqrt(((end_pos - start_pos) ** 2).sum())
-            print(f"  Agent {agent_id} ({'SDC' if is_sdc else 'other'}): {len(gt_sorted)} GT pts, {len(pred_sorted)} pred pts, GT movement: {dist:.2f}m")
+            print(f"  Agent {agent_id} ({'SDC' if is_sdc else 'other'}): {len(gt_sorted)} GT pts, {len(pred_sorted)} pred pts, GT movement length: {dist:.2f}m")
         
         # Draw predicted trajectory (colored dashed line) - draw first so GT is on top
         # This is ONE continuous line connecting all predicted positions
@@ -964,8 +964,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         # Print parallel execution info for autoregressive rollout
         if batch_idx % 20 == 0:
             if torch.cuda.is_available():
-                print(f"\n[Batch {batch_idx}] Scenarios: {B} | Total Nodes: {num_nodes} | Edges: {num_edges}")
-                print(f"[PARALLEL] Processing {B} scenarios simultaneously | Rollout: {num_rollout_steps} steps")
+                print(f"\n[Batch {batch_idx}]: Processing {B} scenarios in parallel | Rollout: {num_rollout_steps} steps | Total Nodes: {num_nodes} | Edges: {num_edges}")
                 print(f"  Agents per scenario: min={min(agents_per_scenario)}, max={max(agents_per_scenario)}, avg={sum(agents_per_scenario)/len(agents_per_scenario):.1f}")
             else:
                 print(f"Batch {batch_idx}: B={B}, Nodes={num_nodes}, Rollout={num_rollout_steps} steps")
@@ -1294,9 +1293,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     final_cosine = total_cosine / max(1, count)
     
     print(f"\n[TRAIN EPOCH SUMMARY]")
-    print(f"  Loss: {final_loss:.6f} | Per-step MSE: {final_mse:.6f} | Per-step RMSE: {final_rmse:.2f}m")
-    print(f"  CosSim: {final_cosine:.4f}")
-    print(f"  Note: Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
+    print(f"  Loss: {final_loss:.6f} | Avg per-step MSE: {final_mse:.6f} | Avg per-step RMSE: {final_rmse:.2f}m | CosSim: {final_cosine:.4f}")
+    print(f"  Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
     # NOTE: No wandb.log here - logging is done per-epoch in main training loop
     # This avoids duplicate logging (per-step vs per-epoch)
