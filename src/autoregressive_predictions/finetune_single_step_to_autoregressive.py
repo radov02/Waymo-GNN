@@ -1526,19 +1526,24 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         final_step_mean_err_m = torch.norm(pred_aligned - target, dim=1).mean().item() * POSITION_SCALE
                         print(f"  [DEBUG VALIDATION] rollout final-step mean error: {final_step_mean_err_m:.2f}m | used_pred_positions={is_using_predicted_positions}")
 
-                    mse = F.mse_loss(pred_aligned, target)
-                    
+                    # Coordinate-wise MSE used for training/loss
+                    mse_coord = F.mse_loss(pred_aligned, target)
+
+                    # Euclidean MSE (mean squared Euclidean distance) for interpretable RMSE in meters
+                    diffs = (pred_aligned - target)
+                    mse_euclid = diffs.pow(2).sum(dim=1).mean()  # mean over agents of (dx^2+dy^2)
                     pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
-                    
-                    rollout_loss += mse
-                    total_mse += mse.item()
+
+                    # Use coordinate MSE for loss/backprop bookkeeping, but accumulate euclidean MSE for RMSE reporting
+                    rollout_loss += mse_coord
+                    total_mse += mse_euclid.item()
                     total_cosine += cos_sim.item()
                     count += 1
-                    
-                    # Per-horizon metrics
-                    horizon_mse[step] += mse.item()
+
+                    # Per-horizon metrics use euclidean MSE (so RMSE = sqrt(mse_euclid)*100 yields meters)
+                    horizon_mse[step] += mse_euclid.item()
                     horizon_cosine[step] += cos_sim.item()
                     horizon_counts[step] += 1
                     
@@ -1571,9 +1576,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     
     # Print per-horizon RMSE
     print(f"  Per-horizon RMSE (meters):")
-    for h in range(min(5, num_rollout_steps)):  # Show first 5 horizons
+    rmse = []
+    for h in range(num_rollout_steps):  # Show first 5 horizons
         h_rmse = (horizon_avg_mse[h] ** 0.5) * 100.0
-        print(f"    H{h+1}: {h_rmse:.2f}m")
+        rmse.append(h_rmse)
+    print(f"{rmse}\n")
     
     return {
         'loss': total_loss / max(1, steps),
