@@ -1,24 +1,13 @@
-"""Prepare VectorNet Data from Waymo TFRecord Files.
-
-This script converts raw Waymo scenario TFRecord files into preprocessed
-VectorNet-format TFRecord files containing agent polylines and map features.
-
-Output files are saved as: #####.vectornet.tfrecord
-
-VectorNetTFRecordDataset will read from:
+"""Prepare VectorNet Data from Waymo TFRecord Files by converting raw Waymo scenario 
+TFRecord files into preprocessed VectorNet-format TFRecord files containing agent 
+polylines and map features, output files: #####.vectornet.tfrecord. Reads from
 - src/vectornet/data/training/*.vectornet.tfrecord
 - src/vectornet/data/validation/*.vectornet.tfrecord
 - src/vectornet/data/testing/*.vectornet.tfrecord
-
 Usage:
-    # Process all splits
-    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario
-    
-    # Process specific split
-    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario --split training
-    
-    # Limit number of scenarios
-    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario --max_scenarios 1000
+    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario       # Process all splits
+    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario --split training     # Process specific split
+    python src/vectornet/prepare_vectornet_data.py --source_dir data/scenario --max_scenarios 1000     # Limit number of scenarios
 """
 
 import os
@@ -30,12 +19,10 @@ import math
 from pathlib import Path
 from tqdm import tqdm
 
-# Add src directory to path for local waymo_open_dataset
-src_dir = Path(__file__).parent.parent
+src_dir = Path(__file__).parent.parent      # add src directory to path for local waymo_open_dataset
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
-# Try to import TensorFlow for TFRecord
 try:
     import tensorflow as tf
     HAS_TF = True
@@ -43,7 +30,6 @@ except ImportError:
     print("ERROR: TensorFlow not available. Install with: pip install tensorflow")
     sys.exit(1)
 
-# Import local Waymo SDK
 try:
     from waymo_open_dataset.protos import scenario_pb2
     HAS_WAYMO_SDK = True
@@ -54,8 +40,6 @@ except ImportError as e:
     print(f"Error: {e}")
     sys.exit(1)
 
-
-# Map feature type encoding
 MAP_FEATURE_TYPES = {
     'lane': 0,
     'road_line': 1,
@@ -66,24 +50,14 @@ MAP_FEATURE_TYPES = {
     'driveway': 6,
 }
 
-
 def rotate_point(x, y, yaw):
-    """Rotate point by -yaw."""
+    """rotate point by -yaw angle"""
     c = math.cos(-yaw)
     s = math.sin(-yaw)
     return c * x - s * y, s * x + c * y
 
-
 def extract_agent_polylines(scenario, history_len=10, normalize=True):
-    """Extract agent trajectory polylines from scenario.
-    
-    Returns dict with:
-        - agent_vectors: list of vectors [ds_x, ds_y, ds_z, de_x, de_y, de_z, vx, vy, heading, width, length, type(4), timestamp]
-        - agent_polyline_ids: list of polyline IDs for each vector
-        - target_agent_idx: index of target agent
-        - origin_x, origin_y, origin_z, origin_yaw: normalization origin
-    """
-    # Find target agent (SDC or first valid track)
+    """extract agent trajectory polylines from scenario"""
     target_idx = scenario.sdc_track_index
     track = scenario.tracks[target_idx]
     
@@ -173,24 +147,18 @@ def extract_agent_polylines(scenario, history_len=10, normalize=True):
             polyline_id += 1
     
     return {
-        'agent_vectors': agent_vectors,
-        'agent_polyline_ids': agent_polyline_ids,
-        'target_agent_idx': target_idx,
-        'num_agent_polylines': polyline_id,
+        'agent_vectors': agent_vectors,     # list of vectors [ds_x, ds_y, ds_z, de_x, de_y, de_z, vx, vy, heading, width, length, type(4), timestamp]
+        'agent_polyline_ids': agent_polyline_ids,      # list of polyline IDs for each vector
+        'target_agent_idx': target_idx,     # index of target agent
+        'num_agent_polylines': polyline_id,     # number of agent polylines
         'origin_x': origin_x,
         'origin_y': origin_y,
         'origin_z': origin_z,
         'origin_yaw': origin_yaw,
     }
 
-
 def extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, normalize=True):
-    """Extract map feature polylines from scenario.
-    
-    Returns dict with:
-        - map_vectors: list of vectors [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7)]
-        - map_polyline_ids: list of polyline IDs for each vector
-    """
+    """extract map feature polylines from scenario"""
     map_vectors = []
     map_polyline_ids = []
     polyline_id = 0
@@ -198,7 +166,7 @@ def extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, no
     for feature in scenario.map_features:
         feature_type = feature.WhichOneof('feature_data')
         
-        # Get polyline points
+        # get polyline points
         points = []
         type_idx = MAP_FEATURE_TYPES.get(feature_type, 0)
         
@@ -214,7 +182,7 @@ def extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, no
         if len(points) < 2:
             continue
         
-        # Create vectors from consecutive points
+        # create vectors from consecutive points
         for i in range(len(points) - 1):
             p_start = points[i]
             p_end = points[i + 1]
@@ -248,20 +216,14 @@ def extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, no
             polyline_id += 1
     
     return {
-        'map_vectors': map_vectors,
-        'map_polyline_ids': map_polyline_ids,
-        'num_map_polylines': polyline_id,
+        'map_vectors': map_vectors,     # list of vectors [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7)]
+        'map_polyline_ids': map_polyline_ids,       # list of polyline IDs for each vector
+        'num_map_polylines': polyline_id,       # number of map polylines
     }
-
 
 def extract_future_trajectory(scenario, target_idx, origin_x, origin_y, origin_yaw, 
                              history_len=10, future_len=50, normalize=True):
-    """Extract future trajectory labels.
-    
-    Returns dict with:
-        - future_positions: list of [x, y] positions
-        - future_valid: list of validity flags
-    """
+    """extract future trajectory labels"""
     track = scenario.tracks[target_idx]
     
     future_positions = []
@@ -289,18 +251,15 @@ def extract_future_trajectory(scenario, target_idx, origin_x, origin_y, origin_y
             future_valid.append(0.0)
     
     return {
-        'future_positions': future_positions,
-        'future_valid': future_valid,
+        'future_positions': future_positions,       # list of [x, y] positions
+        'future_valid': future_valid,            # list of validity flags
     }
 
-
 def process_scenario(scenario, history_len=10, future_len=50):
-    """Process a single scenario and extract VectorNet features."""
+    """process a single scenario and extract VectorNet features"""
     try:
-        # Extract agent polylines
         agent_data = extract_agent_polylines(scenario, history_len=history_len)
         
-        # Extract map polylines
         map_data = extract_map_polylines(
             scenario,
             agent_data['origin_x'],
@@ -309,7 +268,6 @@ def process_scenario(scenario, history_len=10, future_len=50):
             agent_data['origin_yaw']
         )
         
-        # Extract future trajectory
         future_data = extract_future_trajectory(
             scenario,
             agent_data['target_agent_idx'],
@@ -320,7 +278,7 @@ def process_scenario(scenario, history_len=10, future_len=50):
             future_len=future_len
         )
         
-        # Combine all data
+        # combine all data:
         return {
             'scenario_id': scenario.scenario_id,
             'agent_vectors': agent_data['agent_vectors'],
@@ -337,7 +295,6 @@ def process_scenario(scenario, history_len=10, future_len=50):
         print(f"Error processing scenario {scenario.scenario_id}: {e}")
         return None
 
-
 def write_vectornet_tfrecord(data_list, output_path):
     """Write processed VectorNet data to TFRecord file."""
     with tf.io.TFRecordWriter(output_path) as writer:
@@ -351,7 +308,6 @@ def write_vectornet_tfrecord(data_list, output_path):
             }))
             
             writer.write(example.SerializeToString())
-
 
 def find_tfrecord_files(base_dir):
     """Find all TFRecord files in directory structure.
@@ -388,7 +344,6 @@ def find_tfrecord_files(base_dir):
     
     return splits
 
-
 def process_tfrecord_file(input_file, history_len=10, future_len=50):
     """Process a single TFRecord file and extract all scenarios."""
     dataset = tf.data.TFRecordDataset(input_file, compression_type='')
@@ -406,16 +361,14 @@ def process_tfrecord_file(input_file, history_len=10, future_len=50):
     
     return processed_scenarios
 
-
 def setup_target_directories(target_base=None):
-    """Create target directory structure."""
+    """create target directory structure."""
     if target_base is None:
         target_base = os.path.join(os.path.dirname(__file__), 'data')
     for split in ['training', 'validation', 'testing']:
         target_dir = os.path.join(target_base, split)
         os.makedirs(target_dir, exist_ok=True)
     return target_base
-
 
 def process_split(source_files, target_dir, split_name, history_len=10, future_len=50, max_scenarios=None):
     """Process all files in a split."""
@@ -462,7 +415,6 @@ def process_split(source_files, target_dir, split_name, history_len=10, future_l
     print(f"  Processed {total_scenarios} scenarios")
     return total_scenarios
 
-
 def verify_setup(target_base=None):
     """Verify that VectorNet TFRecord files were created."""
     if target_base is None:
@@ -486,7 +438,6 @@ def verify_setup(target_base=None):
     else:
         print("\n VectorNet data preparation complete!")
         return True
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -532,7 +483,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Set default target directory
     if args.target_dir is None:
         args.target_dir = os.path.join(os.path.dirname(__file__), 'data')
     
@@ -563,7 +513,7 @@ def main():
     print("\nSetting up target directories...")
     target_base = setup_target_directories(args.target_dir)
     
-    # Process each split
+    # process each split
     if args.split:
         # Process only specified split
         if args.split in splits:

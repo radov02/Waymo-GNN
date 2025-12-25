@@ -1,35 +1,19 @@
-"""VectorNet Dataset for Direct TFRecord Loading from Waymo Open Motion Dataset.
-
-This module provides a proper VectorNet dataset that extracts:
-1. Agent trajectory polylines (past trajectory as vectors)
-2. Map feature polylines (lanes, road edges, crosswalks)
-3. Traffic light information
-4. Multi-step future trajectory labels
-
-Unlike the HDF5-based dataset, this directly parses TFRecord files to get
-all the information VectorNet needs, including HD map features.
-
-Reference: "VectorNet: Encoding HD Maps and Agent Dynamics from Vectorized Representation"
-(Gao et al., 2020)
-"""
+"""VectorNet Dataset for Direct TFRecord Loading from Waymo Open Motion Dataset, extracting agent trajectory polylines,
+map feature polylines, traffic light states and multi-step future trajectory labels."""
 
 import torch
-import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Data
 import os
 import sys
 import glob
 import math
 from typing import Dict, List, Tuple, Optional, Any
 
-# Add parent path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Try to import TensorFlow for TFRecord parsing
 try:
     import tensorflow as tf
-    # Suppress TensorFlow warnings
     tf.get_logger().setLevel('ERROR')
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     HAS_TF = True
@@ -37,7 +21,6 @@ except ImportError:
     HAS_TF = False
     print("Warning: TensorFlow not available. Using tfrecord package instead.")
 
-# Try to import Waymo Open Dataset protos
 try:
     from waymo_open_dataset.protos import scenario_pb2
     HAS_WAYMO_SDK = True
@@ -48,17 +31,8 @@ except ImportError:
 
 class VectorNetTFRecordDataset(Dataset):
     """VectorNet dataset that directly loads from Waymo TFRecord files.
+    Each vector in a polyline: [ds_x, ds_y, ds_z, de_x, de_y, de_z, attributes..., polyline_id]"""
     
-    This dataset creates proper polyline representations for VectorNet:
-    - Agent past trajectories as polylines
-    - Map features (lanes, road edges, crosswalks) as polylines
-    - Traffic light states
-    - Multi-step future trajectory labels
-    
-    Each vector in a polyline: [ds_x, ds_y, ds_z, de_x, de_y, de_z, attributes..., polyline_id]
-    """
-    
-    # Map feature type encoding
     MAP_FEATURE_TYPES = {
         'lane': 0,
         'road_line': 1, 
@@ -69,7 +43,6 @@ class VectorNetTFRecordDataset(Dataset):
         'driveway': 6,
     }
     
-    # Agent type encoding
     AGENT_TYPES = {
         0: 'unset',
         1: 'vehicle',
@@ -80,7 +53,7 @@ class VectorNetTFRecordDataset(Dataset):
     
     def __init__(
         self,
-        tfrecord_dir: str,
+        tfrecord_dir: str,      # base directory containing scenario/training, scenario/validation, etc.
         split: str = 'training',
         history_len: int = 10,
         future_len: int = 50,
@@ -92,21 +65,6 @@ class VectorNetTFRecordDataset(Dataset):
         max_scenarios: Optional[int] = None,
         num_agents_to_predict: Optional[int] = 8,
     ):
-        """
-        Args:
-            tfrecord_dir: Base directory containing scenario/training, scenario/validation, etc.
-            split: 'training', 'validation', or 'testing'
-            history_len: Number of past timesteps to use (default 10 = 1 second at 10Hz)
-            future_len: Number of future timesteps to predict (default 50 = 5 seconds at 10Hz)
-            max_agents: Maximum number of agents to include
-            max_map_polylines: Maximum number of map polylines to include
-            max_polyline_vectors: Maximum vectors per polyline
-            normalize: Whether to normalize coordinates relative to target agent
-            cache_scenarios: Whether to cache parsed scenarios in memory
-            max_scenarios: Maximum number of scenarios to load (None = all)
-            num_agents_to_predict: Number of agents to predict for per scenario
-                                   (None = all valid agents, int = limit to top N)
-        """
         self.tfrecord_dir = tfrecord_dir
         self.split = split
         self.history_len = history_len
@@ -118,31 +76,21 @@ class VectorNetTFRecordDataset(Dataset):
         self.cache_scenarios = cache_scenarios
         self.max_scenarios = max_scenarios
         self.num_agents_to_predict = num_agents_to_predict
-        
-        # Scenario cache
         self._scenario_cache: Dict[int, Any] = {}
-        
-        # Find TFRecord files
         self.data_dir = os.path.join(tfrecord_dir, split)
         self.tfrecord_files = sorted(glob.glob(os.path.join(self.data_dir, "*.tfrecord")))
-        
         if len(self.tfrecord_files) == 0:
             raise ValueError(f"No TFRecord files found in {self.data_dir}")
-        
         print(f"Found {len(self.tfrecord_files)} TFRecord files in {self.data_dir}")
         print(f"Predicting for {num_agents_to_predict if num_agents_to_predict else 'all valid'} agents per scenario")
-        
-        # Build index: (file_idx, scenario_idx_in_file) -> global_idx
-        self._build_index()
+        self._build_index()     # build index: (file_idx, scenario_idx_in_file) -> global_idx
     
     def _build_index(self):
-        """Build an index of all scenarios across all TFRecord files."""
+        """build an index of all scenarios across all TFRecord files - necessary for batching and random access"""
         self.scenario_index: List[Tuple[int, int]] = []  # (file_idx, scenario_idx_in_file)
-        
         print("Building scenario index...")
         for file_idx, tfrecord_path in enumerate(self.tfrecord_files):
             try:
-                # Count scenarios in this file
                 if HAS_TF:
                     dataset = tf.data.TFRecordDataset(tfrecord_path, compression_type='')
                     scenario_count = 0
@@ -151,8 +99,7 @@ class VectorNetTFRecordDataset(Dataset):
                         if self.max_scenarios and len(self.scenario_index) + scenario_count >= self.max_scenarios:
                             break
                 else:
-                    # Fallback: assume fixed number per file
-                    scenario_count = 50  # Typical number per file
+                    scenario_count = 50  # Fallback: assume fixed number per file
                 
                 for s_idx in range(scenario_count):
                     self.scenario_index.append((file_idx, s_idx))
@@ -186,31 +133,18 @@ class VectorNetTFRecordDataset(Dataset):
         raise IndexError(f"Scenario {scenario_idx} not found in {tfrecord_path}")
     
     def _get_valid_agents_for_prediction(self, scenario, num_agents_to_predict: Optional[int] = None) -> List[int]:
-        """Get list of valid agent indices that can be predicted.
-        
-        An agent is valid for prediction if:
-        1. Has valid state at current timestep (history_len - 1)
-        2. Has at least some valid future states
-        
-        Args:
-            scenario: Waymo scenario proto
-            num_agents_to_predict: Max number of agents to return (None = all valid)
-            
-        Returns:
-            List of valid agent indices (track indices)
-        """
+        """Get list of valid agent indices that can be predicted: an agent is valid for prediction if: 
+        has valid state at current timestep (history_len - 1) and has at least some valid future states"""
         valid_agents = []
         
         for i, track in enumerate(scenario.tracks):
             if not hasattr(track, 'states') or len(track.states) <= self.history_len:
                 continue
                 
-            # Check if current timestep is valid
-            if not track.states[self.history_len - 1].valid:
+            if not track.states[self.history_len - 1].valid:        # check if current timestep is valid
                 continue
             
-            # Check if agent has at least some valid future states
-            has_future = False
+            has_future = False      # check if agent has at least some valid future states
             for t in range(self.history_len, min(self.history_len + self.future_len, len(track.states))):
                 if track.states[t].valid:
                     has_future = True
@@ -221,35 +155,25 @@ class VectorNetTFRecordDataset(Dataset):
             
             valid_agents.append(i)
         
-        # Prioritize SDC if present
         sdc_idx = scenario.sdc_track_index
         if sdc_idx in valid_agents:
             valid_agents.remove(sdc_idx)
-            valid_agents.insert(0, sdc_idx)
+            valid_agents.insert(0, sdc_idx)   # prioritize SDC if present
         
-        # Limit number of agents if specified
+        # limit number of agents if specified:
         if num_agents_to_predict is not None and len(valid_agents) > num_agents_to_predict:
             valid_agents = valid_agents[:num_agents_to_predict]
         
-        # Fallback: if no valid agents, use SDC anyway
-        if len(valid_agents) == 0:
+        if len(valid_agents) == 0:      # if no valid agents, use SDC
             valid_agents = [scenario.sdc_track_index]
         
         return valid_agents
     
     def _get_target_agent_state(self, scenario) -> Tuple[int, float, float, float, float]:
-        """Get target agent index and current state for normalization.
-        
-        Uses SDC (self-driving car) as the reference for normalization.
-        
-        Returns:
-            (target_idx, origin_x, origin_y, origin_z, origin_yaw)
-        """
-        # Use SDC as the reference for coordinate normalization
+        """get target agent index and current state for normalization, use SDC (self-driving car) as the reference for normalization"""
         target_idx = scenario.sdc_track_index
-        
-        # Get current state (last history timestep)
         track = scenario.tracks[target_idx]
+        # get current state (last history timestep):
         current_state = track.states[self.history_len - 1] if len(track.states) > self.history_len - 1 else track.states[-1]
         
         origin_x = current_state.center_x
@@ -260,32 +184,14 @@ class VectorNetTFRecordDataset(Dataset):
         return target_idx, origin_x, origin_y, origin_z, origin_yaw
     
     def _rotate_point(self, x: float, y: float, yaw: float) -> Tuple[float, float]:
-        """Rotate point by -yaw to align with target agent heading."""
+        """rotate point by -yaw angle to align with target agent heading"""
         c = math.cos(-yaw)
         s = math.sin(-yaw)
         return c * x - s * y, s * x + c * y
     
-    def _extract_agent_polylines(
-        self, 
-        scenario, 
-        target_idx: int,
-        origin_x: float, 
-        origin_y: float, 
-        origin_z: float,
-        origin_yaw: float
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, int, Dict[int, int]]:
-        """Extract agent trajectory polylines.
-        
-        Each agent's past trajectory becomes a polyline.
-        Each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, vx, vy, heading, width, length, type_onehot(4), timestamp, polyline_id]
-        
-        Returns:
-            agent_vectors: [N_vectors, feature_dim]
-            agent_polyline_ids: [N_vectors]
-            target_polyline_idx: Index of target agent's polyline (for SDC/reference)
-            num_polylines: Total number of agent polylines
-            track_to_polyline: Dict mapping track index to polyline index
-        """
+    def _extract_agent_polylines(self, scenario, target_idx: int, origin_x: float, origin_y: float, origin_z: float, origin_yaw: float) -> Tuple[torch.Tensor, torch.Tensor, int, int, Dict[int, int]]:
+        """extract agent trajectory polylines, each agent's past trajectory becomes a polyline.
+        Each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, vx, vy, heading, width, length, type_onehot(4), timestamp, polyline_id]"""
         agent_vectors = []
         agent_polyline_ids = []
         polyline_id = 0
@@ -296,23 +202,19 @@ class VectorNetTFRecordDataset(Dataset):
             if polyline_id >= self.max_agents:
                 break
             
-            # Check if agent has valid history
             valid_history = []
-            for t in range(self.history_len):
+            for t in range(self.history_len):       # check if agent has valid history
                 if t < len(track.states) and track.states[t].valid:
                     valid_history.append(t)
-            
-            if len(valid_history) < 2:  # Need at least 2 points for a polyline
+            if len(valid_history) < 2:  # need at least 2 points for a polyline
                 continue
             
-            # Store mapping from track index to polyline index
-            track_to_polyline[agent_idx] = polyline_id
+            track_to_polyline[agent_idx] = polyline_id      # store mapping from track index to polyline index
             
-            # Mark target agent (SDC for reference)
-            if agent_idx == target_idx:
+            if agent_idx == target_idx:     # mark target agent (SDC for reference)
                 target_polyline_idx = polyline_id
             
-            # Create vectors from consecutive valid timesteps
+            # create vectors from consecutive valid timesteps:
             vectors_this_polyline = []
             for i in range(len(valid_history) - 1):
                 if len(vectors_this_polyline) >= self.max_polyline_vectors:
@@ -321,10 +223,11 @@ class VectorNetTFRecordDataset(Dataset):
                 t_start = valid_history[i]
                 t_end = valid_history[i + 1]
                 
+                # use SDC state as origin for normalization:
                 state_start = track.states[t_start]
                 state_end = track.states[t_end]
                 
-                # Transform to local coordinates
+                # transform to local coordinates (around SDC):
                 if self.normalize:
                     ds_x, ds_y = self._rotate_point(
                         state_start.center_x - origin_x,
@@ -352,22 +255,22 @@ class VectorNetTFRecordDataset(Dataset):
                     de_z = state_end.center_z if hasattr(state_end, 'center_z') else 0.0
                     vx, vy = state_end.velocity_x, state_end.velocity_y
                 
-                # Heading (relative to origin if normalizing)
+                # heading (relative to origin if normalizing)
                 heading = state_end.heading if hasattr(state_end, 'heading') else 0.0
                 if self.normalize:
                     heading = heading - origin_yaw
                 
-                # Agent dimensions
+                # agent dimensions
                 width = track.width if hasattr(track, 'width') else 2.0
                 length = track.length if hasattr(track, 'length') else 4.5
                 
-                # Agent type one-hot
+                # agent type one-hot
                 obj_type = track.object_type if hasattr(track, 'object_type') else 0
                 type_onehot = [0.0, 0.0, 0.0, 0.0]
                 if 1 <= obj_type <= 4:
                     type_onehot[obj_type - 1] = 1.0
                 
-                # Timestamp (normalized to [0, 1] within history)
+                # timestamp (normalized to [0, 1] within history)
                 timestamp = t_end / self.history_len
                 
                 vector = [
@@ -387,7 +290,7 @@ class VectorNetTFRecordDataset(Dataset):
                 polyline_id += 1
         
         if len(agent_vectors) == 0:
-            # Return empty tensors with correct dimensions
+            # return empty tensors with correct dimensions
             return (
                 torch.zeros((0, 16), dtype=torch.float32),
                 torch.zeros((0,), dtype=torch.long),
@@ -397,31 +300,16 @@ class VectorNetTFRecordDataset(Dataset):
             )
         
         return (
-            torch.tensor(agent_vectors, dtype=torch.float32),
-            torch.tensor(agent_polyline_ids, dtype=torch.long),
-            target_polyline_idx,
-            polyline_id,
-            track_to_polyline
+            torch.tensor(agent_vectors, dtype=torch.float32),       # [N_vectors, feature_dim]
+            torch.tensor(agent_polyline_ids, dtype=torch.long),     # [N_vectors]
+            target_polyline_idx,                             # index of target agent's polyline
+            polyline_id,                                   # total number of agent polylines
+            track_to_polyline                          # mapping from track index to polyline index
         )
     
-    def _extract_map_polylines(
-        self,
-        scenario,
-        origin_x: float,
-        origin_y: float, 
-        origin_z: float,
-        origin_yaw: float,
-        start_polyline_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Extract map feature polylines (lanes, roads, crosswalks).
-        
-        Each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7), polyline_id]
-        
-        Returns:
-            map_vectors: [N_vectors, feature_dim]
-            map_polyline_ids: [N_vectors]
-            num_polylines: Total number of map polylines
-        """
+    def _extract_map_polylines(self, scenario, origin_x: float, origin_y: float,  origin_z: float, origin_yaw: float, start_polyline_id: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Extract map feature polylines (lanes, roads, crosswalks),
+        each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7), polyline_id]"""
         map_vectors = []
         map_polyline_ids = []
         polyline_id = start_polyline_id
@@ -432,7 +320,7 @@ class VectorNetTFRecordDataset(Dataset):
             
             feature_type = feature.WhichOneof('feature_data')
             
-            # Get polyline points based on feature type
+            # get polyline points based on feature type:
             points = []
             type_idx = self.MAP_FEATURE_TYPES.get(feature_type, 0)
             
@@ -445,21 +333,20 @@ class VectorNetTFRecordDataset(Dataset):
             elif feature_type == 'crosswalk' and hasattr(feature.crosswalk, 'polygon'):
                 points = [(p.x, p.y, getattr(p, 'z', 0.0)) for p in feature.crosswalk.polygon]
             elif feature_type == 'stop_sign':
-                # Stop signs are points, not polylines
+                # stop signs are points, not polylines
                 if hasattr(feature.stop_sign, 'position'):
                     pos = feature.stop_sign.position
                     points = [(pos.x, pos.y, getattr(pos, 'z', 0.0))]
-            
             if len(points) < 2:
                 continue
             
-            # Create vectors from consecutive points
+            # create vectors from consecutive points:
             vectors_this_polyline = []
             for i in range(min(len(points) - 1, self.max_polyline_vectors)):
                 p_start = points[i]
                 p_end = points[i + 1]
                 
-                # Transform to local coordinates
+                # transform to local coordinates (around SDC):
                 if self.normalize:
                     ds_x, ds_y = self._rotate_point(
                         p_start[0] - origin_x,
@@ -477,7 +364,7 @@ class VectorNetTFRecordDataset(Dataset):
                     ds_x, ds_y, ds_z = p_start
                     de_x, de_y, de_z = p_end
                 
-                # Type one-hot
+                # type one-hot
                 type_onehot = [0.0] * 7
                 type_onehot[type_idx] = 1.0
                 
@@ -498,27 +385,14 @@ class VectorNetTFRecordDataset(Dataset):
             )
         
         return (
-            torch.tensor(map_vectors, dtype=torch.float32),
-            torch.tensor(map_polyline_ids, dtype=torch.long),
-            polyline_id
+            torch.tensor(map_vectors, dtype=torch.float32),     # [N_vectors, feature_dim]
+            torch.tensor(map_polyline_ids, dtype=torch.long),   # [N_vectors]
+            polyline_id                                  # total number of map polylines
         )
     
-    def _extract_future_trajectory(
-        self,
-        scenario,
-        target_idx: int,
-        origin_x: float,
-        origin_y: float,
-        origin_yaw: float
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract future trajectory labels for target agent.
-        
-        Returns:
-            future_positions: [future_len, 2] - (x, y) positions
-            future_valid: [future_len] - validity mask
-        """
+    def _extract_future_trajectory(self, scenario, target_idx: int, origin_x: float, origin_y: float, origin_yaw: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """extract future trajectory labels for target agent"""
         track = scenario.tracks[target_idx]
-        
         future_positions = []
         future_valid = []
         
@@ -545,53 +419,30 @@ class VectorNetTFRecordDataset(Dataset):
                 future_valid.append(0.0)
         
         return (
-            torch.tensor(future_positions, dtype=torch.float32),
-            torch.tensor(future_valid, dtype=torch.float32)
+            torch.tensor(future_positions, dtype=torch.float32),        # [future_len, 2] - (x, y) positions
+            torch.tensor(future_valid, dtype=torch.float32)          # [future_len] - validity mask
         )
     
-    def _extract_multi_agent_futures(
-        self,
-        scenario,
-        target_track_indices: List[int],
-        track_to_polyline: Dict[int, int],
-        origin_x: float,
-        origin_y: float,
-        origin_yaw: float
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract future trajectories for multiple target agents.
-        
-        Args:
-            scenario: Waymo scenario proto
-            target_track_indices: List of track indices to predict for
-            track_to_polyline: Dict mapping track index to polyline index
-            origin_x, origin_y, origin_yaw: Normalization origin
-            
-        Returns:
-            target_polyline_indices: [num_targets] polyline indices in the scene
-            future_positions: [num_targets, future_len, 2]
-            future_valid: [num_targets, future_len]
-        """
+    def _extract_multi_agent_futures(self, scenario, target_track_indices: List[int], track_to_polyline: Dict[int, int], origin_x: float, origin_y: float, origin_yaw: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """extract future trajectories for multiple target agents"""
         target_polyline_indices = []
         all_future_positions = []
         all_future_valid = []
         
         for track_idx in target_track_indices:
-            # Get the polyline index for this track
             if track_idx not in track_to_polyline:
-                continue  # Agent didn't have valid history (was skipped)
+                continue  # agent didn't have valid history (was skipped)
             
-            polyline_idx = track_to_polyline[track_idx]
+            polyline_idx = track_to_polyline[track_idx]     # get the polyline index for this track
             target_polyline_indices.append(polyline_idx)
             
-            # Extract future trajectory for this agent
-            future_pos, future_val = self._extract_future_trajectory(
-                scenario, track_idx, origin_x, origin_y, origin_yaw
-            )
+            # extract future trajectory for this agent:
+            future_pos, future_val = self._extract_future_trajectory(scenario, track_idx, origin_x, origin_y, origin_yaw)
             all_future_positions.append(future_pos)
             all_future_valid.append(future_val)
         
         if len(target_polyline_indices) == 0:
-            # Fallback: no valid agents found
+            # fallback: no valid agents found
             return (
                 torch.zeros((0,), dtype=torch.long),
                 torch.zeros((0, self.future_len, 2), dtype=torch.float32),
@@ -599,141 +450,115 @@ class VectorNetTFRecordDataset(Dataset):
             )
         
         return (
-            torch.tensor(target_polyline_indices, dtype=torch.long),
+            torch.tensor(target_polyline_indices, dtype=torch.long),        # [num_targets] polyline indices in the scene
             torch.stack(all_future_positions, dim=0),  # [num_targets, future_len, 2]
             torch.stack(all_future_valid, dim=0)       # [num_targets, future_len]
         )
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single scenario for VectorNet with multi-agent prediction.
-        
-        Returns a dictionary with:
-            - agent_vectors: [N_agent_vectors, agent_feature_dim]
-            - agent_polyline_ids: [N_agent_vectors]
-            - map_vectors: [N_map_vectors, map_feature_dim] 
-            - map_polyline_ids: [N_map_vectors]
-            - target_polyline_indices: [num_targets] polyline indices for target agents
-            - future_positions: [num_targets, future_len, 2]
-            - future_valid: [num_targets, future_len]
-            - num_targets: number of target agents
-            - scenario_id: Scenario identifier
-        """
+        """get a single scenario for VectorNet with multi-agent prediction"""
         file_idx, scenario_idx = self.scenario_index[idx]
         
-        # Check cache
-        cache_key = (file_idx, scenario_idx)
+        cache_key = (file_idx, scenario_idx)        # check cache
         if self.cache_scenarios and cache_key in self._scenario_cache:
             return self._scenario_cache[cache_key]
         
-        # Parse scenario
         scenario = self._parse_scenario(file_idx, scenario_idx)
         
-        # Get SDC as the reference for coordinate normalization
+        # get SDC as the reference for coordinate normalization:
         ref_idx, origin_x, origin_y, origin_z, origin_yaw = self._get_target_agent_state(scenario)
         
-        # Extract agent polylines (returns track_to_polyline mapping)
-        agent_vectors, agent_polyline_ids, sdc_polyline_idx, num_agent_polylines, track_to_polyline = \
-            self._extract_agent_polylines(scenario, ref_idx, origin_x, origin_y, origin_z, origin_yaw)
+        # extract agent polylines:
+        agent_vectors, agent_polyline_ids, sdc_polyline_idx, num_agent_polylines, track_to_polyline = self._extract_agent_polylines(scenario, ref_idx, origin_x, origin_y, origin_z, origin_yaw)
         
-        # Extract map polylines
-        map_vectors, map_polyline_ids, total_polylines = \
-            self._extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, num_agent_polylines)
+        # extract map polylines:
+        map_vectors, map_polyline_ids, total_polylines = self._extract_map_polylines(scenario, origin_x, origin_y, origin_z, origin_yaw, num_agent_polylines)
         
-        # Get valid agents for prediction
-        target_track_indices = self._get_valid_agents_for_prediction(
-            scenario, 
-            num_agents_to_predict=self.num_agents_to_predict
-        )
+        # get valid agents for prediction:
+        target_track_indices = self._get_valid_agents_for_prediction(scenario, num_agents_to_predict=self.num_agents_to_predict)
         
-        # Extract future trajectories for all target agents
-        target_polyline_indices, future_positions, future_valid = self._extract_multi_agent_futures(
-            scenario, target_track_indices, track_to_polyline, origin_x, origin_y, origin_yaw
-        )
+        # extract future trajectories for all target agents:
+        target_polyline_indices, future_positions, future_valid = self._extract_multi_agent_futures(scenario, target_track_indices, track_to_polyline, origin_x, origin_y, origin_yaw)
         
         result = {
             'agent_vectors': agent_vectors,
             'agent_polyline_ids': agent_polyline_ids,
             'map_vectors': map_vectors,
             'map_polyline_ids': map_polyline_ids,
-            'target_polyline_indices': target_polyline_indices,  # [num_targets]
+            'target_polyline_indices': target_polyline_indices,         # [num_targets]
             'num_agent_polylines': torch.tensor(num_agent_polylines, dtype=torch.long),
-            'future_positions': future_positions,                # [num_targets, future_len, 2]
-            'future_valid': future_valid,                        # [num_targets, future_len]
+            'future_positions': future_positions,                   # [num_targets, future_len, 2]
+            'future_valid': future_valid,                               # [num_targets, future_len]
             'num_targets': torch.tensor(len(target_polyline_indices), dtype=torch.long),
             'scenario_id': scenario.scenario_id,
         }
         
-        # Cache if enabled
-        if self.cache_scenarios:
+        if self.cache_scenarios:        # cache if enabled
             self._scenario_cache[cache_key] = result
         
         return result
 
-
 def vectornet_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Collate function for VectorNet dataset with multi-agent support.
-    
-    Handles variable-length polylines by concatenating and tracking batch indices.
-    Multi-agent prediction is handled by flattening all target agents across scenarios.
-    """
+    """collate function for VectorNet dataset with multi-agent support, handles variable-length polylines by concatenating and 
+    tracking batch indices, multi-agent prediction is handled by flattening all target agents across scenarios."""
     batch_size = len(batch)
     
-    # Concatenate agent vectors with batch tracking
+    # concatenate agent vectors with batch tracking:
     agent_vectors_list = []
     agent_polyline_ids_list = []
     agent_batch_list = []
     
-    # Concatenate map vectors with batch tracking  
+    # concatenate map vectors with batch tracking:
     map_vectors_list = []
     map_polyline_ids_list = []
     map_batch_list = []
     
-    # Multi-agent target tracking
-    # Each target gets: (polyline_idx, scenario_batch_idx)
-    all_target_polyline_indices = []  # Flattened list of all target polyline indices
-    all_target_scenario_batch = []     # Which scenario each target belongs to
+    # multi-agent target tracking:
+    # each target gets: (polyline_idx, scenario_batch_idx)
+    all_target_polyline_indices = []  # flattened list of all target polyline indices
+    all_target_scenario_batch = []     # which scenario each target belongs to
     all_future_positions = []          # [total_targets, future_len, 2]
     all_future_valid = []              # [total_targets, future_len]
-    num_targets_per_scenario = []      # How many targets in each scenario
+    num_targets_per_scenario = []      # how many targets in each scenario
     
     scenario_ids = []
     
     agent_polyline_offset = 0
     
-    for b_idx, sample in enumerate(batch):
-        # Agent data
-        agent_vectors_list.append(sample['agent_vectors'])
-        agent_polyline_ids_list.append(sample['agent_polyline_ids'] + agent_polyline_offset)
-        agent_batch_list.append(torch.full((len(sample['agent_vectors']),), b_idx, dtype=torch.long))
+    for b_idx, scenario in enumerate(batch):
+        # agent data
+        agent_vectors_list.append(scenario['agent_vectors'])
+        agent_polyline_ids_list.append(scenario['agent_polyline_ids'] + agent_polyline_offset)
+        agent_batch_list.append(torch.full((len(scenario['agent_vectors']),), b_idx, dtype=torch.long))
         
-        # Map data
-        map_vectors_list.append(sample['map_vectors'])
-        map_polyline_ids_list.append(sample['map_polyline_ids'] + agent_polyline_offset)
-        map_batch_list.append(torch.full((len(sample['map_vectors']),), b_idx, dtype=torch.long))
+        # map data
+        map_vectors_list.append(scenario['map_vectors'])
+        map_polyline_ids_list.append(scenario['map_polyline_ids'] + agent_polyline_offset)
+        map_batch_list.append(torch.full((len(scenario['map_vectors']),), b_idx, dtype=torch.long))
         
-        # Multi-agent targets
-        target_indices = sample['target_polyline_indices']  # [num_targets]
+        # multi-agent targets
+        target_indices = scenario['target_polyline_indices']  # [num_targets]
         num_targets = len(target_indices)
         num_targets_per_scenario.append(num_targets)
         
-        # Offset target polyline indices and flatten
+        # offset target polyline indices and flatten
         for t in range(num_targets):
             all_target_polyline_indices.append(target_indices[t].item() + agent_polyline_offset)
             all_target_scenario_batch.append(b_idx)
         
-        # Flatten future positions and valid masks
-        # sample['future_positions'] is [num_targets, future_len, 2]
+        # flatten future positions and valid masks
+        # scenario['future_positions'] is [num_targets, future_len, 2]
         for t in range(num_targets):
-            all_future_positions.append(sample['future_positions'][t])
-            all_future_valid.append(sample['future_valid'][t])
+            all_future_positions.append(scenario['future_positions'][t])
+            all_future_valid.append(scenario['future_valid'][t])
         
-        scenario_ids.append(sample['scenario_id'])
+        scenario_ids.append(scenario['scenario_id'])
         
         # Update offset (only agent polylines, as map polylines are concatenated with agent polylines)
-        num_agent_polylines = sample['num_agent_polylines'].item()
+        num_agent_polylines = scenario['num_agent_polylines'].item()
         agent_polyline_offset += num_agent_polylines
     
-    # Handle empty batches
+    # handle empty batches
     total_targets = sum(num_targets_per_scenario)
     
     return {
@@ -743,7 +568,7 @@ def vectornet_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         'map_vectors': torch.cat(map_vectors_list, dim=0) if map_vectors_list else torch.zeros((0, 13)),
         'map_polyline_ids': torch.cat(map_polyline_ids_list, dim=0) if map_polyline_ids_list else torch.zeros((0,), dtype=torch.long),
         'map_batch': torch.cat(map_batch_list, dim=0) if map_batch_list else torch.zeros((0,), dtype=torch.long),
-        # Multi-agent support
+        # multi-agent:
         'target_polyline_indices': torch.tensor(all_target_polyline_indices, dtype=torch.long),  # [total_targets]
         'target_scenario_batch': torch.tensor(all_target_scenario_batch, dtype=torch.long),      # [total_targets]
         'future_positions': torch.stack(all_future_positions, dim=0) if all_future_positions else torch.zeros((0, 50, 2)),  # [total_targets, future_len, 2]
@@ -754,32 +579,9 @@ def vectornet_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         'scenario_ids': scenario_ids,
     }
 
-
-def create_vectornet_dataloaders(
-    tfrecord_dir: str,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    history_len: int = 10,
-    future_len: int = 50,
-    max_train_scenarios: Optional[int] = None,
-    max_val_scenarios: Optional[int] = None,
-    num_agents_to_predict: Optional[int] = 8,
-) -> Tuple[DataLoader, DataLoader]:
-    """Create training and validation dataloaders for VectorNet.
-    
-    Args:
-        tfrecord_dir: Base directory (e.g., 'data/scenario')
-        batch_size: Batch size
-        num_workers: Number of data loading workers
-        history_len: Number of history timesteps
-        future_len: Number of future timesteps to predict
-        max_train_scenarios: Max training scenarios (None = all)
-        max_val_scenarios: Max validation scenarios (None = all)
-        num_agents_to_predict: Number of agents to predict for per scenario
-    
-    Returns:
-        train_loader, val_loader
-    """
+def create_vectornet_dataloaders(tfrecord_dir: str, batch_size: int = 32, num_workers: int = 4, history_len: int = 10,
+    future_len: int = 50, max_train_scenarios: Optional[int] = None, max_val_scenarios: Optional[int] = None, num_agents_to_predict: Optional[int] = 8) -> Tuple[DataLoader, DataLoader]:
+    """create training and validation dataloaders for VectorNet"""
     train_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=tfrecord_dir,
         split='training',
@@ -818,13 +620,9 @@ def create_vectornet_dataloaders(
     
     return train_loader, val_loader
 
-
-# For backward compatibility with existing code
+# wrapper for compatibility with PyG data format
 class VectorNetDatasetWrapper(Dataset):
-    """Wrapper that converts TFRecord dataset output to PyG Data format.
-    
-    This allows using the TFRecord dataset with existing PyG-based training code.
-    """
+    """Wrapper that converts TFRecord dataset output to PyG Data format for using the TFRecord dataset with PyG-based training code."""
     
     def __init__(self, tfrecord_dataset: VectorNetTFRecordDataset):
         self.dataset = tfrecord_dataset
