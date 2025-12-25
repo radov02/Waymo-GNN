@@ -557,7 +557,9 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
 def main():
     """main training loop"""
     args = parse_args()
-    data_dir = args.data_dir if args.data_dir else os.path.join(os.path.dirname(__file__), 'data')
+    # Default to project root data/scenario directory
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = args.data_dir if args.data_dir else os.path.join(project_root, 'data', 'scenario')
     max_train_scenarios = args.max_train
     max_val_scenarios = args.max_val
     hidden_dim = args.hidden_dim
