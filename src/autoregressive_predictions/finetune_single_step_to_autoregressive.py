@@ -1520,7 +1520,12 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         min_size = min(pred_aligned.shape[0], target.shape[0])
                         pred_aligned = pred_aligned[:min_size]
                         target = target[:min_size]
-                    
+
+                    # Debug: report final-step mean error (meters) for this rollout
+                    if step == effective_rollout - 1 and pred_aligned.shape[0] > 0:
+                        final_step_mean_err_m = torch.norm(pred_aligned - target, dim=1).mean().item() * POSITION_SCALE
+                        print(f"  [DEBUG VALIDATION] rollout final-step mean error: {final_step_mean_err_m:.2f}m | used_pred_positions={is_using_predicted_positions}")
+
                     mse = F.mse_loss(pred_aligned, target)
                     
                     pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
