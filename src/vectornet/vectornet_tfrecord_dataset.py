@@ -1,6 +1,5 @@
 """VectorNet Dataset for Direct TFRecord Loading from Waymo Open Motion Dataset, extracting agent trajectory polylines,
 map feature polylines, traffic light states and multi-step future trajectory labels."""
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data
@@ -9,9 +8,7 @@ import sys
 import glob
 import math
 from typing import Dict, List, Tuple, Optional, Any
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR')
@@ -20,7 +17,6 @@ try:
 except ImportError:
     HAS_TF = False
     print("Warning: TensorFlow not available. Using tfrecord package instead.")
-
 try:
     from waymo_open_dataset.protos import scenario_pb2
     HAS_WAYMO_SDK = True
@@ -578,46 +574,6 @@ def vectornet_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torc
         'batch_size': batch_size,
         'scenario_ids': scenario_ids,
     }
-
-# wrapper for compatibility with PyG data format
-class VectorNetDatasetWrapper(Dataset):
-    """Wrapper that converts TFRecord dataset output to PyG Data format for using the TFRecord dataset with PyG-based training code."""
-    
-    def __init__(self, tfrecord_dataset: VectorNetTFRecordDataset):
-        self.dataset = tfrecord_dataset
-    
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx: int) -> Data:
-        sample = self.dataset[idx]
-        
-        # Combine agent and map vectors
-        all_vectors = torch.cat([
-            sample['agent_vectors'],
-            sample['map_vectors']
-        ], dim=0) if sample['map_vectors'].numel() > 0 else sample['agent_vectors']
-        
-        all_polyline_ids = torch.cat([
-            sample['agent_polyline_ids'],
-            sample['map_polyline_ids']
-        ], dim=0) if sample['map_polyline_ids'].numel() > 0 else sample['agent_polyline_ids']
-        
-        # Create agent mask (True for agent polylines, False for map)
-        agent_mask = torch.zeros(all_vectors.shape[0], dtype=torch.bool)
-        agent_mask[:len(sample['agent_vectors'])] = True
-        
-        data = Data(
-            x=all_vectors,
-            polyline_ids=all_polyline_ids,
-            agent_mask=agent_mask,
-            target_polyline_idx=sample['target_polyline_idx'],
-            y=sample['future_positions'],  # [future_len, 2]
-            y_valid=sample['future_valid'],  # [future_len]
-            scenario_id=sample['scenario_id'],
-        )
-        
-        return data
 
 if __name__ == '__main__':
     # Test the dataset

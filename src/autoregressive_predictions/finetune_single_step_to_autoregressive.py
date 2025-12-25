@@ -1395,9 +1395,56 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     if source_graph.y is None:
                         break
                     
-                    # Check if node counts match - skip if they don't
-                    if graph_for_prediction.x.shape[0] != source_graph.y.shape[0]:
-                        # Node count changed - switch to ground truth graph
+                    # ========== AGENT ALIGNMENT ==========
+                    # Agents may enter/leave between timesteps. We need to handle this properly.
+                    # If node counts don't match, try to align by agent ID, otherwise skip.
+                    pred_num_nodes = graph_for_prediction.x.shape[0]
+                    source_num_nodes = source_graph.y.shape[0] if source_graph.y is not None else 0
+                    
+                    # Try agent-based alignment first
+                    pred_agent_ids = getattr(graph_for_prediction, 'agent_ids', None)
+                    source_agent_ids = getattr(source_graph, 'agent_ids', None)
+                    pred_batch_tensor = getattr(graph_for_prediction, 'batch', None)
+                    source_batch_tensor = getattr(source_graph, 'batch', None)
+                    
+                    use_alignment = False
+                    pred_indices = None
+                    source_indices = None
+                    pred_id_to_idx = {}  # Initialize outside to ensure scope
+                    common_ids = set()   # Initialize outside to ensure scope
+                    
+                    if (pred_agent_ids is not None and source_agent_ids is not None and 
+                        pred_batch_tensor is not None and source_batch_tensor is not None and
+                        len(pred_agent_ids) == pred_num_nodes and 
+                        len(source_agent_ids) == source_num_nodes):
+                        # Build mappings
+                        pred_batch_np = pred_batch_tensor.cpu().numpy()
+                        source_batch_np = source_batch_tensor.cpu().numpy()
+                        
+                        for idx in range(pred_num_nodes):
+                            bid = int(pred_batch_np[idx])
+                            aid = pred_agent_ids[idx]
+                            pred_id_to_idx[(bid, aid)] = idx
+                        
+                        source_id_to_idx = {}
+                        for idx in range(source_num_nodes):
+                            bid = int(source_batch_np[idx])
+                            aid = source_agent_ids[idx]
+                            source_id_to_idx[(bid, aid)] = idx
+                        
+                        common_ids = set(pred_id_to_idx.keys()) & set(source_id_to_idx.keys())
+                        
+                        if len(common_ids) >= 2:
+                            common_ids_list = sorted(common_ids)
+                            pred_indices = torch.tensor([pred_id_to_idx[gid] for gid in common_ids_list], 
+                                                        device=device, dtype=torch.long)
+                            source_indices = torch.tensor([source_id_to_idx[gid] for gid in common_ids_list], 
+                                                          device=device, dtype=torch.long)
+                            use_alignment = True
+                    
+                    # Fall back to node count check if alignment not possible
+                    if not use_alignment and pred_num_nodes != source_num_nodes:
+                        # Node count changed and can't align - switch to ground truth graph
                         graph_for_prediction = target_graph
                         is_using_predicted_positions = False
                         continue
@@ -1413,27 +1460,72 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         timestep=t + step
                     )
                     
+                    # Apply alignment if needed
+                    if use_alignment and pred_indices is not None:
+                        pred_aligned = pred[pred_indices]
+                        target_base = source_graph.y[source_indices].to(pred.dtype)
+                    else:
+                        pred_aligned = pred
+                        target_base = source_graph.y.to(pred.dtype)
+                    
                     # Compute correct target for autoregressive evaluation
                     # source_graph.y contains displacement from GT position[source_t] to GT position[target_t]
                     # If using predicted positions, we need displacement from pred_pos to GT position[target_t]
                     if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                        # Check if position sizes match (agents may have appeared/disappeared)
-                        if graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
+                        # Need to align target positions too
+                        if use_alignment and pred_indices is not None:
+                            # Get target positions for aligned agents
+                            target_agent_ids = getattr(target_graph, 'agent_ids', None)
+                            target_batch_for_align = getattr(target_graph, 'batch', None)
+                            if target_agent_ids is not None and target_batch_for_align is not None:
+                                target_batch_np = target_batch_for_align.cpu().numpy()
+                                target_id_to_idx = {}
+                                for idx in range(target_graph.x.shape[0]):
+                                    bid = int(target_batch_np[idx])
+                                    aid = target_agent_ids[idx]
+                                    target_id_to_idx[(bid, aid)] = idx
+                                
+                                # Find common agents between pred and target
+                                common_with_target = set(target_id_to_idx.keys()) & common_ids
+                                
+                                if len(common_with_target) >= 2:
+                                    common_list = sorted(common_with_target)
+                                    pred_idx_for_target = torch.tensor([pred_id_to_idx[gid] for gid in common_list], 
+                                                                       device=device, dtype=torch.long)
+                                    target_pos_indices = torch.tensor([target_id_to_idx[gid] for gid in common_list], 
+                                                                      device=device, dtype=torch.long)
+                                    
+                                    gt_next_pos = target_graph.pos[target_pos_indices]
+                                    current_pred_pos = graph_for_prediction.pos[pred_idx_for_target]
+                                    target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                                    target = target.to(pred.dtype)
+                                    pred_aligned = pred[pred_idx_for_target]
+                                else:
+                                    target = target_base
+                            else:
+                                target = target_base
+                        elif graph_for_prediction.pos.shape[0] == target_graph.pos.shape[0]:
                             gt_next_pos = target_graph.pos
                             current_pred_pos = graph_for_prediction.pos
                             target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
                             target = target.to(pred.dtype)
                         else:
                             # Size mismatch - fall back to GT displacement
-                            target = source_graph.y.to(pred.dtype)
+                            target = target_base
                             is_using_predicted_positions = False  # Reset flag
                     else:
                         # Using GT positions - use displacement stored in source_graph.y
-                        target = source_graph.y.to(pred.dtype)
+                        target = target_base
                     
-                    mse = F.mse_loss(pred, target)
+                    # Ensure pred_aligned and target have same size before computing loss
+                    if pred_aligned.shape[0] != target.shape[0]:
+                        min_size = min(pred_aligned.shape[0], target.shape[0])
+                        pred_aligned = pred_aligned[:min_size]
+                        target = target[:min_size]
                     
-                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                    mse = F.mse_loss(pred_aligned, target)
+                    
+                    pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
                     target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                     cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
                     
@@ -1460,6 +1552,12 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     # Compute per-horizon averages
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
+    
+    # Debug: Check if any horizon has zero counts
+    zero_count_horizons = [h for h in range(min(10, num_rollout_steps)) if horizon_counts[h] == 0]
+    if zero_count_horizons:
+        print(f"  [DEBUG] Horizons with zero samples: {zero_count_horizons}")
+        print(f"  [DEBUG] First 10 horizon counts: {horizon_counts[:10]}")
     
     # Print validation summary with RMSE in meters
     final_mse = total_mse / max(1, count)

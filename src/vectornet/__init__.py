@@ -11,8 +11,7 @@ try:
     from .vectornet_tfrecord_dataset import (
         VectorNetTFRecordDataset,
         vectornet_collate_fn,
-        create_vectornet_dataloaders,
-        VectorNetDatasetWrapper,
+        create_vectornet_dataloaders
     )
     HAS_TFRECORD_DATASET = True
 except ImportError as e:
@@ -43,7 +42,6 @@ __all__ = [
     'VectorNetTFRecordDataset',
     'vectornet_collate_fn',
     'create_vectornet_dataloaders',
-    'VectorNetDatasetWrapper',
     'HAS_TFRECORD_DATASET',
     
     'get_vectornet_config',

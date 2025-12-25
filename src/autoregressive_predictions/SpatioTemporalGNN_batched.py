@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv
-from torch_geometric.utils import to_dense_batch
 from torch.utils.checkpoint import checkpoint
 from config import debug_mode
 
@@ -56,11 +55,12 @@ class SpatioTemporalGNNBatched(nn.Module):
         ])
         
         # Temporal encoder: GRU processes sequence of spatial features
+        # batch_first=True for better memory layout: [batch, seq_len, features]
         self.gru = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=num_gru_layers,
-            batch_first=False,
+            batch_first=True,  # Changed for better GPU memory access patterns
             dropout=dropout if num_gru_layers > 1 else 0.0
         )
         
@@ -109,6 +109,9 @@ class SpatioTemporalGNNBatched(nn.Module):
         2. Batched: reset_gru_hidden_states(batch_size=B, agents_per_scenario=[n1,...])
         
         The GCN model doesn't use to_dense_batch, so it just needs total node count.
+        
+        NOTE: This also detaches any existing hidden state, effectively implementing
+        truncated BPTT at batch boundaries.
         """
         # Handle batched call - just compute total nodes
         if batch_size is not None and agents_per_scenario is not None:
@@ -123,6 +126,15 @@ class SpatioTemporalGNNBatched(nn.Module):
                 self.hidden_dim,
                 device=device
             )
+    
+    def detach_hidden_states(self):
+        """Detach GRU hidden states from computation graph (for truncated BPTT).
+        
+        Call this periodically during long rollouts to prevent memory explosion
+        while still allowing gradients to flow within the truncation window.
+        """
+        if self.gru_hidden is not None:
+            self.gru_hidden = self.gru_hidden.detach()
     
     def _spatial_layer_forward(self, h, layer, norm, is_last):
         """Single spatial layer forward pass (for gradient checkpointing)."""
@@ -187,24 +199,35 @@ class SpatioTemporalGNNBatched(nn.Module):
         total_nodes = x.size(0)
         
         # Initialize GRU hidden state if needed
+        # Hidden state shape: [num_layers, total_nodes, hidden_dim]
         if self.gru_hidden is None or self.gru_hidden.size(1) != total_nodes:
             self.reset_gru_hidden_states(total_nodes, device)
         
         if self.gru_hidden.device != device:
             self.gru_hidden = self.gru_hidden.to(device)
         
-        # 1. Spatial encoding (already batched via PyG)
+        # 1. Spatial encoding (already batched via PyG - very GPU efficient)
         spatial_features = self.spatial_encoding(x, edge_index, edge_weight)
         
         # 2. Temporal encoding
-        # GRU input: [seq_len=1, total_nodes, hidden_dim]
-        # Each node is treated as an independent sequence
-        gru_input = spatial_features.unsqueeze(0)
+        # GRU with batch_first=True expects: [batch, seq_len, features]
+        # We treat each node as a separate sequence, processing one timestep at a time
+        # Input: [total_nodes, 1, hidden_dim] - all nodes process their next timestep in parallel
+        gru_input = spatial_features.unsqueeze(1)  # [total_nodes, 1, hidden_dim]
         
+        # GRU forward: processes all nodes in parallel on GPU
+        # This is efficient because cuDNN GRU kernels are optimized for large batch sizes
         gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
-        self.gru_hidden = new_hidden.detach()
         
-        temporal_features = gru_output.squeeze(0)
+        # CRITICAL: During training, maintain gradient flow for temporal learning
+        # During evaluation, detach to save memory
+        if self.training:
+            self.gru_hidden = new_hidden
+        else:
+            self.gru_hidden = new_hidden.detach()
+        
+        # Output: [total_nodes, 1, hidden_dim] -> [total_nodes, hidden_dim]
+        temporal_features = gru_output.squeeze(1)
         
         # 3. Skip connection + decode
         decoder_input = torch.cat([temporal_features, x], dim=-1)
@@ -226,9 +249,13 @@ class SpatioTemporalGNNBatched(nn.Module):
         self._init_weights()
     
     def forward_sequence(self, x_sequence, edge_index, edge_weight=None):
-        """Forward pass for entire sequence (useful for testing)."""
+        """Forward pass for entire sequence (useful for testing).
+        
+        Processes timesteps sequentially, maintaining GRU hidden state.
+        """
         num_nodes = x_sequence[0].size(0)
-        self.reset_gru_hidden_states(num_nodes)
+        device = x_sequence[0].device
+        self.reset_gru_hidden_states(num_nodes, device)
         
         predictions = []
         for t, x_t in enumerate(x_sequence):
@@ -236,3 +263,78 @@ class SpatioTemporalGNNBatched(nn.Module):
             predictions.append(pred_t)
         
         return predictions
+    
+    def forward_sequence_parallel(self, x_sequence, edge_index, edge_weight=None):
+        """Forward pass for entire sequence with maximum GPU parallelism.
+        
+        This method processes all timesteps' spatial encodings in parallel,
+        then processes the temporal sequence through GRU. More GPU efficient
+        for inference when we have the full sequence available.
+        
+        Args:
+            x_sequence: List of T tensors, each [num_nodes, input_dim]
+            edge_index: Edge connectivity [2, num_edges]
+            edge_weight: Optional edge weights
+            
+        Returns:
+            List of T prediction tensors, each [num_nodes, output_dim]
+        """
+        if len(x_sequence) == 0:
+            return []
+        
+        T = len(x_sequence)
+        num_nodes = x_sequence[0].size(0)
+        device = x_sequence[0].device
+        
+        # 1. Batch all spatial encodings (very GPU efficient)
+        # Stack all timesteps: [T * num_nodes, input_dim]
+        x_stacked = torch.cat(x_sequence, dim=0)
+        
+        # Expand edge_index for all timesteps
+        edge_indices = []
+        for t in range(T):
+            offset = t * num_nodes
+            edge_indices.append(edge_index + offset)
+        edge_index_stacked = torch.cat(edge_indices, dim=1)
+        
+        # Expand edge weights if present
+        edge_weight_stacked = None
+        if edge_weight is not None:
+            edge_weight_stacked = edge_weight.repeat(T)
+        
+        # Single GCN forward for all timesteps at once
+        spatial_features_stacked = self.spatial_encoding(
+            x_stacked, edge_index_stacked, edge_weight_stacked
+        )
+        
+        # Reshape to [T, num_nodes, hidden_dim]
+        spatial_features = spatial_features_stacked.view(T, num_nodes, self.hidden_dim)
+        
+        # 2. Temporal encoding: GRU processes all timesteps at once
+        # Transpose for batch_first=True: [num_nodes, T, hidden_dim]
+        gru_input = spatial_features.transpose(0, 1)
+        
+        # Reset hidden states
+        self.reset_gru_hidden_states(num_nodes, device)
+        
+        # GRU forward: [num_nodes, T, hidden_dim]
+        gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
+        self.gru_hidden = new_hidden.detach()
+        
+        # 3. Decode all timesteps at once
+        # gru_output: [num_nodes, T, hidden_dim]
+        # x_sequence stacked for skip connection: [num_nodes, T, input_dim]
+        x_for_skip = torch.stack(x_sequence, dim=1)  # [num_nodes, T, input_dim]
+        
+        decoder_input = torch.cat([gru_output, x_for_skip], dim=-1)  # [num_nodes, T, hidden+input]
+        
+        # Flatten for decoder: [num_nodes * T, hidden+input]
+        decoder_input_flat = decoder_input.view(-1, decoder_input.size(-1))
+        predictions_flat = self.decoder(decoder_input_flat)
+        predictions_flat = torch.clamp(predictions_flat, min=-5.0, max=5.0)
+        
+        # Reshape back: [num_nodes, T, output_dim] -> list of T tensors
+        predictions = predictions_flat.view(num_nodes, T, self.output_dim)
+        predictions_list = [predictions[:, t, :] for t in range(T)]
+        
+        return predictions_list
