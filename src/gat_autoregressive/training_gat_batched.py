@@ -290,7 +290,7 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
     print(f"  MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
     print(f"  CosSim: {avg_cosine_sim:.4f} (target: >0.7) | AngleErr: {avg_angle_error:.4f} rad")
     if avg_cosine_sim < 0.5:
-        print(f"  ⚠️  WARNING: Low cosine similarity indicates poor direction learning!")
+        print(f"  WARNING: Low cosine similarity indicates poor direction learning!")
     
     # Call visualization AFTER epoch completes (model is still in train mode but no backward pending)
     if visualize_callback is not None and last_batch_dict is not None:

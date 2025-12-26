@@ -110,7 +110,12 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
         print(f"Loading pre-trained GCN model from {checkpoint_path}...")
         
         # Infer GCN architecture from checkpoint weights
-        gcn_layer_keys = ['spatial_layers.0.lin.weight', 'module.spatial_layers.0.lin.weight']
+        # Try multiple key formats: regular, DataParallel (module.), and torch.compile (_orig_mod.)
+        gcn_layer_keys = [
+            'spatial_layers.0.lin.weight',
+            'module.spatial_layers.0.lin.weight',
+            '_orig_mod.spatial_layers.0.lin.weight'
+        ]
         
         checkpoint_hidden_dim = None
         print(f"  First 10 keys in checkpoint state_dict:")
@@ -1443,22 +1448,22 @@ def run_autoregressive_finetuning(
     is_parallel = False
     if os.path.exists(pretrained_checkpoint_batched):
         print(f"Found batched checkpoint: {pretrained_checkpoint_batched}")
-        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched, device)
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched, device, model_type=model_type)
         pretrained_checkpoint = pretrained_checkpoint_batched
     elif pretrained_checkpoint is not None and os.path.exists(pretrained_checkpoint):
         print(f"Found checkpoint: {pretrained_checkpoint}")
-        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint, device)
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint, device, model_type=model_type)
     elif pretrained_checkpoint_2 is not None and os.path.exists(pretrained_checkpoint_2):
         print(f"Found checkpoint: {pretrained_checkpoint_2}")
-        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_2, device)
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_2, device, model_type=model_type)
         pretrained_checkpoint = pretrained_checkpoint_2
     elif pretrained_checkpoint_3 is not None and os.path.exists(pretrained_checkpoint_3):
         print(f"Found checkpoint: {pretrained_checkpoint_3}")
-        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_3, device)
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_3, device, model_type=model_type)
         pretrained_checkpoint = pretrained_checkpoint_3
     elif pretrained_checkpoint_4 is not None and os.path.exists(pretrained_checkpoint_4):
         print(f"Found checkpoint: {pretrained_checkpoint_4}")
-        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_4, device)
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_4, device, model_type=model_type)
         pretrained_checkpoint = pretrained_checkpoint_4
     else:
         raise FileNotFoundError(
