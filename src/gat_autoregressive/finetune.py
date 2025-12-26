@@ -1058,13 +1058,6 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         gt_current_pos = source_gt_graph.pos.to(pred.dtype)
                         gt_next_pos = target_graph.pos.to(pred.dtype)
                         target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
-                
-                # Model predicts displacement directly [N, 2]
-                pred_aligned = pred[pred_indices]
-                target = target_graph.y[target_indices].to(pred.dtype)
-            else:
-                pred_aligned = pred
-                target = target_graph.y.to(pred.dtype)
             
             # Check for NaN in predictions or targets before computing loss
             if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
