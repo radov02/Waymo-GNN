@@ -213,7 +213,7 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     # Scale from 0.1 (end of warmup) to 0.5 (final epoch)
     # CRITICAL: Max capped at 0.5 to maintain training stability
     min_sampling = 0.1
-    max_sampling = 0.5
+    max_sampling = 0.8
     
     if strategy == 'linear' or strategy == 'delayed_linear':
         return min_sampling + progress * (max_sampling - min_sampling)

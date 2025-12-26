@@ -512,20 +512,30 @@ def run_testing(test_dataset_path=test_hdf5_path,
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
-        # Try autoregressive checkpoint first, fall back to base checkpoint
+        # Try autoregressive checkpoint first (new location), then root dir (old location), then base checkpoint
         autoreg_path = os.path.join(gcn_checkpoint_dir_autoreg, 'finetuned_scheduled_sampling_best.pt')
+        root_autoreg_path = os.path.join('checkpoints', 'finetuned_scheduled_sampling_best.pt')
         base_path = os.path.join(gcn_checkpoint_dir, 'best_model.pt')
+        root_base_path = os.path.join('checkpoints', 'best_model.pt')
         
         if os.path.exists(autoreg_path):
             checkpoint_path = autoreg_path
-            print(f"Using autoregressive fine-tuned checkpoint")
+            print(f"Using autoregressive fine-tuned checkpoint: {autoreg_path}")
+        elif os.path.exists(root_autoreg_path):
+            checkpoint_path = root_autoreg_path
+            print(f"Using autoregressive fine-tuned checkpoint: {root_autoreg_path}")
         elif os.path.exists(base_path):
             checkpoint_path = base_path
-            print(f"Using base single-step checkpoint")
+            print(f"Using base single-step checkpoint: {base_path}")
+        elif os.path.exists(root_base_path):
+            checkpoint_path = root_base_path
+            print(f"Using base single-step checkpoint: {root_base_path}")
         else:
             print(f"ERROR: No checkpoint found!")
             print(f"  Checked: {autoreg_path}")
+            print(f"  Checked: {root_autoreg_path}")
             print(f"  Checked: {base_path}")
+            print(f"  Checked: {root_base_path}")
             if use_wandb:
                 wandb.finish(exit_code=1)
             return None
