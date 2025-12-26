@@ -1,4 +1,8 @@
 """Fine-tune single-step GCN model for autoregressive prediction using scheduled sampling."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import (autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy)
 from gat_autoregressive.finetune import run_autoregressive_finetuning
 
