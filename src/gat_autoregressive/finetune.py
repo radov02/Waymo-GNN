@@ -856,7 +856,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         
         # Initialize per-agent error tracking for ADE/FDE computation
         # Track displacement error (in meters) per agent per timestep
-        current_rollout_errors = torch.zeros(current_graph.x.shape[0], effective_rollout, device=device)
+        # NOTE: This will be resized after first step when we know aligned agent count
+        current_rollout_errors = None
+        aligned_agent_count = None
 
         for step in range(effective_rollout):
             target_t = t + step + 1
@@ -1109,9 +1111,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # Convert displacement error to meters
                 step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE  # [num_agents]
                 
-                # Store errors for this step in the current rollout
-                if step < effective_rollout and step_errors_meters.shape[0] <= current_rollout_errors.shape[0]:
-                    current_rollout_errors[:step_errors_meters.shape[0], step] = step_errors_meters
+                # Initialize error tensor on first step with correct aligned agent count
+                if current_rollout_errors is None:
+                    aligned_agent_count = step_errors_meters.shape[0]
+                    current_rollout_errors = torch.zeros(aligned_agent_count, effective_rollout, device=device)
+                
+                # Store errors for this step - only if agent count matches
+                if step < effective_rollout and step_errors_meters.shape[0] == aligned_agent_count:
+                    current_rollout_errors[:, step] = step_errors_meters
             
             if step < num_rollout_steps - 1:
                 # Scheduled sampling: sometimes use prediction, sometimes use GT
@@ -1160,8 +1167,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             total_loss += rollout_loss.item()
             steps += 1
             
-            # Save rollout errors for ADE/FDE computation
-            train_agent_errors.append(current_rollout_errors.cpu().numpy())
+            # Save rollout errors for ADE/FDE computation - only if initialized
+            if current_rollout_errors is not None and current_rollout_errors.abs().sum() > 0:
+                train_agent_errors.append(current_rollout_errors.cpu().numpy())
         
         if batch_idx % 20 == 0:
             loss_val = rollout_loss.item() if rollout_loss is not None and hasattr(rollout_loss, 'item') else 0.0
@@ -1288,7 +1296,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             is_using_predicted_positions = False
             
             # Initialize per-agent error tracking for this batch's rollout
-            current_rollout_errors = torch.zeros(current_graph.x.shape[0], effective_rollout, device=device)
+            # Will be resized after first step when we know aligned agent count
+            current_rollout_errors = None
+            aligned_agent_count = None
             
             for step in range(effective_rollout):
                 target_t = start_t + step + 1
@@ -1343,12 +1353,16 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Error in meters: ||pred_disp - target_disp|| * POSITION_SCALE
                 step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
                 
-                # Store errors for this step
-                if step < effective_rollout and step_errors_meters.shape[0] == current_rollout_errors.shape[0]:
+                # Initialize error tensor on first step with actual agent count
+                if current_rollout_errors is None:
+                    aligned_agent_count = step_errors_meters.shape[0]
+                    current_rollout_errors = torch.zeros(aligned_agent_count, effective_rollout, device=device)
+                
+                # Store errors for this step - only if agent count matches
+                if step < effective_rollout and step_errors_meters.shape[0] == aligned_agent_count:
                     current_rollout_errors[:, step] = step_errors_meters
                 elif batch_idx == 0 and step < 5:
-                    print(f"    [WARNING] Step {step}: Cannot store errors. step={step}, effective_rollout={effective_rollout}, "
-                          f"step_errors shape={step_errors_meters.shape}, rollout_errors shape={current_rollout_errors.shape}")
+                    print(f"    [WARNING] Step {step}: Agent count mismatch. expected={aligned_agent_count}, got={step_errors_meters.shape[0]}")
                 
                 # Debug: print position drift for first batch
                 if batch_idx == 0 and not debug_printed:
