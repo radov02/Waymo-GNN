@@ -60,7 +60,7 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                 num_gat_layers=config.get('num_layers', num_layers),
                 num_gru_layers=config.get('num_gru_layers', num_gru_layers),
                 dropout=config.get('dropout', dropout),
-                num_heads=config.get('num_heads', gat_num_heads),
+                num_heads=config.get('num_attention_heads', config.get('num_heads', gat_num_heads)),
                 max_agents_per_scenario=128
             )
         else:
