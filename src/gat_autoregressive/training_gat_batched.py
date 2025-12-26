@@ -58,7 +58,6 @@ from config import (device, gat_num_workers, num_layers, num_gru_layers, epochs,
                     visualize_every_n_epochs, debug_mode,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta,
                     scheduler_patience, scheduler_factor, min_lr, gat_prefetch_factor,
-                    early_stopping_patience, early_stopping_min_delta,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
                     print_gpu_info, pin_memory, gat_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
@@ -79,68 +78,6 @@ BATCHED_BATCH_SIZE = batch_size  # Use batch_size from config.py
 # GAT-specific directories
 VIZ_DIR = 'visualizations/autoreg/gat'
 cfg.viz_training_dir = VIZ_DIR
-
-
-class OverfittingDetector:
-    """Detect overfitting by tracking when train loss decreases but val loss increases.
-    
-    Stops training after patience consecutive epochs of overfitting.
-    """
-    
-    def __init__(self, patience=4, min_delta=0.001, verbose=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.verbose = verbose
-        self.overfit_counter = 0
-        self.best_val_loss = None
-        self.prev_train_loss = None
-        self.prev_val_loss = None
-        self.should_stop = False
-        
-    def __call__(self, train_loss, val_loss):
-        """Check if we're overfitting: train loss decreasing but val loss increasing."""
-        
-        # Initialize on first call
-        if self.best_val_loss is None:
-            self.best_val_loss = val_loss
-            self.prev_train_loss = train_loss
-            self.prev_val_loss = val_loss
-            return
-        
-        # Track best validation loss
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-        
-        # Detect overfitting: train improves but val gets worse
-        train_improved = train_loss < (self.prev_train_loss - self.min_delta)
-        val_worsened = val_loss > (self.prev_val_loss + self.min_delta)
-        
-        if train_improved and val_worsened:
-            self.overfit_counter += 1
-            if self.verbose:
-                print(f"  Overfitting detected: train {self.prev_train_loss:.4f}->{train_loss:.4f}, "
-                      f"val {self.prev_val_loss:.4f}->{val_loss:.4f} "
-                      f"({self.overfit_counter}/{self.patience})")
-            
-            if self.overfit_counter >= self.patience:
-                self.should_stop = True
-                if self.verbose:
-                    print(f"\n  STOPPING: Overfitting detected for {self.patience} consecutive epochs!")
-        else:
-            # Reset counter if not overfitting
-            if self.overfit_counter > 0 and self.verbose:
-                print(f"  No overfitting this epoch, counter reset")
-            self.overfit_counter = 0
-        
-        self.prev_train_loss = train_loss
-        self.prev_val_loss = val_loss
-            
-    def reset(self):
-        self.overfit_counter = 0
-        self.best_val_loss = None
-        self.prev_train_loss = None
-        self.prev_val_loss = None
-        self.should_stop = False
 
 
 # ============== WORKER INIT FUNCTION (MODULE LEVEL FOR PICKLING) ==============
@@ -492,7 +429,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 "loss_gamma": loss_gamma,
                 "loss_delta": loss_delta,
                 "scheduler": "ReduceLROnPlateau",
-                "early_stopping_patience": early_stopping_patience,
                 "batched_training": True
             },
             name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}",
@@ -602,12 +538,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         persistent_workers=True if gat_num_workers > 0 else False,
         worker_init_fn=worker_init_fn if gat_num_workers > 0 else None
     )
-
-    overfit_detector = OverfittingDetector(
-        patience=4,  # Stop after 4 consecutive epochs of overfitting
-        min_delta=early_stopping_min_delta, 
-        verbose=True
-    )
     
     print(f"Training on {device}")
     print(f"Dataset: {len(dataset)} scenarios")
@@ -700,7 +630,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 "val/mse": val_mse,
                 "val/cosine_similarity": val_cos,
                 "val/angle_error": val_angle,
-                "train_val_gap": train_loss - val_loss  # Track overfitting (positive = overfitting)
+                "train_val_gap": train_loss - val_loss
             })
         
         # Single wandb.log call with all metrics for this epoch
@@ -709,9 +639,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         # Continue with scheduler and checkpoint saving
         if val_dataloader is not None:
             scheduler.step(val_loss)
-            
-            # Check for overfitting with both train and val loss
-            overfit_detector(train_loss, val_loss)
+        
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -723,14 +651,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 print(f"   New best validation loss: {val_loss:.4f} at epoch {epoch+1}")
         else:
             scheduler.step(train_loss)
-            print("   No validation data - cannot detect overfitting")
-        
-        if overfit_detector.should_stop:
-            print(f"\n{'='*60}")
-            print(f"Training stopped at epoch {epoch+1} due to overfitting")
-            print(f"Best validation loss: {best_val_loss:.4f}")
-            print(f"{'='*60}")
-            break
     
     # Save best model checkpoint after training completes
     if best_model_state is not None:

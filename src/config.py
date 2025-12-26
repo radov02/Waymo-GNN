@@ -51,9 +51,6 @@ gradient_clip_value = 1.0  # gradient clipping threshold to prevent exploding gr
 scheduler_patience = 5  # wait scheduler_patience epochs before reducing LR
 scheduler_factor = 0.5  # reduce LR by scheduler_factor*100 % when triggered
 min_lr = 1e-5         # minimum learning rate
-# Early stopping settings:
-early_stopping_patience = 10  # stop if no improvement for N epochs
-early_stopping_min_delta = 0.00000001  # minimum improvement to count as progress
 # Loss weights - balance direction and magnitude for accurate trajectory prediction:
 loss_alpha = 0.2    # angle weight (directional accuracy)
 loss_beta = 0.5     # MSE weight (positional accuracy) - the primary loss for magnitude
@@ -112,8 +109,6 @@ vectornet_gradient_clip = 1.0
 vectornet_scheduler_patience = 5
 vectornet_scheduler_factor = 0.5
 vectornet_min_lr = 1e-6
-vectornet_early_stopping_patience = 10
-vectornet_early_stopping_min_delta = 0.0000001
 # Loss Weights:
 vectornet_loss_alpha = 0.2    # Angle loss weight
 vectornet_loss_beta = 0.5     # MSE loss weight (primary)
