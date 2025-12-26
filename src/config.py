@@ -36,7 +36,8 @@ gcn_viz_dir = 'visualizations/gcn'
 gcn_viz_dir_autoreg = 'visualizations/gcn/autoreg'
 gcn_viz_dir_testing = 'visualizations/gcn/autoreg/testing'
 # and GAT-specific configuration:
-gat_num_heads = 4                   # number of attention heads in GAT
+gat_num_heads = 8                   # number of attention heads in GAT (increased from 4 for better spatial modeling)
+gat_learning_rate = 0.0001         # GAT-specific LR: 1e-4 for stable attention training (vs 1e-3 for GCN)
 gat_checkpoint_dir = 'checkpoints/gat'
 gat_checkpoint_dir_autoreg = 'checkpoints/gat/autoregressive'
 gat_viz_dir = 'visualizations/gat'
@@ -58,8 +59,13 @@ loss_alpha = 0.4    # angle weight (directional accuracy) - INCREASED from 0.2
 loss_beta = 0.3     # MSE weight (positional accuracy) - DECREASED from 0.5
 loss_gamma = 0.1    # Velocity magnitude consistency
 loss_delta = 0.4    # Cosine similarity (directional signal) - INCREASED from 0.2
+# GAT-specific loss weights (GAT needs more displacement focus, less angle focus):
+gat_loss_alpha = 0.15   # angle weight - LOWER than GCN (GAT learns direction via attention)
+gat_loss_beta = 0.6     # MSE weight - HIGHER (prioritize actual displacement accuracy)
+gat_loss_gamma = 0.1    # velocity magnitude consistency
+gat_loss_delta = 0.15   # cosine similarity - balanced with angle
 # Training:
-visualize_every_n_epochs = 9
+visualize_every_n_epochs = 5
 visualize_final_epoch = True        # Always visualize the final epoch regardless of visualize_every_n_epochs
 visualize_first_batch_only = False
 max_nodes_per_graph_viz = 9  # max nodes to show per graph in visualization

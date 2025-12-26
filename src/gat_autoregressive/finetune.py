@@ -448,6 +448,9 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             # if graph_for_prediction.x.shape[0] != target_graph.num_nodes:
             #     break
             
+            # Filter prediction graph to first scenario (batch_idx=0) for tracking agents
+            pred_scenario_indices, current_agent_ids, _ = filter_to_scenario(graph_for_prediction, 0, B)
+            
             # GAT forward pass with agent_ids for per-agent GRU tracking
             agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
             pred = model(graph_for_prediction.x, graph_for_prediction.edge_index,

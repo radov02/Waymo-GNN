@@ -57,11 +57,12 @@ from config import (device, gat_num_workers, num_layers, num_gru_layers, epochs,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, debug_mode,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta,
+                    gat_learning_rate, gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta,
                     scheduler_patience, scheduler_factor, min_lr, gat_prefetch_factor,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
                     print_gpu_info, pin_memory, gat_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
-                    cache_validation_data, max_validation_scenarios, batch_size, gat_checkpoint_dir)
+                    cache_validation_data, max_validation_scenarios, batch_size, gat_checkpoint_dir, gat_num_heads)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
@@ -433,23 +434,23 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             config={
                 "model": "SpatioTemporalGAT_Batched",
                 "batch_size": batch_size,
-                "learning_rate": learning_rate,
+                "learning_rate": gat_learning_rate,
                 "dataset": dataset_name,
                 "dropout": dropout,
                 "hidden_channels": hidden_channels,
                 "num_gat_layers": num_layers,
                 "num_gru_layers": num_gru_layers,
                 "use_gat": True,
-                "num_heads": 4,
+                "num_heads": gat_num_heads,
                 "epochs": epochs,
-                "loss_alpha": loss_alpha,
-                "loss_beta": loss_beta,
-                "loss_gamma": loss_gamma,
-                "loss_delta": loss_delta,
+                "loss_alpha": gat_loss_alpha,
+                "loss_beta": gat_loss_beta,
+                "loss_gamma": gat_loss_gamma,
+                "loss_delta": gat_loss_delta,
                 "scheduler": "ReduceLROnPlateau",
                 "batched_training": True
             },
-            name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}",
+            name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}",
             dir="../wandb"
         )
         should_finish_wandb = True    
@@ -467,8 +468,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     wandb.define_metric("val/angle_error", step_metric="epoch")
     wandb.define_metric("learning_rate", step_metric="epoch")
     wandb.define_metric("train_val_gap", step_metric="epoch")
-    # Initialize batched model
-    num_attention_heads = 4  # Number of attention heads for GAT
+    # Initialize batched model with GAT-specific attention heads
     model = SpatioTemporalGATBatched(
         input_dim=input_dim,
         hidden_dim=hidden_channels,
@@ -476,7 +476,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         num_gat_layers=num_layers,
         num_gru_layers=num_gru_layers,
         dropout=dropout,
-        num_heads=num_attention_heads,
+        num_heads=gat_num_heads,  # Use config value (8 heads for better spatial modeling)
         use_gradient_checkpointing=use_gradient_checkpointing,
         max_agents_per_scenario=128  # Adjust based on your data
     )
@@ -495,7 +495,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     model, is_parallel = setup_model_parallel(model, device)
     wandb.watch(model, log='all', log_freq=10)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=gat_learning_rate)  # Use GAT-specific LR
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
                                   patience=scheduler_patience, min_lr=min_lr)
     loss_fn = advanced_directional_loss
@@ -562,7 +562,9 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Batch size: {batch_size} scenarios/batch (GPU parallel)")
     print(f"Batches per epoch: {len(dataloader)}")
     print(f"Sequence length: {sequence_length}")
-    print(f"Learning rate: {learning_rate}")
+    print(f"Learning rate: {gat_learning_rate} (GAT-optimized)")
+    print(f"Attention heads: {gat_num_heads}")
+    print(f"Loss weights: α={gat_loss_alpha}, β={gat_loss_beta}, γ={gat_loss_gamma}, δ={gat_loss_delta}")
     print(f"Mixed Precision: {'BF16' if use_bf16 else 'FP16' if use_amp else 'Disabled'}")
     print(f"Checkpoints: {gat_checkpoint_dir}\n")
     
@@ -581,7 +583,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     best_model_state = None
     best_optimizer_state = None
     best_epoch = 0
-    checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt'
+    checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
     checkpoint_path = os.path.join(gat_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
     
@@ -611,10 +613,10 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                     traceback.print_exc()
             last_viz_batch = batch_dict
         
-        # Training
+        # Training (use GAT-specific loss weights)
         train_loss, train_mse, train_cos, train_angle, _ = train_single_epoch_batched(
             model, dataloader, optimizer, loss_fn,
-            loss_alpha, loss_beta, loss_gamma, loss_delta,
+            gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta,
             device, epoch, scaler=scaler, amp_dtype=amp_dtype,
             visualize_callback=viz_callback
         )
@@ -632,11 +634,11 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             "learning_rate": optimizer.param_groups[0]['lr']
         }
         
-        # Validation
+        # Validation (use GAT-specific loss weights)
         if val_dataloader is not None:
             val_loss, val_mse, val_cos, val_angle = validate_single_epoch_batched(
                 model, val_dataloader, loss_fn,
-                loss_alpha, loss_beta, loss_gamma, loss_delta, device
+                gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta, device
             )
             
             print(f"[Valid] Loss: {val_loss:.4f} | MSE: {val_mse:.4f} | "
@@ -683,12 +685,16 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             'config': {
                 'batch_size': batch_size,
                 'hidden_channels': hidden_channels,
-                'learning_rate': learning_rate,
-                'num_attention_heads': num_attention_heads,
+                'learning_rate': gat_learning_rate,
+                'num_attention_heads': gat_num_heads,
                 'num_layers': num_layers,
                 'num_gru_layers': num_gru_layers,
                 'dropout': dropout,
-                'use_gat': True
+                'use_gat': True,
+                'loss_alpha': gat_loss_alpha,
+                'loss_beta': gat_loss_beta,
+                'loss_gamma': gat_loss_gamma,
+                'loss_delta': gat_loss_delta
             }
         }, checkpoint_path)
         print(f"Best GAT model saved to {checkpoint_filename}")
@@ -701,7 +707,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"\n{'='*60}")
     print(f"Saving final model from epoch {epoch+1}...")
     save_model = get_model_for_saving(model, is_parallel)
-    final_checkpoint_filename = f'final_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt'
+    final_checkpoint_filename = f'final_gat_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
     final_checkpoint_path = os.path.join(gat_checkpoint_dir, final_checkpoint_filename)
     torch.save({
         'epoch': epoch + 1,
@@ -712,12 +718,16 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         'config': {
             'batch_size': batch_size,
             'hidden_channels': hidden_channels,
-            'learning_rate': learning_rate,
-            'num_attention_heads': num_attention_heads,
+            'learning_rate': gat_learning_rate,
+            'num_attention_heads': gat_num_heads,
             'num_layers': num_layers,
             'num_gru_layers': num_gru_layers,
             'dropout': dropout,
-            'use_gat': True
+            'use_gat': True,
+            'loss_alpha': gat_loss_alpha,
+            'loss_beta': gat_loss_beta,
+            'loss_gamma': gat_loss_gamma,
+            'loss_delta': gat_loss_delta
         }
     }, final_checkpoint_path)
     print(f"Final GAT model saved to {final_checkpoint_filename}")
