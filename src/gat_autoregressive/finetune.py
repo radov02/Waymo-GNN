@@ -17,7 +17,7 @@ from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     input_dim, output_dim, sequence_length, hidden_channels,
-                    dropout, learning_rate, project_name, dataset_name, epochs,
+                    dropout, learning_rate, project_name, dataset_name, epochs, gat_learning_rate,
                     gradient_clip_value, gat_num_heads, gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
                     autoreg_num_rollout_steps, autoreg_num_epochs, autoreg_sampling_strategy,
@@ -1443,7 +1443,7 @@ def run_autoregressive_finetuning(
     # construct checkpoint filename based on training script's naming convention:
     
     if model_type == "gat":
-        checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
+        checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
         os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
@@ -1493,7 +1493,7 @@ def run_autoregressive_finetuning(
             "model": "SpatioTemporalGATBatched_Autoregressive" if model_type == "gat" else "SpatioTemporalGCNBatched_Autoregressive",
             "pretrained_from": pretrained_checkpoint,
             "batch_size": batch_size,
-            "learning_rate": learning_rate * 0.1,
+            "learning_rate": gat_learning_rate if model_type == "gat" else learning_rate,
             "dataset": dataset_name,
             "num_rollout_steps": num_rollout_steps,
             "prediction_horizon": f"{num_rollout_steps * 0.1}s",
@@ -1507,7 +1507,7 @@ def run_autoregressive_finetuning(
     
     wandb.watch(model, log='all', log_freq=10)
     
-    finetune_lr = learning_rate * 0.05      # make lower to help with stability (prevent NaN gradients during scheduled sampling)
+    finetune_lr = (gat_learning_rate if model_type == "gat" else learning_rate)
     optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7)
     
