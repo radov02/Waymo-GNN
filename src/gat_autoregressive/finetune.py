@@ -1077,15 +1077,15 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             
             # Combined displacement loss
             disp_loss = 0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss
-                
-                # Final NaN check
-                if torch.isnan(disp_loss):
-                    print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
-                    continue
-                
-                # Temporal discount for autoregressive stability
-                discount = 0.97 ** step
-                step_loss = disp_loss * discount
+            
+            # Final NaN check
+            if torch.isnan(disp_loss):
+                print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
+                continue
+            
+            # Temporal discount for autoregressive stability
+            discount = 0.97 ** step
+            step_loss = disp_loss * discount
             
             if rollout_loss is None:
                 rollout_loss = step_loss
