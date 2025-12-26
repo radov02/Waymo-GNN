@@ -10,6 +10,7 @@ data/graphs/training/*
 checkpoints/*
 
 .env
+venv
 wandb/*
 
 __pycache__/
@@ -22,6 +23,7 @@ visualizations/scenario_sequence/*.png
 visualizations/training/*
 visualizations/autoreg/*.png
 visualizations/autoreg/gat/*.png
+visualizations/vectornet/*.png
 
 src/wandb/*
 

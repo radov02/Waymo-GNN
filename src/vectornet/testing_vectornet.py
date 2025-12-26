@@ -47,7 +47,11 @@ def load_model(checkpoint_path, device):
         'num_heads': vectornet_num_heads,
         'dropout': vectornet_dropout,
         'history_length': vectornet_history_length,
+        'node_mask_ratio': 0.0,  # Default: no masking during inference
     })
+    
+    # Get node completion config (defaults for backwards compatibility)
+    node_mask_ratio = config.get('node_mask_ratio', 0.0)
     
     model = VectorNetTFRecord(
         agent_input_dim=AGENT_VECTOR_DIM,
@@ -58,7 +62,9 @@ def load_model(checkpoint_path, device):
         num_polyline_layers=config.get('num_polyline_layers', vectornet_num_polyline_layers),
         num_global_layers=config.get('num_global_layers', vectornet_num_global_layers),
         num_heads=config.get('num_heads', vectornet_num_heads),
-        dropout=config.get('dropout', vectornet_dropout)
+        dropout=config.get('dropout', vectornet_dropout),
+        node_mask_ratio=0.0,  # Always 0 during inference (no masking)
+        mask_target_polyline=False,
     )
     
     state_dict = checkpoint['model_state_dict']     # load weights

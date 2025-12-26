@@ -66,6 +66,14 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--num_workers', type=int, default=4)
     
+    # Node completion task arguments
+    parser.add_argument('--node_mask_ratio', type=float, default=0.15,
+                       help='Ratio of polylines to mask for node completion task (paper: 0.15)')
+    parser.add_argument('--lambda_node', type=float, default=1.0,
+                       help='Weight for node completion loss (paper: lambda=1.0)')
+    parser.add_argument('--no_node_completion', action='store_true',
+                       help='Disable node completion auxiliary task')
+    
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb')
     parser.add_argument('--resume', type=str, default=None, 
                        help='Resume from checkpoint')
@@ -111,6 +119,35 @@ def multistep_trajectory_loss(pred, target, valid_mask=None,
         delta * endpoint_loss
     )
     return total_loss
+
+def node_completion_loss(node_completion_dict):
+    """Compute node completion loss (L_node) from masked polyline reconstruction.
+    
+    This implements the auxiliary task from the VectorNet paper where masked 
+    polyline features are reconstructed from global context.
+    
+    Args:
+        node_completion_dict: Dict containing:
+            - 'reconstructed': [num_masked, hidden_dim] reconstructed features
+            - 'original': [num_masked, hidden_dim] original features (pre-norm)
+            - 'masked_indices': [num_masked] indices of masked polylines
+            
+    Returns:
+        loss: Scalar Huber/SmoothL1 loss for masked polyline reconstruction
+    """
+    if node_completion_dict is None:
+        return torch.tensor(0.0)
+    
+    reconstructed = node_completion_dict['reconstructed']
+    original = node_completion_dict['original']
+    
+    if reconstructed.numel() == 0 or original.numel() == 0:
+        return torch.tensor(0.0, device=reconstructed.device)
+    
+    # Use SmoothL1 (Huber) loss as in the paper
+    loss = F.smooth_l1_loss(reconstructed, original, reduction='mean')
+    
+    return loss
 
 def compute_metrics(pred, target, valid_mask=None):
     """Compute ADE (Average Displacement Error) and FDE (Final Displacement Error) metrics using:
@@ -400,11 +437,25 @@ def visualize_vectornet_predictions(predictions, targets, valid_mask, scenario_i
     return filepath
 
 def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma, loss_delta,
-                gradient_clip, scaler=None, visualize_callback=None):
-    """Train for one epoch with gradient accumulation"""
+                gradient_clip, scaler=None, visualize_callback=None,
+                use_node_completion=True, lambda_node=1.0):
+    """Train for one epoch with gradient accumulation and optional node completion task.
+    
+    Args:
+        model: VectorNet model
+        dataloader: Training data loader
+        optimizer: Optimizer
+        loss_alpha, loss_beta, loss_gamma, loss_delta: Trajectory loss weights
+        gradient_clip: Gradient clipping value
+        scaler: AMP scaler (optional)
+        visualize_callback: Callback for visualization (optional)
+        use_node_completion: Whether to use node completion auxiliary task
+        lambda_node: Weight for node completion loss (paper: lambda=1.0)
+    """
     model.train()
     total_loss = 0.0
     total_traj_loss = 0.0
+    total_node_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     steps = 0
@@ -426,13 +477,18 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
         
         with torch.amp.autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
             
-            predictions = model(batch)  # forward pass, get [B, future_len, 2]
+            # Forward pass with optional node completion
+            if use_node_completion:
+                predictions, node_completion_dict = model(batch, return_node_completion=True)
+            else:
+                predictions = model(batch, return_node_completion=False)
+                node_completion_dict = None
             
             # Get targets:
             targets = batch['future_positions'].to(predictions.device)  # [B, future_len, 2]
             valid_mask = batch['future_valid'].to(predictions.device)   # [B, future_len]
             
-            # use trajectory loss
+            # Trajectory loss (L_traj)
             traj_loss = multistep_trajectory_loss(
                 predictions, targets, valid_mask,
                 alpha=loss_alpha,
@@ -441,7 +497,14 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
                 delta=loss_delta
             )
             
-            loss = traj_loss
+            # Node completion loss (L_node)
+            if use_node_completion and node_completion_dict is not None:
+                node_loss = node_completion_loss(node_completion_dict)
+            else:
+                node_loss = torch.tensor(0.0, device=predictions.device)
+            
+            # Combined loss: L = L_traj + lambda * L_node (paper formulation)
+            loss = traj_loss + lambda_node * node_loss
             loss = loss / accumulation_steps      # scale loss for gradient accumulation
             if torch.isnan(loss):
                 print(f"  Warning: NaN loss at batch {batch_idx}")
@@ -471,6 +534,7 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
         
         total_loss += (loss.item() * accumulation_steps)  # unscale for logging
         total_traj_loss += traj_loss.item()
+        total_node_loss += node_loss.item() if torch.is_tensor(node_loss) else node_loss
         total_ade += ade.item()
         total_fde += fde.item()
         steps += 1
@@ -486,6 +550,7 @@ def train_epoch(model, dataloader, optimizer, loss_alpha, loss_beta, loss_gamma,
     metrics = {
         'loss': total_loss / max(1, steps),
         'traj_loss': total_traj_loss / max(1, steps),
+        'node_loss': total_node_loss / max(1, steps),
         'ade': total_ade / max(1, steps),
         'fde': total_fde / max(1, steps),
     }
@@ -571,12 +636,25 @@ def main():
     epochs = args.epochs
     num_workers = args.num_workers
     
+    # Node completion parameters
+    use_node_completion = not args.no_node_completion
+    node_mask_ratio = args.node_mask_ratio
+    lambda_node = args.lambda_node
+    
     train_device = torch.device(str(device))
     print(f"Using device: {train_device}")
     
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Print node completion settings
+    if use_node_completion:
+        print(f"\nNode Completion Task: ENABLED")
+        print(f"  Mask ratio: {node_mask_ratio:.2%}")
+        print(f"  Lambda (L_node weight): {lambda_node}")
+    else:
+        print(f"\nNode Completion Task: DISABLED")
     
     if not args.no_wandb:
         run_name = vectornet_wandb_name or f"vectornet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -595,6 +673,9 @@ def main():
                 'num_workers': num_workers,
                 'max_train_scenarios': max_train_scenarios,
                 'max_val_scenarios': max_val_scenarios,
+                'use_node_completion': use_node_completion,
+                'node_mask_ratio': node_mask_ratio,
+                'lambda_node': lambda_node,
             },
         )
     else:
@@ -659,6 +740,8 @@ def main():
         num_global_layers=num_global_layers,
         num_heads=num_heads,
         dropout=vectornet_dropout,
+        node_mask_ratio=node_mask_ratio if use_node_completion else 0.0,
+        mask_target_polyline=False,  # Don't mask target polylines to keep trajectory prediction stable
     ).to(train_device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -755,9 +838,15 @@ def main():
         train_metrics = train_epoch(model, train_loader, optimizer,
                                    vectornet_loss_alpha, vectornet_loss_beta,
                                    vectornet_loss_gamma, vectornet_loss_delta,
-                                   vectornet_gradient_clip, scaler, visualize_callback=viz_callback)
-        print(f"\nTrain - Loss: {train_metrics['loss']:.4f} | "
-              f"ADE: {train_metrics['ade']:.4f} | FDE: {train_metrics['fde']:.4f}")
+                                   vectornet_gradient_clip, scaler, visualize_callback=viz_callback,
+                                   use_node_completion=use_node_completion, lambda_node=lambda_node)
+        if use_node_completion:
+            print(f"\nTrain - Loss: {train_metrics['loss']:.4f} | "
+                  f"Traj: {train_metrics['traj_loss']:.4f} | Node: {train_metrics['node_loss']:.4f} | "
+                  f"ADE: {train_metrics['ade']:.4f} | FDE: {train_metrics['fde']:.4f}")
+        else:
+            print(f"\nTrain - Loss: {train_metrics['loss']:.4f} | "
+                  f"ADE: {train_metrics['ade']:.4f} | FDE: {train_metrics['fde']:.4f}")
         
         # validate:
         val_metrics = validate(model, val_loader,
@@ -772,7 +861,7 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
         
         # Log epoch-averaged metrics (one point per epoch)
-        wandb.log({
+        log_dict = {
             "epoch": epoch + 1,
             "train/loss": train_metrics['loss'],
             "train/traj_loss": train_metrics['traj_loss'],
@@ -782,7 +871,10 @@ def main():
             "val/ade": val_metrics['ade'],
             "val/fde": val_metrics['fde'],
             "learning_rate": current_lr,
-        }, commit=True)
+        }
+        if use_node_completion:
+            log_dict["train/node_loss"] = train_metrics['node_loss']
+        wandb.log(log_dict, commit=True)
         
         # Save best model state in memory:
         if val_metrics['loss'] < best_val_loss:
@@ -817,6 +909,9 @@ def main():
                 'dropout': vectornet_dropout,
                 'future_len': vectornet_prediction_horizon,
                 'history_len': vectornet_history_length,
+                'node_mask_ratio': node_mask_ratio if use_node_completion else 0.0,
+                'use_node_completion': use_node_completion,
+                'lambda_node': lambda_node,
             }
         }, best_checkpoint_path)
         print(f"Best VectorNet model saved to best_vectornet_tfrecord.pt")
@@ -849,6 +944,9 @@ def main():
             'dropout': vectornet_dropout,
             'future_len': vectornet_prediction_horizon,
             'history_len': vectornet_history_length,
+            'node_mask_ratio': node_mask_ratio if use_node_completion else 0.0,
+            'use_node_completion': use_node_completion,
+            'lambda_node': lambda_node,
         }
     }, final_checkpoint_path)
     print(f"Final VectorNet model saved to final_vectornet_tfrecord.pt")
