@@ -70,15 +70,7 @@ from torch.nn.utils import clip_grad_norm_
 from helper_functions.visualization_functions import visualize_epoch, visualize_training_progress
 from helper_functions.helpers import advanced_directional_loss, compute_metrics
 import config as cfg
-
-# ============== BATCHED TRAINING CONFIGURATION ==============
-# batch_size is imported from config.py
-BATCHED_BATCH_SIZE = batch_size  # Use batch_size from config.py
-
-# GAT-specific directories
-VIZ_DIR = 'visualizations/autoreg/gat'
-cfg.viz_training_dir = VIZ_DIR
-
+from config import (batch_size, gat_viz_dir)
 
 # ============== WORKER INIT FUNCTION (MODULE LEVEL FOR PICKLING) ==============
 def worker_init_fn(worker_id):
@@ -391,7 +383,7 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
 
 def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.hdf5", 
                          validation_path="./data/graphs/validation/validation_seqlen90.hdf5",
-                         batch_size=BATCHED_BATCH_SIZE,
+                         batch_size=batch_size,
                          wandb_run=None, return_viz_batch=False):
     """Run batched GAT training with batch_size > 1 for better GPU utilization."""
     
@@ -405,7 +397,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"{'='*60}\n")
     
     os.makedirs(gat_checkpoint_dir, exist_ok=True)
-    os.makedirs(VIZ_DIR, exist_ok=True)
+    os.makedirs(gat_viz_dir, exist_ok=True)
     
     should_finish_wandb = False
     if wandb_run is None:
@@ -577,11 +569,11 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             nonlocal last_viz_batch
             if ep % visualize_every_n_epochs == 0:
                 try:
-                    # Use visualize_training_progress directly with VIZ_DIR
+                    # Use visualize_training_progress directly with gat_viz_dir
                     filepath, avg_error = visualize_training_progress(
                         mdl, batch_dict, epoch=ep+1,
                         scenario_id=None,
-                        save_dir=VIZ_DIR,  # Use GAT-specific directory
+                        save_dir=gat_viz_dir,  # Use GAT-specific directory
                         device=dev,
                         max_nodes_per_graph=cfg.max_nodes_per_graph_viz,
                         show_timesteps=cfg.show_timesteps_viz
@@ -718,8 +710,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Batched GAT Training')
-    parser.add_argument('--batch-size', type=int, default=BATCHED_BATCH_SIZE,
-                        help=f'Batch size (default: {BATCHED_BATCH_SIZE})')
+    parser.add_argument('--batch-size', type=int, default=batch_size,
+                        help=f'Batch size (default: {batch_size})')
     parser.add_argument('--train-path', type=str, 
                         default='./data/graphs/training/training_seqlen90.hdf5',
                         help='Training data path')

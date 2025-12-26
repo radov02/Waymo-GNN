@@ -269,7 +269,7 @@ def get_model_for_saving(model, is_parallel):
 
 def load_model_state(model, state_dict, is_parallel):
     """
-    Load state dict into model, handling DataParallel prefix.
+    Load state dict into model, handling DataParallel prefix and size mismatches.
     
     Args:
         model: Model to load into
@@ -287,14 +287,41 @@ def load_model_state(model, state_dict, is_parallel):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
         has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
     
+    # Handle module prefix
     if is_parallel and not has_module_prefix:
         # Model is parallel but checkpoint isn't - add prefix
-        new_state_dict = {'module.' + k: v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict, strict=False)
+        state_dict = {'module.' + k: v for k, v in state_dict.items()}
     elif not is_parallel and has_module_prefix:
         # Model is not parallel but checkpoint is - remove prefix
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict, strict=False)
-    else:
-        # Both match
-        model.load_state_dict(state_dict, strict=False)
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    
+    # Filter out keys with size mismatches (e.g., when num_heads changes)
+    model_state = model.state_dict()
+    filtered_state_dict = {}
+    mismatched_keys = []
+    
+    for k, v in state_dict.items():
+        if k in model_state:
+            if v.shape == model_state[k].shape:
+                filtered_state_dict[k] = v
+            else:
+                mismatched_keys.append(f"{k}: checkpoint={v.shape}, model={model_state[k].shape}")
+        else:
+            # Key not in model - will be handled by strict=False
+            filtered_state_dict[k] = v
+    
+    if mismatched_keys:
+        print(f"\n[WARNING] Skipping {len(mismatched_keys)} layers with size mismatches:")
+        for key in mismatched_keys[:5]:  # Show first 5
+            print(f"  - {key}")
+        if len(mismatched_keys) > 5:
+            print(f"  ... and {len(mismatched_keys) - 5} more")
+        print("These layers will be randomly initialized.\n")
+    
+    # Load with filtered state dict
+    missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+    
+    if missing:
+        print(f"[INFO] {len(missing)} keys not found in checkpoint (will use random init)")
+    if unexpected:
+        print(f"[INFO] {len(unexpected)} unexpected keys in checkpoint (ignored)")
