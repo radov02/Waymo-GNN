@@ -289,7 +289,7 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
     print(f"\n[TRAIN EPOCH {epoch+1} SUMMARY]")
     print(f"  AVERAGED LOSS (per timestep): {avg_loss_epoch:.6f}")
     print(f"  MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
-    print(f"  CosSim: {avg_cosine_sim:.4f} (target: >0.7) | AngleErr: {avg_angle_error:.4f} rad")
+    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
     if avg_cosine_sim < 0.5:
         print(f"  WARNING: Low cosine similarity indicates poor direction learning!")
     

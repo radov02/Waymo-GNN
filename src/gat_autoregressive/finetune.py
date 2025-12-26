@@ -1271,6 +1271,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             rollout_loss = 0.0
             is_using_predicted_positions = False
             
+            # Initialize per-agent error tracking for this batch's rollout
+            current_rollout_errors = torch.zeros(current_graph.x.shape[0], effective_rollout, device=device)
+            
             for step in range(effective_rollout):
                 target_t = start_t + step + 1
                 if target_t >= T:
@@ -1323,11 +1326,6 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Track per-agent displacement error at each step for ADE/FDE
                 # Error in meters: ||pred_disp - target_disp|| * POSITION_SCALE
                 step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
-                
-                # Initialize or accumulate per-agent errors for this rollout
-                if step == 0:
-                    # Start new rollout tracking: [num_agents, num_steps]
-                    current_rollout_errors = torch.zeros(pred.shape[0], effective_rollout, device=device)
                 
                 # Store errors for this step
                 if step < effective_rollout and step_errors_meters.shape[0] == current_rollout_errors.shape[0]:
@@ -1570,7 +1568,7 @@ def run_autoregressive_finetuning(
     
     use_amp_finetune = False  # DISABLED - use float32 for stability
     print(f"\n{'='*80}")
-    print(f"GAT AUTOREGRESSIVE FINE-TUNING (BATCHED)")
+    print(f"{'GAT' if model_type == 'gat' else 'GCN'} AUTOREGRESSIVE FINE-TUNING (BATCHED)")
     print(f"{'='*80}")
     print(f"Device: {device}")
     print(f"Pre-trained model: {pretrained_checkpoint}")
