@@ -1367,12 +1367,14 @@ def run_autoregressive_finetuning(
     """Fine-tune pre-trained model for autoregressive multi-step prediction."""
     
     # construct checkpoint filename based on training script's naming convention:
-    checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
+    
     if model_type == "gat":
+        checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
         os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
     elif model_type == "gcn":
+        checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{num_epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
         os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gcn_viz_dir_autoreg, exist_ok=True)
