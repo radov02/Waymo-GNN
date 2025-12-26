@@ -51,7 +51,7 @@ gradient_clip_value = 1.0  # gradient clipping threshold to prevent exploding gr
 # Learning rate scheduler settings:
 scheduler_patience = 5  # wait scheduler_patience epochs before reducing LR
 scheduler_factor = 0.5  # reduce LR by scheduler_factor*100 % when triggered
-min_lr = 1e-5         # minimum learning rate
+min_lr = 1e-4         # minimum learning rate
 # Loss weights - balance direction and magnitude for accurate trajectory prediction:
 # Updated weights: Prioritize direction learning (angle + cosine) over raw magnitude
 # Previous weights yielded poor CosSim ~0.35 (random directions)
