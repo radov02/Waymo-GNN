@@ -25,7 +25,7 @@ use_edge_weights = False    # False to disable distance-based edge weights
 
 # ============== SpatioTemporalGNN model (GCN and GAT) ==============
 input_dim = 15      # 11 properties (vx, vy, speed, heading, valid, ax, ay, rel_x_sdc, rel_y_sdc, dist_sdc, dist_nearest) + 4 one-hot object type
-output_dim = 2      # Predict velocity (vx_norm, vy_norm) only - other features computed from graph structure
+output_dim = 2      # Predict displacement (dx_norm, dy_norm) - normalized displacement to next position
 hidden_channels = 128   # capacity for complex patterns
 num_layers = 3      # number of GCN layers for spatial encoding
 num_gru_layers = 1  # number of GRU layers for temporal encoding

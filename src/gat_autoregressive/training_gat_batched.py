@@ -181,24 +181,9 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                     print(f"  Warning: NaN in predictions at batch {batch_idx}, t={t}, skipping...")
                     continue
                 
-                # SIMPLIFIED LOSS: Model predicts 2D velocity only
-                # Convert velocity to displacement for loss computation
-                dt = 0.1  # timestep in seconds
-                from config import MAX_SPEED, POSITION_SCALE
-                
-                # Model outputs 2D velocity (vx_norm, vy_norm)
-                pred_vx_norm = out_predictions[:, 0]
-                pred_vy_norm = out_predictions[:, 1]
-                
-                # Convert velocity to displacement
-                pred_vx = pred_vx_norm * MAX_SPEED
-                pred_vy = pred_vy_norm * MAX_SPEED
-                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
-                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
-                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)  # [N, 2]
-                
-                # Displacement loss
-                loss_t = loss_fn(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype), 
+                # Model predicts displacement directly (same as GCN)
+                # No conversion needed - out_predictions is [N, 2] displacement
+                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
                                 batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                 gamma=loss_gamma, delta=loss_delta)
                 
@@ -213,18 +198,18 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             if batch_idx % 100 == 0 and t == 0:
                 with torch.no_grad():
                     from helper_functions.helpers import _compute_angle_loss, _compute_cosine_loss
-                    angle_loss_val = _compute_angle_loss(pred_disp_for_loss, batched_graph.y)
-                    mse_val = F.mse_loss(pred_disp_for_loss, batched_graph.y) * 100.0
-                    cos_loss_val = _compute_cosine_loss(pred_disp_for_loss, batched_graph.y)
+                    angle_loss_val = _compute_angle_loss(out_predictions, batched_graph.y)
+                    mse_val = F.mse_loss(out_predictions, batched_graph.y) * 100.0
+                    cos_loss_val = _compute_cosine_loss(out_predictions, batched_graph.y)
                     print(f"  [Loss Debug] angle={angle_loss_val:.4f}, mse={mse_val:.4f}, cos={cos_loss_val:.4f}, total={loss_t.item():.4f}")
             
             with torch.no_grad():
-                mse = F.mse_loss(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
+                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
+                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
                 target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
                 
-                pred_angle = torch.atan2(pred_disp_for_loss[:, 1], pred_disp_for_loss[:, 0])
+                pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
                 target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
                 angle_diff = torch.atan2(torch.sin(pred_angle - target_angle), 
                                         torch.cos(pred_angle - target_angle))
@@ -347,36 +332,19 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
                     timestep=t
                 )
                 
-                # Multi-dimensional loss computation (same as training)
-                dt = 0.1
-                from config import MAX_SPEED, POSITION_SCALE
-                
-                pred_vx_norm = out_predictions[:, 0]
-                pred_vy_norm = out_predictions[:, 1]
-                pred_vx = pred_vx_norm * MAX_SPEED
-                pred_vy = pred_vy_norm * MAX_SPEED
-                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
-                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
-                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)
-                
-                gt_vx_norm = batched_graph.x[:, 0]
-                gt_vy_norm = batched_graph.x[:, 1]
-                gt_speed_norm = batched_graph.x[:, 2]
-                gt_heading = batched_graph.x[:, 3]
-                
-                # Simplified displacement loss only
-                loss_t = loss_fn(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype), 
+                # Model predicts displacement directly (same as GCN)
+                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
                                 batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                 gamma=loss_gamma, delta=loss_delta)
                 accumulated_loss += loss_t
                 valid_timesteps += 1
                 
-                mse = F.mse_loss(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
+                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
+                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
                 target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
                 
-                pred_angle = torch.atan2(pred_disp_for_loss[:, 1], pred_disp_for_loss[:, 0])
+                pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
                 target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
                 angle_diff = torch.atan2(torch.sin(pred_angle - target_angle),
                                         torch.cos(pred_angle - target_angle))
@@ -586,11 +554,14 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
     checkpoint_path = os.path.join(gat_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
+    viz_error = None  # Track visualization error for logging
     
     for epoch in range(epochs):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
+        
+        viz_error = None  # Reset for this epoch
         
         # Visualization callback
         def viz_callback(ep, batch_dict, mdl, dev, wb):
@@ -606,7 +577,9 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                         max_nodes_per_graph=cfg.max_nodes_per_graph_viz,
                         show_timesteps=cfg.show_timesteps_viz
                     )
-                    wb.log({"epoch": ep, "viz_avg_error": avg_error})
+                    # Don't log here - will be logged with other metrics at end of epoch
+                    nonlocal viz_error
+                    viz_error = avg_error
                 except Exception as e:
                     print(f"  Visualization error: {e}")
                     import traceback
@@ -633,6 +606,10 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             "train/angle_error": train_angle,
             "learning_rate": optimizer.param_groups[0]['lr']
         }
+        
+        # Add visualization error if available
+        if viz_error is not None:
+            log_dict["viz_avg_error"] = viz_error
         
         # Validation (use GAT-specific loss weights)
         if val_dataloader is not None:

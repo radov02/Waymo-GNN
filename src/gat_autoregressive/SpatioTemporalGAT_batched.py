@@ -68,8 +68,8 @@ class SpatioTemporalGATBatched(nn.Module):
             dropout=dropout if num_gru_layers > 1 else 0.0
         )
         
-        # Decoder: MLP to predict 2D VELOCITY only (vx_norm, vy_norm)
-        # Other features (distances, one-hot, etc.) come from graph structure
+        # Decoder: MLP to predict 2D DISPLACEMENT (dx_norm, dy_norm)
+        # Same as GCN model - predicts normalized displacement to next position
         decoder_input_dim = hidden_dim + input_dim
         self.decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, hidden_dim),
@@ -78,7 +78,7 @@ class SpatioTemporalGATBatched(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim)  # Just 2D velocity (vx_norm, vy_norm)
+            nn.Linear(hidden_dim // 2, output_dim)  # 2D displacement (dx_norm, dy_norm)
         )
         
         # Per-agent GRU hidden states - TRACKED BY AGENT ID

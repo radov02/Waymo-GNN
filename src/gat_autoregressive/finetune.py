@@ -192,11 +192,11 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # Guarantee final epoch is 1.0 (100% autoregressive)
+    # Guarantee final epoch reaches max sampling
+    # CRITICAL: Cap at 0.5 (50%) to prevent model collapse from excessive autoregressive exposure
+    # Higher values cause compounding errors that destabilize training
     if epoch >= total_epochs - 1:
-        return 1.0
-    
-    # TODO: make scheduled sampling linearly increase from 0.0 to 1.0 over total_epochs...
+        return 0.5
     
     # During warmup, use small amount of model predictions to start learning
     if epoch < warmup_epochs:
@@ -210,9 +210,10 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     progress = adjusted_epoch / max(1, remaining_epochs - 1)
     progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
     
-    # Scale from 0.1 (end of warmup) to 1.0 (final epoch)
+    # Scale from 0.1 (end of warmup) to 0.5 (final epoch)
+    # CRITICAL: Max capped at 0.5 to maintain training stability
     min_sampling = 0.1
-    max_sampling = 1.0
+    max_sampling = 0.5
     
     if strategy == 'linear' or strategy == 'delayed_linear':
         return min_sampling + progress * (max_sampling - min_sampling)
@@ -536,11 +537,11 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                     current_gt_graph = batched_graph_sequence[start_t + step]
                     # Extract 2D displacement from predicted 15-dim feature vectors
                     dt = 0.1
-                    pred_vx = (pred[:, 0] * MAX_SPEED).cpu()  # denormalize velocity
-                    pred_vy = (pred[:, 1] * MAX_SPEED).cpu()
+                    pred_vx = pred[:, 0] * MAX_SPEED  # denormalize velocity (keep on device)
+                    pred_vy = pred[:, 1] * MAX_SPEED
                     pred_dx = pred_vx * dt  # displacement in meters
                     pred_dy = pred_vy * dt
-                    pred_displacement = torch.stack([pred_dx, pred_dy], dim=1)  # [N, 2] in meters
+                    pred_displacement = torch.stack([pred_dx, pred_dy], dim=1)  # [N, 2] in meters, on device
                     
                     # CRITICAL: Only update positions for agents that exist in BOTH graphs
                     if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
@@ -569,11 +570,13 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             current_idx = current_id_to_idx[gid]
                             next_idx = next_id_to_idx[gid]
                             if current_idx < pred_displacement.shape[0] and current_idx < current_gt_graph.pos.shape[0]:
-                                graph_for_prediction.pos[next_idx] = current_gt_graph.pos[current_idx] + pred_displacement[current_idx]
+                                # Ensure both tensors are on the same device
+                                graph_for_prediction.pos[next_idx] = (current_gt_graph.pos[current_idx].to(device) + 
+                                                                       pred_displacement[current_idx].to(device))
                     else:
                         # Fallback: only update if sizes match
                         if current_gt_graph.pos.shape[0] == pred_displacement.shape[0] == graph_for_prediction.pos.shape[0]:
-                            graph_for_prediction.pos = current_gt_graph.pos + pred_displacement
+                            graph_for_prediction.pos = current_gt_graph.pos.to(device) + pred_displacement.to(device)
             else:
                 # No more GT graphs available, use update function as fallback
                 graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
@@ -790,6 +793,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_cosine = 0.0
     steps = 0
     count = 0
+    
+    # Track per-agent errors for ADE/FDE computation
+    train_agent_errors = []  # List of [num_agents, num_steps] arrays
 
     # TODO: velocity smoothing or only position update?    
 
@@ -855,6 +861,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         rollout_loss = None
         graph_for_prediction = current_graph
         is_using_predicted_positions = False  # Track if we're using our predictions
+        
+        # Initialize per-agent error tracking for ADE/FDE computation
+        # Track displacement error (in meters) per agent per timestep
+        current_rollout_errors = torch.zeros(current_graph.x.shape[0], effective_rollout, device=device)
 
         for step in range(effective_rollout):
             target_t = t + step + 1
@@ -1117,6 +1127,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 total_mse += mse_loss.item()
                 total_cosine += cos_sim.mean().item()
                 count += 1
+                
+                # Track per-agent displacement errors for ADE/FDE computation
+                # Convert displacement error to meters
+                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
+                
+                # Store errors for this step in the current rollout
+                if step < effective_rollout and step_errors_meters.shape[0] <= current_rollout_errors.shape[0]:
+                    current_rollout_errors[:step_errors_meters.shape[0], step] = step_errors_meters
             
             if step < num_rollout_steps - 1:
                 # Scheduled sampling: sometimes use prediction, sometimes use GT
@@ -1164,6 +1182,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 optimizer.step()
             total_loss += rollout_loss.item()
             steps += 1
+            
+            # Save rollout errors for ADE/FDE computation
+            train_agent_errors.append(current_rollout_errors.cpu().numpy())
         
         if batch_idx % 20 == 0:
             loss_val = rollout_loss.item() if rollout_loss is not None and hasattr(rollout_loss, 'item') else 0.0
@@ -1179,8 +1200,24 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     final_loss = total_loss / max(1, steps)
     final_cosine = total_cosine / max(1, count)
     
+    # Compute ADE and FDE from accumulated agent errors
+    train_ade = 0.0
+    train_fde = 0.0
+    total_train_agents = 0
+    if train_agent_errors:
+        # Concatenate all rollout errors: [total_agents, num_steps]
+        all_train_errors = np.concatenate(train_agent_errors, axis=0)
+        if all_train_errors.shape[0] > 0 and all_train_errors.shape[1] > 0:
+            # ADE: Average displacement error across all timesteps per agent, then across agents
+            per_agent_ade = np.mean(all_train_errors, axis=1)  # [total_agents]
+            train_ade = float(np.mean(per_agent_ade))
+            # FDE: Final displacement error (last timestep)
+            train_fde = float(np.mean(all_train_errors[:, -1]))
+            total_train_agents = all_train_errors.shape[0]
+    
     print(f"\n[TRAIN EPOCH SUMMARY]")
     print(f"  Loss: {final_loss:.6f} | Avg per-step MSE: {final_mse:.6f} | Avg per-step RMSE: {final_rmse:.2f}m | CosSim: {final_cosine:.4f}")
+    print(f"  ADE: {train_ade:.2f}m | FDE: {train_fde:.2f}m (across {total_train_agents} agent rollouts)")
     print(f"  Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
     # NOTE: No wandb.log here - logging is done per-epoch in main training loop
@@ -1189,7 +1226,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     return {
         'loss': final_loss,
         'mse': final_mse,
-        'cosine_sim': final_cosine
+        'cosine_sim': final_cosine,
+        'ade': train_ade,
+        'fde': train_fde
     }
 
 def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel, epoch=0, total_epochs=40):
@@ -1331,10 +1370,6 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 if step < effective_rollout and step_errors_meters.shape[0] == current_rollout_errors.shape[0]:
                     current_rollout_errors[:, step] = step_errors_meters
                 
-                # At final step, save rollout errors
-                if step == effective_rollout - 1:
-                    all_agent_errors.append(current_rollout_errors.cpu().numpy())
-                
                 # Debug: print position drift for first batch
                 if batch_idx == 0 and not debug_printed:
                     pos_drift = 0.0
@@ -1365,7 +1400,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     )
                     is_using_predicted_positions = True
             
-            # After rollout completes
+            # After rollout completes, save errors for ADE/FDE computation
+            # Only save if we have valid error data
+            if current_rollout_errors.numel() > 0:
+                all_agent_errors.append(current_rollout_errors.cpu().numpy())
+            
             total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
             steps += 1
     
@@ -1787,9 +1826,8 @@ def run_autoregressive_finetuning(
     torch.save(final_checkpoint_data, final_path)
     
     print(f"\n{'='*80}")
-    print(f"GAT FINE-TUNING COMPLETE!")
+    print(f"{'GAT' if model_type == 'gat' else 'GCN'} FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
-    print(f"Epochs completed: {actual_final_epoch}/{num_epochs}" + (" (early stopped)" if early_stopped else ""))
     best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
     print(f"Best model: {os.path.join(gat_checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
