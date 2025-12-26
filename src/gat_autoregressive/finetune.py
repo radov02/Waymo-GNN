@@ -1239,12 +1239,6 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     # First step uses GT position
                     target = target_graph.y.to(pred.dtype)
                 
-                # Multi-dimensional loss computation (same as training)
-                dt = 0.1
-                pred_vx_norm = pred[:, 0]
-                pred_vy_norm = pred[:, 1]
-                pred_vx = pred_vx_norm * MAX_SPEED
-                pred_vy = pred_vy_norm * MAX_SPEED
                 # Model outputs 2D velocity - convert to displacement for loss
                 dt = 0.1
                 pred_vx_norm = pred[:, 0]
@@ -1259,6 +1253,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 mse = F.mse_loss(pred_disp_for_loss, target)
                 
                 # Track per-agent displacement error at each step for ADE/FDE
+                # Error in meters: ||pred_disp - target_disp|| * POSITION_SCALE
                 step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
                 
                 # Initialize or accumulate per-agent errors for this rollout
@@ -1311,18 +1306,20 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     horizon_avg_mse = [horizon_mse[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     horizon_avg_cosine = [horizon_cosine[h] / max(1, horizon_counts[h]) for h in range(num_rollout_steps)]
     
-    # Compute ADE, FDE, and Miss Rate from all_agent_errors
-    # ADE: Average Displacement Error - mean error across all timesteps and agents
-    # FDE: Final Displacement Error - error at the last timestep
-    # Miss Rate: Percentage of endpoints with error > 2.0m
+    # Compute ADE and FDE from all_agent_errors
+    # ADE (Average Displacement Error): For each agent, compute mean error across all timesteps,
+    #     then average those means across all agents
+    # FDE (Final Displacement Error): Mean of final timestep errors across all agents
     if all_agent_errors:
         # Concatenate all rollout errors: [total_agents, num_steps]
         all_errors = np.concatenate(all_agent_errors, axis=0)  # [total_agents, num_steps]
         
-        # ADE: mean across all agents and all timesteps
-        ade = float(np.mean(all_errors))
+        # ADE: First compute per-agent average across timesteps, then average across agents
+        # This gives equal weight to each agent regardless of trajectory length
+        per_agent_ade = np.mean(all_errors, axis=1)  # [total_agents] - mean error per agent
+        ade = float(np.mean(per_agent_ade))  # Average across all agents
         
-        # FDE: mean of final timestep errors across all agents
+        # FDE: Mean of final timestep errors across all agents
         fde = float(np.mean(all_errors[:, -1]))
         
         total_agents = all_errors.shape[0]
