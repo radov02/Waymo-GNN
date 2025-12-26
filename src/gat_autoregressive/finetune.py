@@ -46,28 +46,31 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Infer architecture from checkpoint weights (universal for both GAT and GCN)
     state_dict = checkpoint['model_state_dict']
-    
-    # Check first spatial layer weight shape to infer hidden_dim
-    # Try both regular and DataParallel key formats
-    first_layer_keys = ['spatial_layers.0.lin.weight', 'module.spatial_layers.0.lin.weight',
-                        'spatial_layers.0.lin_src.weight', 'module.spatial_layers.0.lin_src.weight']
-    
-    checkpoint_hidden_dim = None
-    for key in first_layer_keys:
-        if key in state_dict:
-            checkpoint_hidden_dim = state_dict[key].shape[0]  # [out_features, in_features]
-            print(f"  Inferred hidden_dim={checkpoint_hidden_dim} from checkpoint weight key: {key}")
-            break
-    
-    if checkpoint_hidden_dim is None:
-        checkpoint_hidden_dim = hidden_channels
-        print(f"  Could not infer hidden_dim from weights, using config.py default: {checkpoint_hidden_dim}")
 
     if model_type == "gat":
         print(f"Loading pre-trained GAT model from {checkpoint_path}...")
+        
+        # Infer GAT architecture from checkpoint weights
+        gat_layer_keys = ['spatial_layers.0.lin_src.weight', 'module.spatial_layers.0.lin_src.weight',
+                          'spatial_layers.0.att_src', 'module.spatial_layers.0.att_src']
+        
+        checkpoint_hidden_dim = None
+        print(f"  First 10 keys in checkpoint state_dict:")
+        for i, key in enumerate(list(state_dict.keys())[:10]):
+            if i < 5 or 'spatial' in key:
+                print(f"    {key}: {state_dict[key].shape}")
+        
+        for key in gat_layer_keys:
+            if key in state_dict:
+                checkpoint_hidden_dim = state_dict[key].shape[0] if len(state_dict[key].shape) > 1 else state_dict[key].shape[0]
+                print(f"  ✓ Inferred GAT hidden_dim={checkpoint_hidden_dim} from key: {key}")
+                break
+        
+        if checkpoint_hidden_dim is None:
+            checkpoint_hidden_dim = hidden_channels
+            print(f"  ✗ Could not infer GAT hidden_dim, using config.py default: {checkpoint_hidden_dim}")
+        
         # Recreate model with saved config or use inferred architecture
         if 'config' in checkpoint:
             config = checkpoint['config']
@@ -106,6 +109,25 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
     elif model_type == "gcn":
         print(f"Loading pre-trained GCN model from {checkpoint_path}...")
         
+        # Infer GCN architecture from checkpoint weights
+        gcn_layer_keys = ['spatial_layers.0.lin.weight', 'module.spatial_layers.0.lin.weight']
+        
+        checkpoint_hidden_dim = None
+        print(f"  First 10 keys in checkpoint state_dict:")
+        for i, key in enumerate(list(state_dict.keys())[:10]):
+            if i < 5 or 'spatial' in key:
+                print(f"    {key}: {state_dict[key].shape}")
+        
+        for key in gcn_layer_keys:
+            if key in state_dict:
+                checkpoint_hidden_dim = state_dict[key].shape[0]  # [out_features, in_features]
+                print(f"  ✓ Inferred GCN hidden_dim={checkpoint_hidden_dim} from key: {key}")
+                break
+        
+        if checkpoint_hidden_dim is None:
+            checkpoint_hidden_dim = hidden_channels
+            print(f"  ✗ Could not infer GCN hidden_dim, using config.py default: {checkpoint_hidden_dim}")
+        
         if 'config' in checkpoint:
             config = checkpoint['config']
             # Debug: print what's in the config
@@ -115,7 +137,7 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
             # Use inferred hidden_dim if available, otherwise fall back to config
             final_hidden_dim = checkpoint_hidden_dim if checkpoint_hidden_dim else config.get('hidden_channels', hidden_channels)
             use_gat_from_checkpoint = config.get('use_gat', False)
-            print(f"  Using hidden_dim={final_hidden_dim}, use_gat={use_gat_from_checkpoint}")
+            print(f"  >>> CREATING GCN MODEL WITH hidden_dim={final_hidden_dim}, use_gat={use_gat_from_checkpoint} <<<")
             
             model = SpatioTemporalGNNBatched(
                 input_dim=config.get('input_dim', input_dim),
