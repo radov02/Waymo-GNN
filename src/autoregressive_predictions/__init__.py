@@ -1,5 +1,5 @@
-from .SpatioTemporalGNN_batched import SpatioTemporalGNN_batched
+from .SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 
 __all__ = [
-    "SpatioTemporalGNN_batched",
+    "SpatioTemporalGNNBatched",
 ]
