@@ -771,6 +771,7 @@ def main():
             scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
+        # Log epoch-averaged metrics (one point per epoch)
         wandb.log({
             "epoch": epoch + 1,
             "train/loss": train_metrics['loss'],
@@ -780,15 +781,6 @@ def main():
             "val/loss": val_metrics['loss'],
             "val/ade": val_metrics['ade'],
             "val/fde": val_metrics['fde'],
-            "lr": current_lr,
-            # Per-epoch aggregated metrics for better tracking
-            "train_epoch/loss": train_metrics['loss'],
-            "train_epoch/traj_loss": train_metrics['traj_loss'],
-            "train_epoch/ade": train_metrics['ade'],
-            "train_epoch/fde": train_metrics['fde'],
-            "val_epoch/loss": val_metrics['loss'],
-            "val_epoch/ade": val_metrics['ade'],
-            "val_epoch/fde": val_metrics['fde'],
             "learning_rate": current_lr,
         }, commit=True)
         
