@@ -77,6 +77,7 @@ class SpatioTemporalGNNBatched(nn.Module):
         )
         
         self.gru_hidden = None
+        self.agent_hidden_states = {}  # Per-agent GRU tracking: {(scenario_idx, agent_id): hidden_tensor}
         self._current_edge_index = None
         self._current_edge_weight = None
         
@@ -126,6 +127,9 @@ class SpatioTemporalGNNBatched(nn.Module):
                 self.hidden_dim,
                 device=device
             )
+        
+        # Also reset per-agent hidden states
+        self.agent_hidden_states = {}
     
     def detach_hidden_states(self):
         """Detach GRU hidden states from computation graph (for truncated BPTT).
@@ -180,7 +184,7 @@ class SpatioTemporalGNNBatched(nn.Module):
         return h
     
     def forward(self, x, edge_index, edge_weight=None, batch=None, 
-                batch_size=None, batch_num=-1, timestep=-1):
+                batch_size=None, batch_num=-1, timestep=-1, agent_ids=None):
         """Forward pass for one timestep with batched scenarios.
         
         Args:
@@ -191,6 +195,7 @@ class SpatioTemporalGNNBatched(nn.Module):
             batch_size: Number of scenarios in batch (B)
             batch_num: Batch number (for logging)
             timestep: Timestep in sequence (for logging)
+            agent_ids: Optional list of agent IDs for per-agent hidden state tracking
             
         Returns:
             Displacement predictions [total_nodes, output_dim]
@@ -198,13 +203,34 @@ class SpatioTemporalGNNBatched(nn.Module):
         device = x.device
         total_nodes = x.size(0)
         
-        # Initialize GRU hidden state if needed
-        # Hidden state shape: [num_layers, total_nodes, hidden_dim]
-        if self.gru_hidden is None or self.gru_hidden.size(1) != total_nodes:
-            self.reset_gru_hidden_states(total_nodes, device)
+        # Build agent keys for per-agent tracking if agent_ids provided
+        use_per_agent_tracking = (agent_ids is not None and batch is not None)
         
-        if self.gru_hidden.device != device:
-            self.gru_hidden = self.gru_hidden.to(device)
+        if use_per_agent_tracking:
+            batch_np = batch.cpu().numpy()
+            agent_keys = []
+            for node_idx in range(total_nodes):
+                scenario_idx = int(batch_np[node_idx])
+                agent_id = agent_ids[node_idx] if node_idx < len(agent_ids) else node_idx
+                agent_keys.append((scenario_idx, agent_id))
+            
+            # Gather existing hidden states
+            gru_hidden = torch.zeros(
+                self.num_gru_layers, total_nodes, self.hidden_dim,
+                device=device, dtype=x.dtype
+            )
+            for node_idx, key in enumerate(agent_keys):
+                if key in self.agent_hidden_states:
+                    gru_hidden[:, node_idx:node_idx+1, :] = self.agent_hidden_states[key]
+        else:
+            # Legacy mode: simple node-level tracking
+            if self.gru_hidden is None or self.gru_hidden.size(1) != total_nodes:
+                self.reset_gru_hidden_states(total_nodes, device)
+            
+            if self.gru_hidden.device != device:
+                self.gru_hidden = self.gru_hidden.to(device)
+            
+            gru_hidden = self.gru_hidden
         
         # 1. Spatial encoding (already batched via PyG - very GPU efficient)
         spatial_features = self.spatial_encoding(x, edge_index, edge_weight)
@@ -217,14 +243,21 @@ class SpatioTemporalGNNBatched(nn.Module):
         
         # GRU forward: processes all nodes in parallel on GPU
         # This is efficient because cuDNN GRU kernels are optimized for large batch sizes
-        gru_output, new_hidden = self.gru(gru_input, self.gru_hidden)
+        gru_output, new_hidden = self.gru(gru_input, gru_hidden)
         
-        # CRITICAL: During training, maintain gradient flow for temporal learning
-        # During evaluation, detach to save memory
-        if self.training:
-            self.gru_hidden = new_hidden
+        # Update hidden states
+        if use_per_agent_tracking:
+            # Store per-agent hidden states
+            new_hidden_detached = new_hidden.detach() if not self.training else new_hidden
+            self.agent_hidden_states = {}
+            for node_idx, key in enumerate(agent_keys):
+                self.agent_hidden_states[key] = new_hidden_detached[:, node_idx:node_idx+1, :]
         else:
-            self.gru_hidden = new_hidden.detach()
+            # Legacy mode: update simple hidden state
+            if self.training:
+                self.gru_hidden = new_hidden
+            else:
+                self.gru_hidden = new_hidden.detach()
         
         # Output: [total_nodes, 1, hidden_dim] -> [total_nodes, hidden_dim]
         temporal_features = gru_output.squeeze(1)

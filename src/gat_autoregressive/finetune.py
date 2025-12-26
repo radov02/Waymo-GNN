@@ -948,10 +948,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 print(f"  [ERROR] NaN in input features at batch {batch_idx}, t={t}, step={step}! Skipping rollout.")
                 break
             
-            # GAT forward pass with optional AMP and agent_ids for per-agent GRU tracking
+            # Forward pass with optional AMP and agent_ids for per-agent GRU tracking
+            # Both GAT and GCN now support per-agent hidden state tracking
             with torch.amp.autocast('cuda', enabled=use_amp_local):
                 edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
                 agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
+                
                 pred = model(
                     graph_for_prediction.x,
                     graph_for_prediction.edge_index,
