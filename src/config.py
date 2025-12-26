@@ -52,10 +52,12 @@ scheduler_patience = 5  # wait scheduler_patience epochs before reducing LR
 scheduler_factor = 0.5  # reduce LR by scheduler_factor*100 % when triggered
 min_lr = 1e-5         # minimum learning rate
 # Loss weights - balance direction and magnitude for accurate trajectory prediction:
-loss_alpha = 0.2    # angle weight (directional accuracy)
-loss_beta = 0.5     # MSE weight (positional accuracy) - the primary loss for magnitude
+# Updated weights: Prioritize direction learning (angle + cosine) over raw magnitude
+# Previous weights yielded poor CosSim ~0.35 (random directions)
+loss_alpha = 0.4    # angle weight (directional accuracy) - INCREASED from 0.2
+loss_beta = 0.3     # MSE weight (positional accuracy) - DECREASED from 0.5
 loss_gamma = 0.1    # Velocity magnitude consistency
-loss_delta = 0.2    # Cosine similarity (directional signal)
+loss_delta = 0.4    # Cosine similarity (directional signal) - INCREASED from 0.2
 # Training:
 visualize_every_n_epochs = 9
 visualize_final_epoch = True        # Always visualize the final epoch regardless of visualize_every_n_epochs

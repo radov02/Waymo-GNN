@@ -29,8 +29,7 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch, build_edge_index_using_radius
-from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features,
-                                                       MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
+from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features, VIBRANT_COLORS, SDC_COLOR)
 from torch.nn.utils import clip_grad_norm_
 import random
 from autoregressive_predictions.SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
@@ -42,20 +41,46 @@ _size_mismatch_warned = False
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
 
 def load_pretrained_model(checkpoint_path, device, model_type="gat"):
-    """Load pre-trained GAT model from checkpoint."""
+    """Load pre-trained GAT/GCN model from checkpoint with automatic architecture inference."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Infer architecture from checkpoint weights (universal for both GAT and GCN)
+    state_dict = checkpoint['model_state_dict']
+    
+    # Check first spatial layer weight shape to infer hidden_dim
+    # Try both regular and DataParallel key formats
+    first_layer_keys = ['spatial_layers.0.lin.weight', 'module.spatial_layers.0.lin.weight',
+                        'spatial_layers.0.lin_src.weight', 'module.spatial_layers.0.lin_src.weight']
+    
+    checkpoint_hidden_dim = None
+    for key in first_layer_keys:
+        if key in state_dict:
+            checkpoint_hidden_dim = state_dict[key].shape[0]  # [out_features, in_features]
+            print(f"  Inferred hidden_dim={checkpoint_hidden_dim} from checkpoint weight key: {key}")
+            break
+    
+    if checkpoint_hidden_dim is None:
+        checkpoint_hidden_dim = hidden_channels
+        print(f"  Could not infer hidden_dim from weights, using config.py default: {checkpoint_hidden_dim}")
 
     if model_type == "gat":
         print(f"Loading pre-trained GAT model from {checkpoint_path}...")
-        # Recreate model with saved config or use defaults
+        # Recreate model with saved config or use inferred architecture
         if 'config' in checkpoint:
             config = checkpoint['config']
+            print(f"  Checkpoint config keys: {list(config.keys())}")
+            print(f"  hidden_channels from checkpoint config: {config.get('hidden_channels', 'NOT FOUND')}")
+            
+            # Use inferred hidden_dim if available, otherwise fall back to config
+            final_hidden_dim = checkpoint_hidden_dim if checkpoint_hidden_dim else config.get('hidden_channels', hidden_channels)
+            print(f"  Using hidden_dim={final_hidden_dim}")
+            
             model = SpatioTemporalGATBatched(
                 input_dim=config.get('input_dim', input_dim),
-                hidden_dim=config.get('hidden_channels', hidden_channels),
+                hidden_dim=final_hidden_dim,
                 output_dim=config.get('output_dim', output_dim),
                 num_gat_layers=config.get('num_layers', num_layers),
                 num_gru_layers=config.get('num_gru_layers', num_gru_layers),
@@ -64,11 +89,11 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                 max_agents_per_scenario=128
             )
         else:
-            # Checkpoint doesn't have config - use default values from config.py
-            print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
+            # Checkpoint doesn't have config - use inferred architecture
+            print("  Warning: Checkpoint missing 'config' key, using inferred architecture from weights")
             model = SpatioTemporalGATBatched(
                 input_dim=input_dim,
-                hidden_dim=hidden_channels,
+                hidden_dim=checkpoint_hidden_dim if checkpoint_hidden_dim else hidden_channels,
                 output_dim=output_dim,
                 num_gat_layers=num_layers,
                 num_gru_layers=num_gru_layers,
@@ -76,28 +101,38 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                 num_heads=4,  # Default value
                 max_agents_per_scenario=128
             )
-        print(f"Loaded GAT model from epoch {checkpoint['epoch']}")
+        print(f"  Loaded GAT model from epoch {checkpoint['epoch']}")
         
     elif model_type == "gcn":
         print(f"Loading pre-trained GCN model from {checkpoint_path}...")
+        
         if 'config' in checkpoint:
             config = checkpoint['config']
+            # Debug: print what's in the config
+            print(f"  Checkpoint config keys: {list(config.keys())}")
+            print(f"  hidden_channels from checkpoint config: {config.get('hidden_channels', 'NOT FOUND')}")
+            
+            # Use inferred hidden_dim if available, otherwise fall back to config
+            final_hidden_dim = checkpoint_hidden_dim if checkpoint_hidden_dim else config.get('hidden_channels', hidden_channels)
+            use_gat_from_checkpoint = config.get('use_gat', False)
+            print(f"  Using hidden_dim={final_hidden_dim}, use_gat={use_gat_from_checkpoint}")
+            
             model = SpatioTemporalGNNBatched(
                 input_dim=config.get('input_dim', input_dim),
-                hidden_dim=config.get('hidden_channels', hidden_channels),
+                hidden_dim=final_hidden_dim,
                 output_dim=config.get('output_dim', output_dim),
                 num_gcn_layers=config.get('num_layers', num_layers),
                 num_gru_layers=config.get('num_gru_layers', num_gru_layers),
                 dropout=config.get('dropout', dropout),
-                use_gat=config.get('use_gat', False),  # Backward compat with old checkpoints
+                use_gat=use_gat_from_checkpoint,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 max_agents_per_scenario=128
             )
         else:
-            print("  Warning: Checkpoint missing 'config' key, using default values from config.py")
+            print("  Warning: Checkpoint missing 'config' key, using inferred architecture from weights")
             model = SpatioTemporalGNNBatched(
                 input_dim=input_dim,
-                hidden_dim=hidden_channels,
+                hidden_dim=checkpoint_hidden_dim,  # Use inferred value!
                 output_dim=output_dim,
                 num_gcn_layers=num_layers,
                 num_gru_layers=num_gru_layers,
@@ -106,7 +141,7 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 max_agents_per_scenario=128
             )
-        print(f" Loaded GCN model from epoch {checkpoint['epoch']}")
+        print(f"  Loaded GCN model from epoch {checkpoint['epoch']}")
     
     # Setup multi-GPU if available
     model, is_parallel = setup_model_parallel(model, device)
@@ -773,7 +808,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         effective_rollout = min(curriculum_steps, T - 1)
         if effective_rollout < 1:
             continue
-        print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
+        if batch_idx % 20 == 0:
+            print(f"  [CURRICULUM] Rollout steps: {effective_rollout} (max: {num_rollout_steps})")
         
         # TODO: Do not use simplified method:
         # SIMPLIFIED: Do ONE rollout per batch starting from t=0
@@ -1733,7 +1769,6 @@ def run_autoregressive_finetuning(
     run.finish()
     return model
 
-
 def update_graph_with_prediction(graph, pred_velocity, device):
     """
     Update graph for next autoregressive step using PREDICTED VELOCITY.
@@ -1898,7 +1933,6 @@ def update_graph_with_prediction(graph, pred_velocity, device):
     
     return updated_graph
 
-
 def filter_to_scenario(graph, scenario_idx, B):
     if B > 1 and hasattr(graph, 'batch'):
         graph_batch_mask = (graph.batch == scenario_idx)
@@ -1918,7 +1952,6 @@ def filter_to_scenario(graph, scenario_idx, B):
     else:
         graph_pos = np.zeros((len(graph_scenario_indices), 2))
     return graph_scenario_indices, graph_agent_ids, graph_pos
-
 
 if __name__ == '__main__':
     model = run_autoregressive_finetuning(

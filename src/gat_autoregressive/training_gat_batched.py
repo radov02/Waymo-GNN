@@ -155,6 +155,7 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
+        valid_timesteps = 0  # Track valid timesteps for averaging
         
         for t, batched_graph in enumerate(batched_graph_sequence):
             if batched_graph.y is None or torch.all(batched_graph.y == 0):
@@ -205,6 +206,16 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                     continue
                     
             accumulated_loss += loss_t
+            valid_timesteps += 1
+            
+            # Detailed loss debugging every 100 batches on first timestep
+            if batch_idx % 100 == 0 and t == 0:
+                with torch.no_grad():
+                    from helper_functions.helpers import _compute_angle_loss, _compute_cosine_loss
+                    angle_loss_val = _compute_angle_loss(pred_disp_for_loss, batched_graph.y)
+                    mse_val = F.mse_loss(pred_disp_for_loss, batched_graph.y) * 100.0
+                    cos_loss_val = _compute_cosine_loss(pred_disp_for_loss, batched_graph.y)
+                    print(f"  [Loss Debug] angle={angle_loss_val:.4f}, mse={mse_val:.4f}, cos={cos_loss_val:.4f}, total={loss_t.item():.4f}")
             
             with torch.no_grad():
                 mse = F.mse_loss(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype))
@@ -234,6 +245,12 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         if isinstance(accumulated_loss, torch.Tensor) and torch.isnan(accumulated_loss):
             print(f"  Warning: NaN accumulated loss at batch {batch_idx}, skipping")
             continue
+        
+        # CRITICAL FIX: Average loss across timesteps instead of raw sum
+        # Previously accumulated_loss was sum over ~89 timesteps, causing loss values ~18-19
+        # Now we average to get per-timestep loss for proper learning signal
+        if valid_timesteps > 0:
+            accumulated_loss = accumulated_loss / valid_timesteps
         
         # Backward pass
         if scaler is not None:
@@ -269,8 +286,11 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
     # Print epoch summary with RMSE in meters
     rmse_meters = (avg_mse ** 0.5) * 100.0
     print(f"\n[TRAIN EPOCH {epoch+1} SUMMARY]")
-    print(f"  Loss: {avg_loss_epoch:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
-    print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
+    print(f"  AVERAGED LOSS (per timestep): {avg_loss_epoch:.6f}")
+    print(f"  MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  CosSim: {avg_cosine_sim:.4f} (target: >0.7) | AngleErr: {avg_angle_error:.4f} rad")
+    if avg_cosine_sim < 0.5:
+        print(f"  ⚠️  WARNING: Low cosine similarity indicates poor direction learning!")
     
     # Call visualization AFTER epoch completes (model is still in train mode but no backward pending)
     if visualize_callback is not None and last_batch_dict is not None:
@@ -311,6 +331,7 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
             base_model.gru_hidden = None
             
             accumulated_loss = 0.0
+            valid_timesteps = 0  # Track valid timesteps for averaging
             
             for t, batched_graph in enumerate(batched_graph_sequence):
                 if batched_graph.y is None or torch.all(batched_graph.y == 0):
@@ -347,6 +368,7 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
                                 batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                 gamma=loss_gamma, delta=loss_delta)
                 accumulated_loss += loss_t
+                valid_timesteps += 1
                 
                 mse = F.mse_loss(pred_disp_for_loss, batched_graph.y.to(out_predictions.dtype))
                 pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
@@ -363,6 +385,10 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
                 total_cosine_sim += cos_sim.item()
                 total_angular += mean_angle_error.item()
                 metric_count += 1
+            
+            # Average loss across timesteps
+            if valid_timesteps > 0:
+                accumulated_loss = accumulated_loss / valid_timesteps
             
             total_loss += accumulated_loss.item()
             steps += 1
