@@ -1714,7 +1714,7 @@ def run_autoregressive_finetuning(
                             break
                         result = visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
+                            device, is_parallel, save_dir=gat_viz_dir_autoreg if model_type == "gat" else gcn_viz_dir_autoreg, total_epochs=num_epochs, model_type=model_type
                         )
                         if isinstance(result, tuple):
                             filepath, final_error = result
@@ -1764,7 +1764,7 @@ def run_autoregressive_finetuning(
                             break
                         result = visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=gat_viz_dir_autoreg if model_type == "gat" else gcn_viz_dir_autoreg, total_epochs=num_epochs
+                            device, is_parallel, save_dir=gat_viz_dir_autoreg if model_type == "gat" else gcn_viz_dir_autoreg, total_epochs=num_epochs, model_type=model_type
                         )
                         if isinstance(result, tuple):
                             filepath, final_error = result
