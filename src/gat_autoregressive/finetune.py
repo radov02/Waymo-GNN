@@ -13,8 +13,8 @@ import wandb
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
-from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
-from dataset import HDF5ScenarioDataset
+from .SpatioTemporalGAT_batched import SpatioTemporalGATBatched
+from ..dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name, epochs, gat_learning_rate,
