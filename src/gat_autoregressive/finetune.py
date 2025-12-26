@@ -1583,8 +1583,8 @@ def run_autoregressive_finetuning(
     print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
     print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
     print(f"Edge Rebuilding: {'Enabled (radius=' + str(radius) + 'm)' if AUTOREG_REBUILD_EDGES else 'Disabled (fixed topology)'}")
-    print(f"Checkpoints: {gat_checkpoint_dir_autoreg}")
-    print(f"Visualizations: {gat_viz_dir_autoreg}")
+    print(f"Checkpoints: {gat_checkpoint_dir_autoreg if model_type == 'gat' else gcn_checkpoint_dir_autoreg}")
+    print(f"Visualizations: {gat_viz_dir_autoreg if model_type == 'gat' else gcn_viz_dir_autoreg}")
     print(f"{'='*80}\n")
 
     if num_rollout_steps >= sequence_length - 1:
