@@ -1501,7 +1501,7 @@ def run_autoregressive_finetuning(
             "epochs": num_epochs,
             "use_gat": model_type == "gat"
         },
-        name=f"{"GAT" if model_type == "gat" else "GCN"}_Autoregressive_finetune_{num_rollout_steps}steps",
+        name=f"{('GAT' if model_type == 'gat' else 'GCN')}_Autoregressive_finetune_{num_rollout_steps}steps",
         dir="../wandb"
     )
     
