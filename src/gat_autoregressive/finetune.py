@@ -53,7 +53,8 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
         
         # Infer GAT architecture from checkpoint weights
         gat_layer_keys = ['spatial_layers.0.lin_src.weight', 'module.spatial_layers.0.lin_src.weight',
-                          'spatial_layers.0.att_src', 'module.spatial_layers.0.att_src']
+                          'spatial_layers.0.att_src', 'module.spatial_layers.0.att_src',
+                          '_orig_mod.spatial_layers.0.lin_src.weight', '_orig_mod.spatial_layers.0.att_src']
         
         checkpoint_hidden_dim = None
         print(f"  First 10 keys in checkpoint state_dict:")
@@ -63,7 +64,11 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
         
         for key in gat_layer_keys:
             if key in state_dict:
-                checkpoint_hidden_dim = state_dict[key].shape[0] if len(state_dict[key].shape) > 1 else state_dict[key].shape[0]
+                # Handle att_src which has shape [1, num_heads, hidden_dim]
+                if 'att_src' in key or 'att_dst' in key:
+                    checkpoint_hidden_dim = state_dict[key].shape[-1]  # Last dimension is hidden_dim
+                else:
+                    checkpoint_hidden_dim = state_dict[key].shape[0] if len(state_dict[key].shape) > 1 else state_dict[key].shape[0]
                 print(f"  ✓ Inferred GAT hidden_dim={checkpoint_hidden_dim} from key: {key}")
                 break
         

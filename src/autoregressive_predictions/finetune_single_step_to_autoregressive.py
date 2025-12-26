@@ -11,7 +11,6 @@ from gat_autoregressive.finetune import run_autoregressive_finetuning
 if __name__ == '__main__':
     model = run_autoregressive_finetuning(
         model_type="gcn",
-        pretrained_checkpoint="./checkpoints/best_model.pt",
         num_rollout_steps=autoreg_num_rollout_steps,
         num_epochs=autoreg_num_epochs,
         sampling_strategy=autoreg_sampling_strategy
