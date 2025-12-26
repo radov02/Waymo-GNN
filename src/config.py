@@ -57,7 +57,7 @@ loss_beta = 0.5     # MSE weight (positional accuracy) - the primary loss for ma
 loss_gamma = 0.1    # Velocity magnitude consistency
 loss_delta = 0.2    # Cosine similarity (directional signal)
 # Training:
-visualize_every_n_epochs = 10
+visualize_every_n_epochs = 9
 visualize_first_batch_only = False
 max_nodes_per_graph_viz = 9  # max nodes to show per graph in visualization
 show_timesteps_viz = 9      # show show_timesteps_viz evenly-spaced timesteps out of all scenario timespan
