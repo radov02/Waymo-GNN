@@ -58,6 +58,7 @@ loss_gamma = 0.1    # Velocity magnitude consistency
 loss_delta = 0.2    # Cosine similarity (directional signal)
 # Training:
 visualize_every_n_epochs = 9
+visualize_final_epoch = True        # Always visualize the final epoch regardless of visualize_every_n_epochs
 visualize_first_batch_only = False
 max_nodes_per_graph_viz = 9  # max nodes to show per graph in visualization
 show_timesteps_viz = 9      # show show_timesteps_viz evenly-spaced timesteps out of all scenario timespan
@@ -289,11 +290,11 @@ def load_model_state(model, state_dict, is_parallel):
     if is_parallel and not has_module_prefix:
         # Model is parallel but checkpoint isn't - add prefix
         new_state_dict = {'module.' + k: v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict, strict=False)
     elif not is_parallel and has_module_prefix:
         # Model is not parallel but checkpoint is - remove prefix
         new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict, strict=False)
     else:
         # Both match
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
