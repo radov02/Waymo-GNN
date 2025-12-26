@@ -543,7 +543,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     best_model_state = None
     best_optimizer_state = None
     best_epoch = 0
-    checkpoint_filename = f'best_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+    checkpoint_filename = f'best_gcn_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
     checkpoint_path = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
     
@@ -675,7 +675,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"\n{'='*60}")
     print(f"Saving final model from epoch {epoch+1}...")
     save_model = get_model_for_saving(model, is_parallel)
-    final_checkpoint_filename = f'final_model_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+    final_checkpoint_filename = f'final_gcn_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
     final_checkpoint_path = os.path.join(gcn_checkpoint_dir, final_checkpoint_filename)
     torch.save({
         'epoch': epoch + 1,
