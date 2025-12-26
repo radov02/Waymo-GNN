@@ -146,8 +146,7 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
             
             # Use inferred hidden_dim if available, otherwise fall back to config
             final_hidden_dim = checkpoint_hidden_dim if checkpoint_hidden_dim else config.get('hidden_channels', hidden_channels)
-            use_gat_from_checkpoint = config.get('use_gat', False)
-            print(f"  >>> CREATING GCN MODEL WITH hidden_dim={final_hidden_dim}, use_gat={use_gat_from_checkpoint} <<<")
+            print(f"  >>> CREATING GCN MODEL WITH hidden_dim={final_hidden_dim}, use_gat=False <<<")
             
             model = SpatioTemporalGNNBatched(
                 input_dim=config.get('input_dim', input_dim),
@@ -156,7 +155,7 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                 num_gcn_layers=config.get('num_layers', num_layers),
                 num_gru_layers=config.get('num_gru_layers', num_gru_layers),
                 dropout=config.get('dropout', dropout),
-                use_gat=use_gat_from_checkpoint,
+                use_gat=False,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 max_agents_per_scenario=128
             )
@@ -251,7 +250,7 @@ def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     return min(steps, max_rollout_steps)
 
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
-                                     is_parallel, save_dir=None, total_epochs=40, model_type="gat"):
+                                     is_parallel, save_dir=None, total_epochs=40, model_type=None):
     """Visualize autoregressive rollout predictions vs ground truth.
     
     Model predicts displacement → updates positions → derives all 15-dim node features.
@@ -267,6 +266,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         total_epochs: Total number of epochs (for display)
         model_type: "gat" or "gcn"
     """
+    if model_type is None:
+        print("CRITICAL ERROR: model_type must be specified as 'gat' or 'gcn' for visualization saving paths.")
+        return None
+    
     if save_dir is None:
         if model_type == "gat":
             save_dir = gat_viz_dir_autoreg
@@ -1343,6 +1346,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Store errors for this step
                 if step < effective_rollout and step_errors_meters.shape[0] == current_rollout_errors.shape[0]:
                     current_rollout_errors[:, step] = step_errors_meters
+                elif batch_idx == 0 and step < 5:
+                    print(f"    [WARNING] Step {step}: Cannot store errors. step={step}, effective_rollout={effective_rollout}, "
+                          f"step_errors shape={step_errors_meters.shape}, rollout_errors shape={current_rollout_errors.shape}")
                 
                 # Debug: print position drift for first batch
                 if batch_idx == 0 and not debug_printed:
@@ -1375,9 +1381,13 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     is_using_predicted_positions = True
             
             # After rollout completes, save errors for ADE/FDE computation
-            # Only save if we have valid error data
+            # Only save if we have valid error data (non-zero)
             if current_rollout_errors.numel() > 0:
-                all_agent_errors.append(current_rollout_errors.cpu().numpy())
+                # Check if any errors were actually stored (non-zero)
+                if current_rollout_errors.abs().sum() > 0:
+                    all_agent_errors.append(current_rollout_errors.cpu().numpy())
+                elif batch_idx == 0:
+                    print(f"    [WARNING] Batch {batch_idx}: all_zeros in current_rollout_errors (shape: {current_rollout_errors.shape})")
             
             total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
             steps += 1
@@ -1389,9 +1399,14 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
     # ADE (Average Displacement Error): For each agent, compute mean error across all timesteps,
     #     then average those means across all agents
     # FDE (Final Displacement Error): Mean of final timestep errors across all agents
+    
+    print(f"  [DEBUG] Total batches processed: {steps}, Batches with valid errors: {len(all_agent_errors)}")
+    
     if all_agent_errors:
         # Concatenate all rollout errors: [total_agents, num_steps]
         all_errors = np.concatenate(all_agent_errors, axis=0)  # [total_agents, num_steps]
+        
+        print(f"  [DEBUG] all_errors shape: {all_errors.shape}, min={all_errors.min():.4f}, max={all_errors.max():.4f}, mean={all_errors.mean():.4f}")
         
         # ADE: First compute per-agent average across timesteps, then average across agents
         # This gives equal weight to each agent regardless of trajectory length
@@ -1716,8 +1731,11 @@ def run_autoregressive_finetuning(
             # Save best model based on validation loss
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
-                save_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-                save_path = os.path.join(gat_checkpoint_dir_autoreg, save_filename)
+                save_filename = f'best_{"gat" if model_type == "gat" else "gcn"}_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+                if model_type == "gat":
+                    save_path = os.path.join(gat_checkpoint_dir_autoreg, save_filename)
+                else:
+                    save_path = os.path.join(gcn_checkpoint_dir_autoreg, save_filename)
                 model_to_save = get_model_for_saving(model, is_parallel)
                 checkpoint_data = {
                     'epoch': epoch,
@@ -1746,7 +1764,7 @@ def run_autoregressive_finetuning(
                             break
                         result = visualize_autoregressive_rollout(
                             model, viz_batch, epoch, num_rollout_steps, 
-                            device, is_parallel, save_dir=gat_viz_dir_autoreg, total_epochs=num_epochs
+                            device, is_parallel, save_dir=gat_viz_dir_autoreg if model_type == "gat" else gcn_viz_dir_autoreg, total_epochs=num_epochs
                         )
                         if isinstance(result, tuple):
                             filepath, final_error = result
@@ -1785,8 +1803,12 @@ def run_autoregressive_finetuning(
     actual_final_epoch = epoch + 1
     
     # Save final model
-    final_filename = f'final_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    final_path = os.path.join(gat_checkpoint_dir_autoreg, final_filename)
+
+    final_filename = f'final_{"gat" if model_type == "gat" else "gcn"}_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    if model_type == "gat":
+        final_path = os.path.join(gat_checkpoint_dir_autoreg, final_filename)
+    else:
+        final_path = os.path.join(gcn_checkpoint_dir_autoreg, final_filename)
     model_to_save = get_model_for_saving(model, is_parallel)
     final_checkpoint_data = {
         'epoch': actual_final_epoch - 1,
@@ -1802,8 +1824,8 @@ def run_autoregressive_finetuning(
     print(f"\n{'='*80}")
     print(f"{'GAT' if model_type == 'gat' else 'GCN'} FINE-TUNING COMPLETE!")
     print(f"{'='*80}")
-    best_filename = f'best_gat_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
-    print(f"Best model: {os.path.join(gat_checkpoint_dir_autoreg, best_filename)}")
+    best_filename = f'best_{"gat" if model_type == "gat" else "gcn"}_autoreg_{num_rollout_steps}step_B{batch_size}_{sampling_strategy}_E{num_epochs}.pt'
+    print(f"Best model: {os.path.join(gat_checkpoint_dir_autoreg if model_type == 'gat' else gcn_checkpoint_dir_autoreg, best_filename)}")
     print(f"Final model: {final_path}")
     print(f"Best val_loss: {best_val_loss:.4f}")
     print(f"{'='*80}\n")

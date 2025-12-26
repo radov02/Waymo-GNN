@@ -150,7 +150,7 @@ def visualize_vectornet_predictions(predictions, targets, positions,
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  Saved visualization to {save_path}")
+        print(f"  saved visualization to {save_path}")
     
     plt.close(fig)
     
