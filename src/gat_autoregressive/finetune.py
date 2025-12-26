@@ -33,7 +33,7 @@ from helper_functions.visualization_functions import (load_scenario_by_id, draw_
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 from torch.nn.utils import clip_grad_norm_
 import random
-from SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
+from autoregressive_predictions.SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 
 
 AUTOREG_REBUILD_EDGES = True  # when enabled, edges are recomputed at each autoregressive step based on updated positions, which captures new spatial relationships as agents move (e.g., agents coming within/out of radius) - more accurate for long rollouts where agents move significantly
@@ -392,7 +392,17 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         batch=graph_for_prediction.batch, batch_size=B, batch_num=0, timestep=start_t + step,
                         agent_ids=agent_ids_for_model)
             
-            pred_disp = pred.cpu().numpy() * POSITION_SCALE
+            # Extract 2D displacement from predicted 15-dim feature vectors
+            # Features [0-1] are normalized velocities vx_norm, vy_norm
+            # Integrate: displacement = velocity * dt
+            dt = 0.1  # timestep in seconds
+            pred_vx_norm = pred[:, 0]  # normalized velocity x
+            pred_vy_norm = pred[:, 1]  # normalized velocity y
+            pred_vx = pred_vx_norm * MAX_SPEED  # denormalize: m/s
+            pred_vy = pred_vy_norm * MAX_SPEED
+            pred_dx = pred_vx * dt  # displacement in meters
+            pred_dy = pred_vy * dt
+            pred_disp = torch.stack([pred_dx, pred_dy], dim=1).cpu().numpy()  # [N, 2] in meters
             
             # DEBUG: Print prediction stats on first few steps
             if step < 5 and enable_debug_viz:
@@ -459,7 +469,13 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 # Update position using agent alignment (same fix as training)
                 if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
                     current_gt_graph = batched_graph_sequence[start_t + step]
-                    pred_displacement = pred * POSITION_SCALE
+                    # Extract 2D displacement from predicted 15-dim feature vectors
+                    dt = 0.1
+                    pred_vx = (pred[:, 0] * MAX_SPEED).cpu()  # denormalize velocity
+                    pred_vy = (pred[:, 1] * MAX_SPEED).cpu()
+                    pred_dx = pred_vx * dt  # displacement in meters
+                    pred_dy = pred_vy * dt
+                    pred_displacement = torch.stack([pred_dx, pred_dy], dim=1)  # [N, 2] in meters
                     
                     # CRITICAL: Only update positions for agents that exist in BOTH graphs
                     if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
@@ -981,36 +997,48 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         gt_next_pos = target_graph.pos.to(pred.dtype)
                         target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
                 
+                # SIMPLIFIED LOSS: Model predicts 2D velocity (vx_norm, vy_norm)
+                # Convert velocity to displacement for loss computation
+                dt = 0.1
+                
+                # Extract predicted velocity (model outputs 2D)
+                pred_vx_norm = pred_aligned[:, 0]
+                pred_vy_norm = pred_aligned[:, 1]
+                
+                # Convert velocity to displacement
+                pred_vx = pred_vx_norm * MAX_SPEED  # denormalize to m/s
+                pred_vy = pred_vy_norm * MAX_SPEED
+                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
+                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
+                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)
+                
                 # Check for NaN in predictions or targets before computing loss
-                if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
+                if torch.isnan(pred_disp_for_loss).any() or torch.isnan(target).any():
                     print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
                     continue
                 
-                # loss:
-                
-                mse_loss = F.mse_loss(pred_aligned, target)     # MSE between predicted and target displacement (per-agent)
-                huber_loss = F.smooth_l1_loss(pred_aligned, target)     # Huber loss (smooth L1) - more robust to outliers
-                pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
+                # Displacement loss components
+                mse_loss = F.mse_loss(pred_disp_for_loss, target)
+                huber_loss = F.smooth_l1_loss(pred_disp_for_loss, target)
+                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
                 target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
-                cosine_loss = (1 - cos_sim).mean()      # Direction loss: cosine similarity between prediction and target
-                pred_magnitude = torch.norm(pred_aligned, dim=1)
+                cosine_loss = (1 - cos_sim).mean()
+                pred_magnitude = torch.norm(pred_disp_for_loss, dim=1)
                 target_magnitude = torch.norm(target, dim=1)
-                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)   # Magnitude loss - ensure predicted displacement has correct length
+                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
                 
-                # Final NaN check on loss values
-                if torch.isnan(mse_loss) or torch.isnan(cosine_loss) or torch.isnan(huber_loss):
+                # Combined displacement loss
+                disp_loss = 0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss
+                
+                # Final NaN check
+                if torch.isnan(disp_loss):
                     print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                     continue
                 
-                # Clamp MSE loss to prevent gradient explosion from outliers
-                mse_loss = torch.clamp(mse_loss, max=10.0)
-                huber_loss = torch.clamp(huber_loss, max=10.0)
-                
-                # Combined loss: Huber (40%) + MSE (20%) + Direction (30%) + Magnitude (10%)
-                # Temporal discount for later steps
-                discount = 0.97 ** step  # Slightly less aggressive discount
-                step_loss = (0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss) * discount
+                # Temporal discount for autoregressive stability
+                discount = 0.97 ** step
+                step_loss = disp_loss * discount
             
             if rollout_loss is None:
                 rollout_loss = step_loss
@@ -1023,71 +1051,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 count += 1
             
             if step < num_rollout_steps - 1:
+                # Scheduled sampling: sometimes use prediction, sometimes use GT
                 use_prediction = np.random.random() < sampling_prob
                 
                 if use_prediction:
-                    # NEW APPROACH: Use GT graph from target_t but with position offset
-                    # This gives the model correct GT velocity features while being at predicted position
-                    # The model sees: GT velocity/heading/speed but offset position - learns to correct
-                    
-                    # Get the GT graph for next timestep (has correct velocity features)
-                    gt_graph_next = batched_graph_sequence[target_t]
-                    
-                    # Compute position offset: where we predicted vs where GT says we should be
-                    # pred is normalized displacement, multiply by 100 to get actual
-                    pred_displacement = pred.detach() * POSITION_SCALE
-                    
-                    # Update position on a clone of GT graph
-                    graph_for_prediction = gt_graph_next.clone()
-                    
-                    # CRITICAL: Only update positions for agents that exist in BOTH graphs
-                    # Use the same alignment logic we use for computing loss
-                    if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        # Get current graph (where we just predicted from)
-                        current_graph = batched_graph_sequence[t + step]
-                        
-                        # Only update if we have valid predictions and agent alignment
-                        if (hasattr(current_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
-                            hasattr(current_graph, 'batch') and hasattr(gt_graph_next, 'batch')):
-                            
-                            # Build agent ID mappings (same as loss computation)
-                            current_batch_np = current_graph.batch.cpu().numpy()
-                            next_batch_np = gt_graph_next.batch.cpu().numpy()
-                            
-                            current_id_to_idx = {}
-                            for idx in range(len(current_graph.agent_ids)):
-                                bid = int(current_batch_np[idx])
-                                aid = current_graph.agent_ids[idx]
-                                current_id_to_idx[(bid, aid)] = idx
-                            
-                            next_id_to_idx = {}
-                            for idx in range(len(gt_graph_next.agent_ids)):
-                                bid = int(next_batch_np[idx])
-                                aid = gt_graph_next.agent_ids[idx]
-                                next_id_to_idx[(bid, aid)] = idx
-                            
-                            # Find common agents
-                            common_ids = set(current_id_to_idx.keys()) & set(next_id_to_idx.keys())
-                            
-                            if len(common_ids) > 0:
-                                # For each common agent, offset their position
-                                for gid in common_ids:
-                                    current_idx = current_id_to_idx[gid]
-                                    next_idx = next_id_to_idx[gid]
-                                    
-                                    if current_idx < pred_displacement.shape[0]:
-                                        # Apply prediction to current position to get offset position
-                                        graph_for_prediction.pos[next_idx] = current_graph.pos[current_idx] + pred_displacement[current_idx]
-                        else:
-                            # No agent IDs - assume same ordering (less safe)
-                            if current_graph.pos.shape[0] == pred_displacement.shape[0]:
-                                num_to_update = min(pred_displacement.shape[0], graph_for_prediction.pos.shape[0])
-                                graph_for_prediction.pos[:num_to_update] = current_graph.pos[:num_to_update] + pred_displacement[:num_to_update]
-                    
-                    is_using_predicted_positions = True  # Position is predicted, features are GT
+                    # TRUE AUTOREGRESSIVE: Build graph from our predictions
+                    graph_for_prediction = update_graph_with_prediction(
+                        graph_for_prediction, pred.detach(), device
+                    )
+                    is_using_predicted_positions = True
                 else:
+                    # TEACHER FORCING: Use ground truth graph from sequence
                     graph_for_prediction = batched_graph_sequence[target_t]
-                    is_using_predicted_positions = False  # Back to GT positions
+                    is_using_predicted_positions = False
         
         # end of single rollout - do backward pass immediately
         if rollout_loss is not None:
@@ -1263,10 +1239,27 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     # First step uses GT position
                     target = target_graph.y.to(pred.dtype)
                 
-                mse = F.mse_loss(pred, target)
+                # Multi-dimensional loss computation (same as training)
+                dt = 0.1
+                pred_vx_norm = pred[:, 0]
+                pred_vy_norm = pred[:, 1]
+                pred_vx = pred_vx_norm * MAX_SPEED
+                pred_vy = pred_vy_norm * MAX_SPEED
+                # Model outputs 2D velocity - convert to displacement for loss
+                dt = 0.1
+                pred_vx_norm = pred[:, 0]
+                pred_vy_norm = pred[:, 1]
+                pred_vx = pred_vx_norm * MAX_SPEED
+                pred_vy = pred_vy_norm * MAX_SPEED
+                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
+                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
+                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)
+                
+                # Simplified loss - just displacement
+                mse = F.mse_loss(pred_disp_for_loss, target)
                 
                 # Track per-agent displacement error at each step for ADE/FDE
-                step_errors_meters = torch.norm(pred - target, dim=1) * POSITION_SCALE  # [num_agents]
+                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
                 
                 # Initialize or accumulate per-agent errors for this rollout
                 if step == 0:
@@ -1291,7 +1284,7 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     if step == 88:
                         debug_printed = True
                 
-                pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
                 target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
                 cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
                 
@@ -1305,12 +1298,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 horizon_counts[step] += 1
                 
                 if step < num_rollout_steps - 1:
+                    # ALWAYS use predictions in evaluation (no teacher forcing)
                     graph_for_prediction = update_graph_with_prediction(
-                        graph_for_prediction, pred, device,
-                        velocity_smoothing=velocity_smoothing,
-                        update_velocity=update_velocity
+                        graph_for_prediction, pred, device
                     )
-                    is_using_predicted_positions = True  # Now we're using predicted positions
+                    is_using_predicted_positions = True
             
             # After rollout completes
             total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
@@ -1742,207 +1734,171 @@ def run_autoregressive_finetuning(
     run.finish()
     return model
 
-def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
+
+def update_graph_with_prediction(graph, pred_velocity, device):
     """
-    Update graph for next autoregressive step - UPDATE VELOCITY FEATURES from predictions.
+    Update graph for next autoregressive step using PREDICTED VELOCITY.
     
-    The model predicts normalized displacement (dx/100, dy/100).
-    
-    Updates:
-    - Position (graph.pos): updated with predicted displacement (* 100)
-    - Velocity (features 0-1): derived from predicted displacement / dt, then normalized (if update_velocity=True)
-    - Speed (feature 2): magnitude of new velocity, normalized (if update_velocity=True)
-    - Heading (feature 3): direction of new velocity (if update_velocity=True)
-    - Relative position to SDC (features 7-8): recalculated based on new positions
-    - Distance to SDC (feature 9): recalculated
-    - Edges: optionally rebuilt based on new positions (AUTOREG_REBUILD_EDGES)
+    Model predicts 2D velocity [N, 2] → we derive all other features:
+        [0-1]   vx, vy - from prediction
+        [2]     speed - calculated as sqrt(vx² + vy²)
+        [3]     heading - calculated as atan2(vy, vx)
+        [4]     valid - keep from previous graph
+        [5-6]   ax, ay - calculated as velocity change from previous
+        [7-10]  distances - recalculated from updated positions
+        [11-14] one-hot type - keep from previous graph (never changes)
     
     Args:
-        graph: PyG Data object with node features and positions
-        pred_displacement: Predicted normalized displacement [N, 2]
+        graph: PyG Data object with current features and positions
+        pred_velocity: Predicted velocity [N, 2] (vx_norm, vy_norm)
         device: Torch device
-        velocity_smoothing: EMA smoothing factor for velocity updates (0=no smoothing, 1=full smoothing)
-                           Higher values = more conservative updates, helps stabilize early training
-        update_velocity: If False, keep original velocity features (helps stabilize very early training)
     
-    NOTE: Previously we preserved velocity features, but this caused trajectory convergence
-    because the model learned to ignore velocity and predict an "average" displacement.
-    Now we update velocity from predictions to maintain agent-specific behavior.
+    Returns:
+        Updated graph with recalculated features and optionally rebuilt edges
     """
     global _size_mismatch_warned
     updated_graph = graph.clone()
-    dt = 0.1  # 0.1 second timestep
+    dt = 0.1  # timestep in seconds
     
-    # CRITICAL: Handle size mismatch between prediction and graph
-    # This can happen when agents enter/leave between timesteps
+    # Handle size mismatch (agents entering/leaving)
     num_nodes_graph = updated_graph.x.shape[0]
-    num_nodes_pred = pred_displacement.shape[0]
+    num_nodes_pred = pred_velocity.shape[0]
     
     if num_nodes_pred != num_nodes_graph:
-        # Size mismatch - only update the overlapping nodes
-        # Only print warning once per epoch to avoid log spam
         if not _size_mismatch_warned:
-            print(f"  [WARNING] Size mismatch in update_graph_with_prediction: pred={num_nodes_pred}, graph={num_nodes_graph} (suppressing further warnings)")
+            print(f"  [WARNING] Size mismatch: pred={num_nodes_pred}, graph={num_nodes_graph}")
             _size_mismatch_warned = True
-        num_nodes_to_update = min(num_nodes_pred, num_nodes_graph)
-        pred_displacement = pred_displacement[:num_nodes_to_update]
-        # We'll only update the first num_nodes_to_update nodes
+        num_nodes = min(num_nodes_pred, num_nodes_graph)
+        pred_velocity = pred_velocity[:num_nodes]
     else:
-        num_nodes_to_update = num_nodes_graph
-
-    # Check for NaN in predictions - if found, replace with zeros to prevent cascade
-    if torch.isnan(pred_displacement).any():
-        print(f"  [WARNING] NaN detected in predictions! Replacing with zeros to prevent cascade.")
-        pred_displacement = torch.nan_to_num(pred_displacement, nan=0.0)
-        # TODO: set this displacement invalid...
+        num_nodes = num_nodes_graph
     
-    # ============== UPDATE VELOCITY FEATURES FROM PREDICTIONS ==============
-    if update_velocity:
-        # Convert predicted displacement to velocity: velocity = displacement / dt
-        # pred_displacement is normalized (actual_disp / 100)
-        # velocity_actual = (pred_disp * 100) / dt = pred_disp * 1000
-        # velocity_normalized = velocity_actual / MAX_SPEED = pred_disp * 1000 / 30 = pred_disp * 33.33
-        velocity_scale = POSITION_SCALE / dt / MAX_SPEED  # = 100 / 0.1 / 30 = 33.33
-        
-        # Get old velocity for acceleration calculation
-        old_vx_norm = updated_graph.x[:num_nodes_to_update, 0].clone()
-        old_vy_norm = updated_graph.x[:num_nodes_to_update, 1].clone()
-        
-        # New velocity from predictions - but clamp the raw displacement first to prevent explosion
-        # Reasonable single-step displacement: max ~3m (30 m/s * 0.1s), normalized = 0.03
-        # TIGHTER CLAMPING: 3m max to match physical limits (30 m/s * 0.1s = 3m)
-        max_disp_norm = 0.03  # 3m max per step - physically realistic limit
-        pred_disp_clamped = torch.clamp(pred_displacement, -max_disp_norm, max_disp_norm)
-        
-        new_vx_norm_raw = pred_disp_clamped[:, 0] * velocity_scale
-        new_vy_norm_raw = pred_disp_clamped[:, 1] * velocity_scale
-        
-        # Clamp to reasonable ranges (normalized values)
-        # MAX_SPEED=30 m/s, so normalized 1.0 = 30 m/s
-        # Use tighter clamping (1.0 = 30 m/s) to prevent unrealistic velocities
-        max_velocity_norm = 1.0  # 30 m/s max - realistic for vehicles
-        new_vx_norm_clamped = torch.clamp(new_vx_norm_raw, -max_velocity_norm, max_velocity_norm)
-        new_vy_norm_clamped = torch.clamp(new_vy_norm_raw, -max_velocity_norm, max_velocity_norm)
-        
-        # Apply EMA smoothing to prevent sudden velocity jumps
-        # new_v = smoothing * old_v + (1 - smoothing) * predicted_v
-        # Higher smoothing = more conservative updates (better for early training)
-        new_vx_norm = velocity_smoothing * old_vx_norm + (1.0 - velocity_smoothing) * new_vx_norm_clamped
-        new_vy_norm = velocity_smoothing * old_vy_norm + (1.0 - velocity_smoothing) * new_vy_norm_clamped
-        
-        # Calculate speed and heading from smoothed velocity
-        new_speed_norm = torch.sqrt(new_vx_norm**2 + new_vy_norm**2)
-        new_heading = torch.atan2(new_vy_norm, new_vx_norm) / np.pi  # Normalize to [-1, 1]
-        
-        # Safety: Check for NaN after velocity calculations
-        if torch.isnan(new_vx_norm).any() or torch.isnan(new_vy_norm).any():
-            print(f"  [ERROR] NaN in velocity features after smoothing! Keeping old values.")
-            # Keep old velocity instead of clamping to zero
-            new_vx_norm = old_vx_norm
-            new_vy_norm = old_vy_norm
-            new_speed_norm = updated_graph.x[:num_nodes_to_update, 2].clone()
-            new_heading = updated_graph.x[:num_nodes_to_update, 3].clone()
-        
-        # Calculate acceleration from velocity change (using smoothed values)
-        # acceleration = (new_v - old_v) / dt
-        # But we need to be careful: if smoothing is high, acceleration should be low
-        accel_scale = MAX_SPEED / dt / MAX_ACCEL  # = 30 / 0.1 / 10 = 30
-        ax_norm = (new_vx_norm - old_vx_norm) * accel_scale
-        ay_norm = (new_vy_norm - old_vy_norm) * accel_scale
-        # Clamp acceleration (0.5 = ~5 m/s^2, 1.0 = ~10 m/s^2 = 1g)
-        ax_norm = torch.clamp(ax_norm, -1.0, 1.0)
-        ay_norm = torch.clamp(ay_norm, -1.0, 1.0)
-        
-        # Update velocity/acceleration features
-        updated_graph.x[:num_nodes_to_update, 0] = new_vx_norm
-        updated_graph.x[:num_nodes_to_update, 1] = new_vy_norm
-        updated_graph.x[:num_nodes_to_update, 2] = new_speed_norm
-        updated_graph.x[:num_nodes_to_update, 3] = new_heading
-        updated_graph.x[:num_nodes_to_update, 5] = ax_norm
-        updated_graph.x[:num_nodes_to_update, 6] = ay_norm
-    # Else: keep original velocity features - helps stabilize early training
-    # ========================================================================
+    # Check for NaN in predictions
+    if torch.isnan(pred_velocity).any():
+        nan_mask = torch.isnan(pred_velocity).any(dim=1)
+        print(f"  [WARNING] NaN in {nan_mask.sum()} predictions! Using previous velocity.")
+        pred_velocity[nan_mask] = updated_graph.x[:num_nodes, 0:2][nan_mask]
     
-    # Only update positions
+    # ============ UPDATE POSITIONS FROM PREDICTED VELOCITY ============
+    # Denormalize velocity
+    pred_vx = pred_velocity[:, 0] * MAX_SPEED  # m/s
+    pred_vy = pred_velocity[:, 1] * MAX_SPEED  # m/s
+    
+    # Integrate: displacement = velocity * dt
+    dx = pred_vx * dt  # meters
+    dy = pred_vy * dt  # meters
+    
+    # Update positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
-        # pred_displacement is normalized, multiply by 100 to get actual displacement
-        actual_displacement = pred_displacement * POSITION_SCALE
-        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
+        displacement = torch.stack([dx, dy], dim=1)
+        updated_graph.pos[:num_nodes] = updated_graph.pos[:num_nodes] + displacement
+    
+    # ============ DERIVE ALL NODE FEATURES FROM PREDICTION ============
+    # Start with zeros, then fill in calculated values
+    new_features = torch.zeros(num_nodes, 15, device=device, dtype=torch.float32)
+    
+    # [0-1] Velocity (normalized) - from prediction
+    new_features[:, 0:2] = pred_velocity[:num_nodes]
+    
+    # [2] Speed (normalized) - calculate from velocity
+    pred_speed = torch.sqrt(pred_vx[:num_nodes]**2 + pred_vy[:num_nodes]**2)
+    new_features[:, 2] = pred_speed / MAX_SPEED
+    
+    # [3] Heading direction (normalized) - calculate from velocity
+    pred_heading = torch.atan2(pred_vy[:num_nodes], pred_vx[:num_nodes]) / np.pi  # [-1, 1]
+    new_features[:, 3] = pred_heading
+    
+    # [4] Valid - keep from previous graph (doesn't change)
+    new_features[:, 4] = updated_graph.x[:num_nodes, 4]
+    
+    # [5-6] Acceleration (normalized) - calculate as velocity change
+    if hasattr(updated_graph, 'x'):
+        prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
+        prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
+        ax = pred_vx[:num_nodes] - prev_vx
+        ay = pred_vy[:num_nodes] - prev_vy
+        new_features[:, 5] = ax / MAX_ACCEL
+        new_features[:, 6] = ay / MAX_ACCEL
+    
+    # [7-10] Distances - recalculate from updated positions
+    if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
+        positions = updated_graph.pos[:num_nodes]
         
-        # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
-        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
-            batch_ids = updated_graph.batch.unique()
-            for batch_id in batch_ids:
-                batch_mask = (updated_graph.batch == batch_id)
-                batch_positions = updated_graph.pos[batch_mask]
-                
-                # Assume SDC is the first node in each batch
-                sdc_pos = batch_positions[0]
-                
-                # Calculate relative positions for this batch
-                rel_pos = batch_positions - sdc_pos
-                dist_to_sdc = torch.sqrt((rel_pos ** 2).sum(dim=1))
-                
-                # Normalize and clamp
-                rel_x_norm = torch.clamp(rel_pos[:, 0] / MAX_DIST_SDC, -1.0, 1.0)
-                rel_y_norm = torch.clamp(rel_pos[:, 1] / MAX_DIST_SDC, -1.0, 1.0)
-                dist_norm = torch.clamp(dist_to_sdc / MAX_DIST_SDC, 0.0, 1.0)
-                
-                # Update features for this batch
-                batch_indices = torch.where(batch_mask)[0]
-                updated_graph.x[batch_indices, 7] = rel_x_norm
-                updated_graph.x[batch_indices, 8] = rel_y_norm
-                updated_graph.x[batch_indices, 9] = dist_norm
+        # Find SDC (ego vehicle) - usually agent 0 or check batch info
+        # For simplicity, use first agent as SDC approximation
+        sdc_pos = positions[0]
         
-        # ============== EDGE REBUILDING ==============
-        # Rebuild edges based on updated positions to capture new spatial relationships
-        # This is critical for long rollouts where agents move significantly
-        if AUTOREG_REBUILD_EDGES:
-            if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
-                # Batched graph: rebuild edges per scenario, then combine
-                batch_ids = updated_graph.batch.unique()
-                all_edge_indices = []
-                all_edge_weights = []
-                
-                for batch_id in batch_ids:
-                    batch_mask = (updated_graph.batch == batch_id)
-                    batch_positions = updated_graph.pos[batch_mask]
-                    batch_indices = torch.where(batch_mask)[0]
-                    
-                    # Get valid mask from feature 4 (validity flag)
-                    valid_mask = updated_graph.x[batch_mask, 4] > 0.5
-                    
-                    # Build new edges for this batch
-                    local_edge_index, local_edge_weight = build_edge_index_using_radius(
-                        batch_positions, radius=radius, self_loops=False, 
-                        valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
-                    )
-                    
-                    # Convert local indices to global indices
-                    if local_edge_index.size(1) > 0:
-                        global_edge_index = batch_indices[local_edge_index]
-                        all_edge_indices.append(global_edge_index)
-                        all_edge_weights.append(local_edge_weight.to(device))
-                
-                # Combine all edges
-                if all_edge_indices:
-                    updated_graph.edge_index = torch.cat(all_edge_indices, dim=1)
-                    updated_graph.edge_weight = torch.cat(all_edge_weights, dim=0)
-                else:
-                    # No edges - create empty tensors
-                    updated_graph.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-                    updated_graph.edge_weight = torch.zeros(0, dtype=torch.float32, device=device)
+        for i in range(num_nodes):
+            # Relative position to SDC
+            rel_x = (positions[i, 0] - sdc_pos[0]).item()
+            rel_y = (positions[i, 1] - sdc_pos[1]).item()
+            dist_sdc = np.sqrt(rel_x**2 + rel_y**2)
+            
+            new_features[i, 7] = rel_x / MAX_DIST_SDC  # normalized
+            new_features[i, 8] = rel_y / MAX_DIST_SDC
+            new_features[i, 9] = min(dist_sdc / MAX_DIST_SDC, 1.0)
+            
+            # Distance to nearest neighbor
+            if num_nodes > 1:
+                dists = torch.norm(positions - positions[i], dim=1)
+                dists[i] = float('inf')  # exclude self
+                min_dist = dists.min().item()
+                new_features[i, 10] = min(min_dist / 50.0, 1.0)  # MAX_DIST_NEAREST=50m
             else:
-                # Single graph (no batching)
-                valid_mask = updated_graph.x[:, 4] > 0.5
-                new_edge_index, new_edge_weight = build_edge_index_using_radius(
-                    updated_graph.pos, radius=radius, self_loops=False,
-                    valid_mask=valid_mask.cpu().numpy() if valid_mask is not None else None
+                new_features[i, 10] = 1.0  # far away (no neighbors)
+    
+    # [11-14] One-hot type - keep from previous graph (NEVER changes)
+    new_features[:, 11:15] = updated_graph.x[:num_nodes, 11:15]
+    
+    # Update graph features
+    updated_graph.x[:num_nodes] = new_features
+    
+    # ============ REBUILD EDGES IF ENABLED ============
+    if AUTOREG_REBUILD_EDGES and hasattr(updated_graph, 'pos'):
+        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
+            # Batched graph: rebuild per scenario
+            batch_ids = updated_graph.batch[:num_nodes].unique()
+            all_edge_indices = []
+            all_edge_weights = []
+            
+            for batch_id in batch_ids:
+                batch_mask = (updated_graph.batch[:num_nodes] == batch_id)
+                batch_positions = updated_graph.pos[:num_nodes][batch_mask]
+                batch_indices = torch.where(batch_mask)[0]
+                
+                # Valid mask from feature 4
+                valid_mask = new_features[batch_mask, 4] > 0.5
+                
+                # Build edges
+                local_edge_index, local_edge_weight = build_edge_index_using_radius(
+                    batch_positions, radius=radius, self_loops=False,
+                    valid_mask=valid_mask.cpu().numpy()
                 )
-                updated_graph.edge_index = new_edge_index.to(device)
-                updated_graph.edge_weight = new_edge_weight.to(device)
+                
+                if local_edge_index.size(1) > 0:
+                    global_edge_index = batch_indices[local_edge_index]
+                    all_edge_indices.append(global_edge_index)
+                    all_edge_weights.append(local_edge_weight.to(device))
+            
+            # Combine edges
+            if all_edge_indices:
+                updated_graph.edge_index = torch.cat(all_edge_indices, dim=1)
+                updated_graph.edge_weight = torch.cat(all_edge_weights, dim=0)
+            else:
+                updated_graph.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                updated_graph.edge_weight = torch.zeros(0, dtype=torch.float32, device=device)
+        else:
+            # Single graph
+            valid_mask = new_features[:, 4] > 0.5
+            new_edge_index, new_edge_weight = build_edge_index_using_radius(
+                updated_graph.pos[:num_nodes], radius=radius, self_loops=False,
+                valid_mask=valid_mask.cpu().numpy()
+            )
+            updated_graph.edge_index = new_edge_index.to(device)
+            updated_graph.edge_weight = new_edge_weight.to(device)
     
     return updated_graph
+
 
 def filter_to_scenario(graph, scenario_idx, B):
     if B > 1 and hasattr(graph, 'batch'):
@@ -1972,382 +1928,3 @@ if __name__ == '__main__':
         num_epochs=autoreg_num_epochs,
         sampling_strategy=autoreg_sampling_strategy
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def update_graph_with_prediction(graph, pred_displacement, device, velocity_smoothing=0.5, update_velocity=True):
-    
-    # NEW APPROACH: Keep GT velocity features, don't update them
-    # This maintains correct agent-specific kinematic features
-    # The model learns: given current position + GT velocity, predict displacement to GT next position
-    
-    # Only update positions (keep all other features from GT)
-    if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
-        # pred_displacement is normalized, multiply by 100 to get actual displacement
-        actual_displacement = pred_displacement * POSITION_SCALE
-        updated_graph.pos[:num_nodes_to_update] = updated_graph.pos[:num_nodes_to_update] + actual_displacement
-        
-        # Update relative position to SDC (features 7-8) and distance to SDC (feature 9)
-        if hasattr(updated_graph, 'batch') and updated_graph.batch is not None:
-            batch_ids = updated_graph.batch.unique()
-            for batch_id in batch_ids:
-                batch_mask = (updated_graph.batch == batch_id)
-                batch_positions = updated_graph.pos[batch_mask]
-                
-                # Assume SDC is the first node in each batch
-                sdc_pos = batch_positions[0]
-                
-                # Calculate relative positions for this batch
-                rel_pos = batch_positions - sdc_pos
-                dist_to_sdc = torch.sqrt((rel_pos ** 2).sum(dim=1))
-                
-                # Normalize and clamp
-                rel_x_norm = torch.clamp(rel_pos[:, 0] / MAX_DIST_SDC, -1.0, 1.0)
-                rel_y_norm = torch.clamp(rel_pos[:, 1] / MAX_DIST_SDC, -1.0, 1.0)
-                dist_norm = torch.clamp(dist_to_sdc / MAX_DIST_SDC, 0.0, 1.0)
-                
-                # Update features for this batch
-                batch_indices = torch.where(batch_mask)[0]
-                updated_graph.x[batch_indices, 7] = rel_x_norm
-                updated_graph.x[batch_indices, 8] = rel_y_norm
-                updated_graph.x[batch_indices, 9] = dist_norm
-
-def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
-                                     is_parallel, save_dir=None):
-
-
-    
-    with torch.no_grad():
-        
-        
-        for step in range(actual_rollout_steps):
-            target_t = start_t + step + 1
-            if target_t >= T:
-                break
-            
-            target_graph = batched_graph_sequence[target_t]
-            
-            # Get agent IDs for the graph we're predicting from (filter to first scenario only)
-            if B > 1 and hasattr(graph_for_prediction, 'batch'):
-                pred_batch_mask = (graph_for_prediction.batch == 0)
-                pred_scenario_indices = torch.where(pred_batch_mask)[0].cpu().numpy()
-            else:
-                pred_scenario_indices = np.arange(graph_for_prediction.num_nodes)
-            
-            if hasattr(graph_for_prediction, 'agent_ids'):
-                all_current_agent_ids = list(graph_for_prediction.agent_ids)
-                current_agent_ids = [all_current_agent_ids[i] for i in pred_scenario_indices if i < len(all_current_agent_ids)]
-            else:
-                current_agent_ids = [i for i in pred_scenario_indices]
-            
-            edge_w = graph_for_prediction.edge_attr if use_edge_weights else None
-            pred = model(graph_for_prediction.x, graph_for_prediction.edge_index,
-                        edge_weight=edge_w, batch=graph_for_prediction.batch,
-                        batch_size=B, batch_num=0, timestep=start_t + step)
-            
-            pred_disp = pred.cpu().numpy() * POSITION_SCALE
-            
-            # DEBUG: Print prediction stats on first step only
-            if step == 0 and enable_debug_viz:
-                pred_batch0 = pred_disp[pred_scenario_indices]
-                print(f"  [DEBUG VIZ] Step 0 pred disp range=[{pred_batch0.min():.2f}, {pred_batch0.max():.2f}]m")
-            
-            # Map predictions to persistent agents using current graph's agent ordering (only first scenario)
-            step_errors = []
-            for local_idx, agent_id in enumerate(current_agent_ids):
-                if agent_id in agent_pred_positions:
-                    # Get global index in the full batched graph
-                    global_idx = pred_scenario_indices[local_idx]
-                    if global_idx < pred_disp.shape[0]:
-                        pred_d = pred_disp[global_idx]
-                        current_pred_pos = agent_pred_positions[agent_id].copy()
-                        new_pos = current_pred_pos + pred_d
-                        agent_pred_positions[agent_id] = new_pos
-                        agent_trajectories[agent_id]['pred'].append((target_t, new_pos.copy()))
-                        
-                        # Calculate error if GT available
-                        if agent_id in gt_positions_by_agent_and_time and target_t in gt_positions_by_agent_and_time[agent_id]:
-                            gt_next_pos = gt_positions_by_agent_and_time[agent_id][target_t]
-                            correct_target_disp = gt_next_pos - current_pred_pos
-                            step_err = np.linalg.norm(pred_d - correct_target_disp)
-                            step_errors.append(step_err)
-            
-            # Print average step error on first step only
-            if step_errors and step == 0 and enable_debug_viz:
-                print(f"  [DEBUG VIZ] Step 0 avg displacement error: {np.mean(step_errors):.2f}m")
-            
-            completed_steps = step + 1
-            
-            # NEW APPROACH: Use GT graph from next timestep with only position offset
-            # This gives the model correct GT velocity features for each agent
-            next_target_t = start_t + step + 2
-            if next_target_t < T:
-                next_gt_graph = batched_graph_sequence[next_target_t]
-                # Start with GT graph (all correct features)
-                graph_for_prediction = next_gt_graph.clone()
-                
-                # But offset position by our prediction to teach error correction
-                # Find common agents between current and next graph
-                if hasattr(next_gt_graph, 'agent_ids') and hasattr(next_gt_graph, 'batch'):
-                    next_agent_ids = list(next_gt_graph.agent_ids)
-                    next_batch = next_gt_graph.batch.cpu().numpy()
-                    
-                    # Filter to first scenario only
-                    if B > 1:
-                        next_batch0_mask = (next_gt_graph.batch == 0)
-                        next_batch0_indices = torch.where(next_batch0_mask)[0].cpu().numpy()
-                    else:
-                        next_batch0_indices = np.arange(next_gt_graph.num_nodes)
-                    
-                    # Apply position offset to common agents
-                    for local_idx, agent_id in enumerate(current_agent_ids):
-                        if agent_id in agent_pred_positions:
-                            # Find this agent in next graph
-                            for next_idx in next_batch0_indices:
-                                if next_idx < len(next_agent_ids) and next_agent_ids[next_idx] == agent_id:
-                                    global_idx = pred_scenario_indices[local_idx]
-                                    if global_idx < pred_disp.shape[0]:
-                                        # Offset position by our prediction
-                                        pred_offset = pred_disp[global_idx]
-                                        graph_for_prediction.pos[next_idx] = graph_for_prediction.pos[next_idx] + torch.from_numpy(pred_offset).to(device)
-                                    break
-            else:
-                # Fallback: use prediction-based update
-                graph_for_prediction = update_graph_with_prediction(
-                    graph_for_prediction, pred, device, update_velocity=False
-                )
-        
-        if enable_debug_viz:
-            print(f"  [DEBUG VIZ] Completed {completed_steps} prediction steps")
-        
-        # Store agent_ids_list for later use
-        agent_ids_list = list(persistent_agent_ids)
-    
-    # Calculate horizon errors using agent_trajectories
-    horizon_errors = []
-    for step in range(actual_rollout_steps):
-        target_t = start_t + step + 1
-        errors_at_step = []
-        for agent_id, traj in agent_trajectories.items():
-            gt_at_t = [pos for t, pos in traj['gt'] if t == target_t]
-            pred_at_t = [pos for t, pos in traj['pred'] if t == target_t]
-            if gt_at_t and pred_at_t:
-                error = np.sqrt(((gt_at_t[0] - pred_at_t[0]) ** 2).sum())
-                errors_at_step.append(error)
-        if errors_at_step:
-            horizon_errors.append(np.mean(errors_at_step))
-    
-    # Select agents to visualize (max 10, prioritizing SDC and moving agents)
-    max_agents_viz = 10
-    
-    # Calculate movement for each agent using the trajectory dictionary
-    agent_movements = {}
-    for agent_id, traj in agent_trajectories.items():
-        gt_positions_list = sorted(traj['gt'], key=lambda x: x[0])
-        total_movement = 0.0
-        for i in range(len(gt_positions_list) - 1):
-            pos1 = gt_positions_list[i][1]
-            pos2 = gt_positions_list[i + 1][1]
-            dist = np.sqrt(((pos2 - pos1) ** 2).sum())
-            total_movement += dist
-        agent_movements[agent_id] = total_movement
-    
-    # Select agents: SDC first, then most moving agents  
-    selected_agent_ids = []
-    if sdc_id is not None and sdc_id in agent_trajectories:
-        selected_agent_ids.append(sdc_id)
-    
-    # Add other agents sorted by movement
-    other_agent_ids = [aid for aid in agent_trajectories.keys() if aid != sdc_id]
-    other_agent_ids_sorted = sorted(other_agent_ids, key=lambda aid: agent_movements.get(aid, 0), reverse=True)
-    remaining_slots = max_agents_viz - len(selected_agent_ids)
-    selected_agent_ids.extend(other_agent_ids_sorted[:remaining_slots])
-    
-    # Assign colors by agent ID
-    agent_colors = {}
-    color_idx = 0
-    for agent_id in selected_agent_ids:
-        if agent_id == sdc_id:
-            agent_colors[agent_id] = SDC_COLOR
-        else:
-            agent_colors[agent_id] = VIBRANT_COLORS[color_idx % len(VIBRANT_COLORS)]
-            color_idx += 1
-    
-    # Calculate axis limits based on all trajectory positions
-    all_x_coords = []
-    all_y_coords = []
-    for agent_id in selected_agent_ids:
-        traj = agent_trajectories[agent_id]
-        for t, pos in traj['gt']:
-            all_x_coords.append(pos[0])
-            all_y_coords.append(pos[1])
-        for t, pos in traj['pred']:
-            all_x_coords.append(pos[0])
-            all_y_coords.append(pos[1])
-    
-    if all_x_coords and all_y_coords:
-        x_min, x_max = min(all_x_coords), max(all_x_coords)
-        y_min, y_max = min(all_y_coords), max(all_y_coords)
-        x_range = x_max - x_min
-        y_range = y_max - y_min
-        x_padding = max(x_range * 0.2, 15.0)
-        y_padding = max(y_range * 0.2, 15.0)
-        x_lim = (x_min - x_padding, x_max + x_padding)
-        y_lim = (y_min - y_padding, y_max + y_padding)
-    else:
-        x_lim, y_lim = None, None
-    
-    # Calculate final error for return value
-    final_error = horizon_errors[-1] if horizon_errors else 0
-    
-    # Create visualization - single plot
-    fig, ax1 = plt.subplots(1, 1, figsize=(12, 10))
-    
-    # Draw map features using shared function from visualization_functions.py
-    if scenario is not None:
-        map_features_drawn = draw_map_features(ax1, scenario, x_lim, y_lim)
-        print(f"  Drew {map_features_drawn} map features")
-    
-    # Draw trajectories for selected agents
-    from matplotlib.lines import Line2D
-    agent_legend_elements = []
-    print(f"Drawing trajectories for {len(selected_agent_ids)} agents:")
-    for agent_id in selected_agent_ids:
-        color = agent_colors[agent_id]
-        is_sdc = (agent_id == sdc_id)
-        agent_label = 'SDC' if is_sdc else f'Agent {agent_id}'
-        
-        traj = agent_trajectories[agent_id]
-        
-        # Sort by timestep
-        gt_sorted = sorted(traj['gt'], key=lambda x: x[0])
-        pred_sorted = sorted(traj['pred'], key=lambda x: x[0])
-        
-        # Extract coordinates
-        gt_traj_x = [pos[0] for t, pos in gt_sorted]
-        gt_traj_y = [pos[1] for t, pos in gt_sorted]
-        pred_traj_x = [pos[0] for t, pos in pred_sorted]
-        pred_traj_y = [pos[1] for t, pos in pred_sorted]
-        
-        # Debug: print trajectory info
-        if len(gt_sorted) > 1:
-            start_pos = gt_sorted[0][1]
-            end_pos = gt_sorted[-1][1]
-            dist = np.sqrt(((end_pos - start_pos) ** 2).sum())
-            print(f"  Agent {agent_id} ({'SDC' if is_sdc else 'other'}): {len(gt_sorted)} GT pts, {len(pred_sorted)} pred pts, GT movement length: {dist:.2f}m")
-        
-        # Draw predicted trajectory (colored dashed line) - draw first so GT is on top
-        # This is ONE continuous line connecting all predicted positions
-        if len(pred_traj_x) > 1:
-            ax1.plot(pred_traj_x, pred_traj_y, '--', color=color, linewidth=2.5, alpha=0.9, zorder=3)
-            # Mark predicted trajectory endpoint (same color, square marker)
-            ax1.scatter(pred_traj_x[-1], pred_traj_y[-1], c=color, marker='s', s=50, 
-                       edgecolors='black', linewidths=0.5, zorder=6)
-        
-        # Draw GT trajectory (black solid line) - on top
-        if len(gt_traj_x) > 1:
-            ax1.plot(gt_traj_x, gt_traj_y, '-', color='black', linewidth=1.5, alpha=0.8, zorder=4)
-            # Mark ground truth endpoint (black x marker)
-            ax1.scatter(gt_traj_x[-1], gt_traj_y[-1], c='black', marker='x', s=50, zorder=6)
-        
-        # Mark start position only (small colored circle)
-        if len(gt_traj_x) > 0:
-            ax1.scatter(gt_traj_x[0], gt_traj_y[0], c=color, marker='o', s=40, 
-                       edgecolors='black', linewidths=0.5, zorder=5)
-        
-        # Add agent to legend (colored for prediction)
-        if len(agent_legend_elements) < 10:
-            agent_legend_elements.append(Line2D([0], [0], color=color, linewidth=2, 
-                                                linestyle='--', label=agent_label))
-    
-    # Add trajectory type indicators to legend
-    line_legend_elements = [
-        Line2D([0], [0], color='black', linewidth=1.5, linestyle='-', label='Ground Truth'),
-        Line2D([0], [0], marker='o', color='gray', markersize=6, linestyle='None', 
-               markeredgecolor='black', label='Start position'),
-        Line2D([0], [0], marker='s', color='gray', markersize=6, linestyle='None', 
-               markeredgecolor='black', label='Predicted endpoint'),
-        Line2D([0], [0], marker='x', color='black', markersize=6, linestyle='None', 
-               label='GT endpoint'),
-    ]
-    
-    ax1.set_xlabel('X position (meters)', fontsize=11)
-    ax1.set_ylabel('Y position (meters)', fontsize=11)
-    ax1.set_title(f'Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)\n'
-                  f'Epoch {epoch+1}', fontsize=12, fontweight='bold')
-    
-    # Single legend with agents and line types
-    all_legend_elements = agent_legend_elements + line_legend_elements
-    ax1.legend(handles=all_legend_elements, loc='upper left', fontsize=7, 
-               framealpha=0.9, ncol=2)
-    
-    ax1.grid(True, alpha=0.3)
-    ax1.set_aspect('equal')
-    if x_lim and y_lim:
-        ax1.set_xlim(x_lim)
-        ax1.set_ylim(y_lim)
-    
-    plt.tight_layout()
-    
-    # Save
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    scenario_str = scenario_ids[0] if scenario_ids else "unknown"
-    filename = f'autoreg_epoch{epoch+1:03d}_{scenario_str}_{timestamp}.png'
-    filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    
-    # NOTE: Don't log to wandb here - visualization images are logged per-epoch in main loop
-    # to avoid step conflicts. The main loop collects all viz paths and logs them together.
-    
-    print(f"  -> Saved visualization to {filepath}")
-    
-    # Return both filepath and final horizon error for epoch-level tracking
-    final_horizon_error = horizon_errors[-1] if horizon_errors else float('inf')
-    return filepath, final_horizon_error

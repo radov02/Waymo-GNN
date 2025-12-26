@@ -229,11 +229,12 @@ class SpatioTemporalGNNBatched(nn.Module):
         # Output: [total_nodes, 1, hidden_dim] -> [total_nodes, hidden_dim]
         temporal_features = gru_output.squeeze(1)
         
-        # 3. Skip connection + decode
+        # 3. Skip connection + decode: predict 2D velocity (vx_norm, vy_norm)
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
         
-        predictions = torch.clamp(predictions, min=-5.0, max=5.0)
+        # Clamp velocity predictions to reasonable range [-2, 2] (normalized)
+        predictions = torch.clamp(predictions, min=-2.0, max=2.0)
         
         if debug_mode:
             print(f"------ Batched GNN Forward (B={batch_size}) at timestep {timestep}: ------")

@@ -35,3 +35,5 @@ src/autoregressive_model/checkpoints/*
 src/vectornet/data/training/*
 src/vectornet/data/validation/*
 src/vectornet/data/testing/*
+
+.github

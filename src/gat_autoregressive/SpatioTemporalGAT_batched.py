@@ -68,7 +68,8 @@ class SpatioTemporalGATBatched(nn.Module):
             dropout=dropout if num_gru_layers > 1 else 0.0
         )
         
-        # Decoder: MLP to predict displacement
+        # Decoder: MLP to predict 2D VELOCITY only (vx_norm, vy_norm)
+        # Other features (distances, one-hot, etc.) come from graph structure
         decoder_input_dim = hidden_dim + input_dim
         self.decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, hidden_dim),
@@ -77,7 +78,7 @@ class SpatioTemporalGATBatched(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, output_dim)
+            nn.Linear(hidden_dim // 2, output_dim)  # Just 2D velocity (vx_norm, vy_norm)
         )
         
         # Per-agent GRU hidden states - TRACKED BY AGENT ID
@@ -266,11 +267,11 @@ class SpatioTemporalGATBatched(nn.Module):
         # 6. Skip connection: concatenate temporal features with original node features
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         
-        # 7. Decode predictions
+        # 7. Decode predictions - predicts 2D velocity (vx_norm, vy_norm)
         predictions = self.decoder(decoder_input)
         
-        # Clamp to prevent explosive predictions
-        predictions = torch.clamp(predictions, min=-0.5, max=0.5)
+        # Clamp velocity predictions to reasonable range [-2, 2] (normalized)
+        predictions = torch.clamp(predictions, min=-2.0, max=2.0)
         
         if debug_mode:
             print(f"------ Batched GAT Forward (B={batch_size}) at timestep {timestep}: ------")
@@ -343,7 +344,21 @@ class SpatioTemporalGATBatched(nn.Module):
         
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
-        predictions = torch.clamp(predictions, min=-0.5, max=0.5)
+        
+        # Clamp to reasonable ranges to prevent explosive predictions
+        # Features [0-2]: velocity and speed (normalized, should be in [-2, 2] range)
+        predictions[:, 0:3] = torch.clamp(predictions[:, 0:3], min=-2.0, max=2.0)
+        # Feature [3]: heading direction (normalized to [-1, 1])
+        predictions[:, 3] = torch.clamp(predictions[:, 3], min=-1.0, max=1.0)
+        # Feature [4]: validity (0 or 1)
+        predictions[:, 4] = torch.sigmoid(predictions[:, 4])  # Use sigmoid for binary validity
+        # Features [5-6]: acceleration (normalized, should be in [-2, 2] range)
+        predictions[:, 5:7] = torch.clamp(predictions[:, 5:7], min=-2.0, max=2.0)
+        # Features [7-10]: relative positions and distances (normalized to [-1, 1] or [0, 1])
+        predictions[:, 7:10] = torch.clamp(predictions[:, 7:10], min=-2.0, max=2.0)
+        predictions[:, 10] = torch.clamp(predictions[:, 10], min=0.0, max=2.0)
+        # Features [11-14]: object type (softmax for categorical)
+        predictions[:, 11:15] = torch.softmax(predictions[:, 11:15], dim=-1)
         
         return predictions
     
