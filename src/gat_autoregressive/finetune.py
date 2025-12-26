@@ -750,7 +750,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     scenario_str = scenario_ids[0] if scenario_ids else "unknown"
-    filename = f'gat_autoreg_epoch{epoch+1:03d}_{scenario_str}_{timestamp}.png'
+    filename = f'{"gat" if model_type == "gat" else "gcn"}_autoreg_epoch{epoch+1:03d}_{scenario_str}_{timestamp}.png'
     filepath = os.path.join(save_dir, filename)
     plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
@@ -1501,7 +1501,7 @@ def run_autoregressive_finetuning(
             "epochs": num_epochs,
             "use_gat": model_type == "gat"
         },
-        name=f"GAT_Autoregressive_finetune_{num_rollout_steps}steps" if model_type == "gat" else f"GCN_Autoregressive_finetune_{num_rollout_steps}steps",
+        name=f"{"GAT" if model_type == "gat" else "GCN"}_Autoregressive_finetune_{num_rollout_steps}steps",
         dir="../wandb"
     )
     
