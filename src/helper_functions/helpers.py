@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from src.config import MAX_SPEED
+from config import MAX_SPEED
 
 @torch.jit.script
 def _compute_angle_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
