@@ -249,6 +249,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                                      is_parallel, save_dir=None, total_epochs=40, model_type="gat"):
     """Visualize autoregressive rollout predictions vs ground truth.
     
+    Model predicts displacement → updates positions → derives all 15-dim node features.
+    
     Args:
         model: The GAT model
         batch_dict: Batch dictionary with graph sequences
@@ -257,7 +259,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
         device: Torch device
         is_parallel: Whether model is DataParallel wrapped
         save_dir: Directory to save visualizations
-        total_epochs: Total number of epochs (for computing velocity smoothing)
+        total_epochs: Total number of epochs (for display)
+        model_type: "gat" or "gcn"
     """
     if save_dir is None:
         if model_type == "gat":
@@ -267,12 +270,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     
-    # TODO (w.r.t. update_graph_with_prediction)
-    # NEW APPROACH: Keep GT velocity features, only update position
-    # This matches training and gives model correct kinematic features
-    velocity_smoothing = 0.0  # Not used
-    update_velocity = False   # Keep GT features
-    print(f"  [VIZ] Using GT velocity features for visualization (epoch {epoch+1}/{total_epochs})")
+    print(f"  [VIZ] Autoregressive rollout: model predicts displacement → derives features (epoch {epoch+1}/{total_epochs})")
     
     base_model = model.module if is_parallel else model
     
@@ -458,17 +456,10 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         batch=graph_for_prediction.batch, batch_size=B, batch_num=0, timestep=start_t + step,
                         agent_ids=agent_ids_for_model)
             
-            # Extract 2D displacement from predicted 15-dim feature vectors
-            # Features [0-1] are normalized velocities vx_norm, vy_norm
-            # Integrate: displacement = velocity * dt
-            dt = 0.1  # timestep in seconds
-            pred_vx_norm = pred[:, 0]  # normalized velocity x
-            pred_vy_norm = pred[:, 1]  # normalized velocity y
-            pred_vx = pred_vx_norm * MAX_SPEED  # denormalize: m/s
-            pred_vy = pred_vy_norm * MAX_SPEED
-            pred_dx = pred_vx * dt  # displacement in meters
-            pred_dy = pred_vy * dt
-            pred_disp = torch.stack([pred_dx, pred_dy], dim=1).cpu().numpy()  # [N, 2] in meters
+            # Model predicts normalized displacement [N, 2]: (dx_norm, dy_norm)
+            # Convert to meters for visualization
+            pred_disp = (pred * POSITION_SCALE).cpu().numpy()  # [N, 2] in meters
+            dt = 0.1  # timestep in seconds (for velocity calculations)
             
             # DEBUG: Print prediction stats on first few steps
             if step < 5 and enable_debug_viz:
@@ -535,13 +526,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 # Update position using agent alignment (same fix as training)
                 if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
                     current_gt_graph = batched_graph_sequence[start_t + step]
-                    # Extract 2D displacement from predicted 15-dim feature vectors
-                    dt = 0.1
-                    pred_vx = pred[:, 0] * MAX_SPEED  # denormalize velocity (keep on device)
-                    pred_vy = pred[:, 1] * MAX_SPEED
-                    pred_dx = pred_vx * dt  # displacement in meters
-                    pred_dy = pred_vy * dt
-                    pred_displacement = torch.stack([pred_dx, pred_dy], dim=1)  # [N, 2] in meters, on device
+                    # Model predicts normalized displacement directly
+                    pred_displacement = pred * POSITION_SCALE  # [N, 2] in meters, on device
                     
                     # CRITICAL: Only update positions for agents that exist in BOTH graphs
                     if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
@@ -579,9 +565,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                             graph_for_prediction.pos = current_gt_graph.pos.to(device) + pred_displacement.to(device)
             else:
                 # No more GT graphs available, use update function as fallback
-                graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device, 
-                                                                      velocity_smoothing=velocity_smoothing,
-                                                                      update_velocity=update_velocity)
+                graph_for_prediction = update_graph_with_prediction(graph_for_prediction, pred, device)
     
     # Calculate errors
     horizon_errors = []
@@ -1075,39 +1059,31 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         gt_next_pos = target_graph.pos.to(pred.dtype)
                         target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
                 
-                # SIMPLIFIED LOSS: Model predicts 2D velocity (vx_norm, vy_norm)
-                # Convert velocity to displacement for loss computation
-                dt = 0.1
-                
-                # Extract predicted velocity (model outputs 2D)
-                pred_vx_norm = pred_aligned[:, 0]
-                pred_vy_norm = pred_aligned[:, 1]
-                
-                # Convert velocity to displacement
-                pred_vx = pred_vx_norm * MAX_SPEED  # denormalize to m/s
-                pred_vy = pred_vy_norm * MAX_SPEED
-                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
-                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
-                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)
-                
-                # Check for NaN in predictions or targets before computing loss
-                if torch.isnan(pred_disp_for_loss).any() or torch.isnan(target).any():
-                    print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
-                    continue
-                
-                # Displacement loss components
-                mse_loss = F.mse_loss(pred_disp_for_loss, target)
-                huber_loss = F.smooth_l1_loss(pred_disp_for_loss, target)
-                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
-                cosine_loss = (1 - cos_sim).mean()
-                pred_magnitude = torch.norm(pred_disp_for_loss, dim=1)
-                target_magnitude = torch.norm(target, dim=1)
-                magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
-                
-                # Combined displacement loss
-                disp_loss = 0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss
+                # Model predicts displacement directly [N, 2]
+                pred_aligned = pred[pred_indices]
+                target = target_graph.y[target_indices].to(pred.dtype)
+            else:
+                pred_aligned = pred
+                target = target_graph.y.to(pred.dtype)
+            
+            # Check for NaN in predictions or targets before computing loss
+            if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
+                print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
+                continue
+            
+            # Displacement loss components (model predicts displacement directly)
+            mse_loss = F.mse_loss(pred_aligned, target)
+            huber_loss = F.smooth_l1_loss(pred_aligned, target)
+            pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
+            target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
+            cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
+            cosine_loss = (1 - cos_sim).mean()
+            pred_magnitude = torch.norm(pred_aligned, dim=1)
+            target_magnitude = torch.norm(target, dim=1)
+            magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
+            
+            # Combined displacement loss
+            disp_loss = 0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss
                 
                 # Final NaN check
                 if torch.isnan(disp_loss):
@@ -1130,7 +1106,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 
                 # Track per-agent displacement errors for ADE/FDE computation
                 # Convert displacement error to meters
-                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
+                step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE  # [num_agents]
                 
                 # Store errors for this step in the current rollout
                 if step < effective_rollout and step_errors_meters.shape[0] <= current_rollout_errors.shape[0]:
@@ -1837,12 +1813,12 @@ def run_autoregressive_finetuning(
     run.finish()
     return model
 
-def update_graph_with_prediction(graph, pred_velocity, device):
+def update_graph_with_prediction(graph, pred_displacement, device):
     """
-    Update graph for next autoregressive step using PREDICTED VELOCITY.
+    Update graph for next autoregressive step using PREDICTED DISPLACEMENT.
     
-    Model predicts 2D velocity [N, 2] → we derive all other features:
-        [0-1]   vx, vy - from prediction
+    Model predicts 2D normalized displacement [N, 2] → we derive all features:
+        [0-1]   vx, vy - calculated from displacement/dt
         [2]     speed - calculated as sqrt(vx² + vy²)
         [3]     heading - calculated as atan2(vy, vx)
         [4]     valid - keep from previous graph
@@ -1852,7 +1828,7 @@ def update_graph_with_prediction(graph, pred_velocity, device):
     
     Args:
         graph: PyG Data object with current features and positions
-        pred_velocity: Predicted velocity [N, 2] (vx_norm, vy_norm)
+        pred_displacement: Predicted normalized displacement [N, 2] (dx_norm, dy_norm)
         device: Torch device
     
     Returns:
@@ -1864,43 +1840,42 @@ def update_graph_with_prediction(graph, pred_velocity, device):
     
     # Handle size mismatch (agents entering/leaving)
     num_nodes_graph = updated_graph.x.shape[0]
-    num_nodes_pred = pred_velocity.shape[0]
+    num_nodes_pred = pred_displacement.shape[0]
     
     if num_nodes_pred != num_nodes_graph:
         if not _size_mismatch_warned:
             print(f"  [WARNING] Size mismatch: pred={num_nodes_pred}, graph={num_nodes_graph}")
             _size_mismatch_warned = True
         num_nodes = min(num_nodes_pred, num_nodes_graph)
-        pred_velocity = pred_velocity[:num_nodes]
+        pred_displacement = pred_displacement[:num_nodes]
     else:
         num_nodes = num_nodes_graph
     
     # Check for NaN in predictions
-    if torch.isnan(pred_velocity).any():
-        nan_mask = torch.isnan(pred_velocity).any(dim=1)
-        print(f"  [WARNING] NaN in {nan_mask.sum()} predictions! Using previous velocity.")
-        pred_velocity[nan_mask] = updated_graph.x[:num_nodes, 0:2][nan_mask]
+    if torch.isnan(pred_displacement).any():
+        nan_mask = torch.isnan(pred_displacement).any(dim=1)
+        print(f"  [WARNING] NaN in {nan_mask.sum()} predictions! Using zeros.")
+        pred_displacement[nan_mask] = 0.0
     
-    # ============ UPDATE POSITIONS FROM PREDICTED VELOCITY ============
-    # Denormalize velocity
-    pred_vx = pred_velocity[:, 0] * MAX_SPEED  # m/s
-    pred_vy = pred_velocity[:, 1] * MAX_SPEED  # m/s
-    
-    # Integrate: displacement = velocity * dt
-    dx = pred_vx * dt  # meters
-    dy = pred_vy * dt  # meters
+    # ============ UPDATE POSITIONS FROM PREDICTED DISPLACEMENT ============
+    # Denormalize displacement (pred_displacement is normalized by POSITION_SCALE=100)
+    displacement_meters = pred_displacement * POSITION_SCALE  # [N, 2] in meters
     
     # Update positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
-        displacement = torch.stack([dx, dy], dim=1)
-        updated_graph.pos[:num_nodes] = updated_graph.pos[:num_nodes] + displacement
+        updated_graph.pos[:num_nodes] = updated_graph.pos[:num_nodes] + displacement_meters[:num_nodes]
     
-    # ============ DERIVE ALL NODE FEATURES FROM PREDICTION ============
+    # ============ DERIVE ALL NODE FEATURES FROM DISPLACEMENT ============
+    # Calculate velocity from displacement: v = dx / dt
+    pred_vx = displacement_meters[:, 0] / dt  # m/s
+    pred_vy = displacement_meters[:, 1] / dt  # m/s
+    
     # Start with zeros, then fill in calculated values
     new_features = torch.zeros(num_nodes, 15, device=device, dtype=torch.float32)
     
-    # [0-1] Velocity (normalized) - from prediction
-    new_features[:, 0:2] = pred_velocity[:num_nodes]
+    # [0-1] Velocity (normalized) - calculate from displacement
+    new_features[:, 0] = pred_vx[:num_nodes] / MAX_SPEED
+    new_features[:, 1] = pred_vy[:num_nodes] / MAX_SPEED
     
     # [2] Speed (normalized) - calculate from velocity
     pred_speed = torch.sqrt(pred_vx[:num_nodes]**2 + pred_vy[:num_nodes]**2)
