@@ -231,6 +231,44 @@ class MultiStepTrajectoryDecoder(nn.Module):
         out = out.view(batch_size, self.prediction_horizon, self.output_dim)
         return out
 
+class NodeCompletionHead(nn.Module):
+    """Masked polyline feature reconstruction head for node completion auxiliary task.
+    
+    This implements the L_node loss from the VectorNet paper - predicting the original
+    polyline features for masked polylines from the global context.
+    """
+    
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super(NodeCompletionHead, self).__init__()
+        
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in self.head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, x):
+        """Reconstruct polyline features.
+        
+        Args:
+            x: [P, hidden_dim] polyline features after global attention
+            
+        Returns:
+            reconstructed: [P, hidden_dim] reconstructed polyline features
+        """
+        return self.head(x)
+
+
 class VectorNetTFRecord(nn.Module):
     """VectorNet model designed for VectorNetTFRecordDataset.
     
@@ -248,9 +286,10 @@ class VectorNetTFRecord(nn.Module):
     The model:
     1. Separately encodes agent and map polylines
     2. Concatenates all polyline features
-    3. Applies global self-attention
+    3. Applies global self-attention (with optional masking for node completion)
     4. Extracts target agent features
     5. Decodes multi-step trajectory
+    6. Optionally reconstructs masked polyline features (node completion task)
     """
     
     def __init__(
@@ -264,12 +303,16 @@ class VectorNetTFRecord(nn.Module):
         num_global_layers: int = 1,
         num_heads: int = 8,
         dropout: float = 0.1,
+        node_mask_ratio: float = 0.15,
+        mask_target_polyline: bool = False,
     ):
         super(VectorNetTFRecord, self).__init__()
         
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.prediction_horizon = prediction_horizon
+        self.node_mask_ratio = node_mask_ratio
+        self.mask_target_polyline = mask_target_polyline
         
         # Separate encoders for agents and map features
         self.agent_encoder = PolylineSubgraphNetwork(
@@ -299,6 +342,12 @@ class VectorNetTFRecord(nn.Module):
             hidden_dim=hidden_dim,
             output_dim=output_dim,
             prediction_horizon=prediction_horizon,
+            dropout=dropout
+        )
+        
+        # Node completion head for masked polyline prediction
+        self.node_completion_head = NodeCompletionHead(
+            hidden_dim=hidden_dim,
             dropout=dropout
         )
     
@@ -335,7 +384,7 @@ class VectorNetTFRecord(nn.Module):
         polyline_features, unique_ids = encoder(vectors, polyline_ids)
         return polyline_features, unique_ids
     
-    def forward(self, batch):
+    def forward(self, batch, return_node_completion: bool = False):
         """Forward pass for TFRecord batch format.
         
         Args:
@@ -350,9 +399,14 @@ class VectorNetTFRecord(nn.Module):
                 - target_scenario_batch: [total_targets] - which scenario each target belongs to
                 - total_targets: int - total number of targets across all scenarios
                 - batch_size: int
+            return_node_completion: If True, also return node completion outputs for L_node loss
                 
         Returns:
             predictions: [total_targets, prediction_horizon, output_dim]
+            node_completion_dict: (optional) Dict with masked polyline reconstruction outputs
+                - 'masked_indices': [num_masked] indices of masked polylines
+                - 'reconstructed': [num_masked, hidden_dim] reconstructed features
+                - 'original': [num_masked, hidden_dim] original features (pre-norm)
         """
         device = next(self.parameters()).device
         batch_size = batch['batch_size']
@@ -373,6 +427,12 @@ class VectorNetTFRecord(nn.Module):
             map_vectors, map_polyline_ids, self.map_encoder
         )
         
+        # Store pre-normalized features for node completion target
+        if map_polyline_features.numel() > 0:
+            all_polylines_prenorm = torch.cat([agent_polyline_features, map_polyline_features], dim=0)
+        else:
+            all_polylines_prenorm = agent_polyline_features.clone()
+        
         # L2 normalize (paper requirement)
         if agent_polyline_features.numel() > 0:
             agent_polyline_features = F.normalize(agent_polyline_features, p=2, dim=-1)
@@ -385,11 +445,54 @@ class VectorNetTFRecord(nn.Module):
         else:
             all_polylines = agent_polyline_features
         
-        # Global interaction (self-attention over all polylines)
-        if all_polylines.numel() > 0:
-            global_features = self.global_graph(all_polylines)  # [P, hidden_dim]
+        num_polylines = all_polylines.shape[0]
+        node_completion_dict = None
+        
+        # Apply masking for node completion during training
+        if self.training and return_node_completion and self.node_mask_ratio > 0.0 and num_polylines > 0:
+            # Create mask - randomly select polylines to mask
+            rand = torch.rand(num_polylines, device=device)
+            mask = rand < self.node_mask_ratio
+            
+            # Optionally avoid masking target polylines to keep trajectory prediction stable
+            if not self.mask_target_polyline:
+                for idx in target_polyline_indices:
+                    if idx < num_polylines:
+                        mask[idx] = False
+            
+            # Ensure we don't mask everything
+            if mask.sum() == num_polylines:
+                # Keep at least one polyline unmasked
+                mask[0] = False
+            
+            masked_indices = mask.nonzero(as_tuple=False).squeeze(-1)
+            
+            if masked_indices.numel() > 0:
+                # Zero out masked polyline features
+                all_polylines_masked = all_polylines.clone()
+                all_polylines_masked[masked_indices] = 0.0
+                
+                # Global interaction with masked features
+                global_features = self.global_graph(all_polylines_masked)  # [P, hidden_dim]
+                
+                # Reconstruct masked polyline features
+                reconstructed = self.node_completion_head(global_features[masked_indices])
+                original = all_polylines_prenorm[masked_indices]
+                
+                node_completion_dict = {
+                    'masked_indices': masked_indices,
+                    'reconstructed': reconstructed,
+                    'original': original,
+                }
+            else:
+                # No polylines masked - regular forward pass
+                global_features = self.global_graph(all_polylines)  # [P, hidden_dim]
         else:
-            global_features = torch.zeros(0, self.hidden_dim, device=device)
+            # Regular forward pass without masking
+            if all_polylines.numel() > 0:
+                global_features = self.global_graph(all_polylines)  # [P, hidden_dim]
+            else:
+                global_features = torch.zeros(0, self.hidden_dim, device=device)
         
         # Extract target agent features for ALL target agents
         # target_polyline_indices contains indices into agent polylines for all targets
@@ -398,6 +501,8 @@ class VectorNetTFRecord(nn.Module):
         # Decode trajectories for all target agents
         predictions = self.trajectory_decoder(target_features)  # [total_targets, prediction_horizon, output_dim]
         
+        if return_node_completion:
+            return predictions, node_completion_dict
         return predictions
 
 
@@ -407,6 +512,7 @@ __all__ = [
     'PolylineSubgraphNetwork',
     'GlobalInteractionGraph',
     'MultiStepTrajectoryDecoder',
+    'NodeCompletionHead',
     'AGENT_VECTOR_DIM',
     'MAP_VECTOR_DIM',
 ]
