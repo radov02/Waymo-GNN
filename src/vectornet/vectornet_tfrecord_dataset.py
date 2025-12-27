@@ -60,6 +60,7 @@ class VectorNetTFRecordDataset(Dataset):
         cache_scenarios: bool = False,
         max_scenarios: Optional[int] = None,
         num_agents_to_predict: Optional[int] = 8,
+        map_feature_radius: float = 100.0,  # Only include map features within this distance (meters)
     ):
         self.tfrecord_dir = tfrecord_dir
         self.split = split
@@ -72,6 +73,7 @@ class VectorNetTFRecordDataset(Dataset):
         self.cache_scenarios = cache_scenarios
         self.max_scenarios = max_scenarios
         self.num_agents_to_predict = num_agents_to_predict
+        self.map_feature_radius = map_feature_radius
         self._scenario_cache: Dict[int, Any] = {}
         self.data_dir = os.path.join(tfrecord_dir, split)
         self.tfrecord_files = sorted(glob.glob(os.path.join(self.data_dir, "*.tfrecord")))
@@ -79,6 +81,7 @@ class VectorNetTFRecordDataset(Dataset):
             raise ValueError(f"No TFRecord files found in {self.data_dir}")
         print(f"Found {len(self.tfrecord_files)} TFRecord files in {self.data_dir}")
         print(f"Predicting for {num_agents_to_predict if num_agents_to_predict else 'all valid'} agents per scenario")
+        print(f"Map feature filtering: {map_feature_radius:.1f}m radius (closest features prioritized)")
         self._build_index()     # build index: (file_idx, scenario_idx_in_file) -> global_idx
     
     def _build_index(self):
@@ -304,22 +307,19 @@ class VectorNetTFRecordDataset(Dataset):
         )
     
     def _extract_map_polylines(self, scenario, origin_x: float, origin_y: float,  origin_z: float, origin_yaw: float, start_polyline_id: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Extract map feature polylines (lanes, roads, crosswalks),
-        each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7), polyline_id]"""
-        map_vectors = []
-        map_polyline_ids = []
-        polyline_id = start_polyline_id
+        """Extract map feature polylines (lanes, roads, crosswalks) with SPATIAL FILTERING.
+        Only includes features within map_feature_radius of the origin (SDC position).
+        Each vector: [ds_x, ds_y, ds_z, de_x, de_y, de_z, type_onehot(7), polyline_id]"""
+        
+        # STEP 1: Filter map features by distance to origin, then sort by distance
+        # This ensures we get the MOST RELEVANT features (closest to prediction area)
+        feature_distances = []
         
         for feature in scenario.map_features:
-            if polyline_id - start_polyline_id >= self.max_map_polylines:
-                break
-            
             feature_type = feature.WhichOneof('feature_data')
             
             # get polyline points based on feature type:
             points = []
-            type_idx = self.MAP_FEATURE_TYPES.get(feature_type, 0)
-            
             if feature_type == 'lane' and hasattr(feature.lane, 'polyline'):
                 points = [(p.x, p.y, getattr(p, 'z', 0.0)) for p in feature.lane.polyline]
             elif feature_type == 'road_line' and hasattr(feature.road_line, 'polyline'):
@@ -335,6 +335,30 @@ class VectorNetTFRecordDataset(Dataset):
                     points = [(pos.x, pos.y, getattr(pos, 'z', 0.0))]
             if len(points) < 2:
                 continue
+            
+            # Compute minimum distance from any point in polyline to origin
+            min_dist = float('inf')
+            for px, py, _ in points:
+                dist = math.sqrt((px - origin_x)**2 + (py - origin_y)**2)
+                min_dist = min(dist, min_dist)
+            
+            # Only include features within radius
+            if min_dist <= self.map_feature_radius:
+                feature_distances.append((min_dist, feature, feature_type, points))
+        
+        # Sort by distance (closest first) to prioritize nearby features
+        feature_distances.sort(key=lambda x: x[0])
+        
+        # STEP 2: Extract vectors from filtered and sorted features
+        map_vectors = []
+        map_polyline_ids = []
+        polyline_id = start_polyline_id
+        
+        for _, feature, feature_type, points in feature_distances:
+            if polyline_id - start_polyline_id >= self.max_map_polylines:
+                break
+            
+            type_idx = self.MAP_FEATURE_TYPES.get(feature_type, 0)
             
             # create vectors from consecutive points:
             vectors_this_polyline = []

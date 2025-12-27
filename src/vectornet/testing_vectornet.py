@@ -30,7 +30,8 @@ from config import (
     vectornet_num_heads, vectornet_dropout, project_name,
     vectornet_prediction_horizon, vectornet_history_length, test_visualize_max,
     vectornet_checkpoint_dir, vectornet_viz_dir_testing, vectornet_best_model,
-    test_max_scenarios, test_visualize_max, test_num_agents_to_predict, test_tfrecord_path)
+    test_max_scenarios, test_visualize_max, test_num_agents_to_predict, test_tfrecord_path,
+    vectornet_map_feature_radius)
 
 def load_model(checkpoint_path, device):
     """load trained VectorNet model from checkpoint and assign the state_dict weights to currently instantiated model"""
@@ -523,6 +524,7 @@ def run_testing(test_dataset_path=None, checkpoint_path=None, batch_size=32, max
         future_len=prediction_horizon,
         max_scenarios=load_max,
         num_agents_to_predict=num_agents,
+        map_feature_radius=vectornet_map_feature_radius,
     )
     
     # random sampling - select random subset of scenarios:

@@ -108,6 +108,7 @@ vectornet_mode = 'multi_step'     # 'multi_step' - full trajectory at once
 vectornet_prediction_horizon = 50
 vectornet_history_length = 10       # past timesteps to encode (1.0s)
 vectornet_num_agents_to_predict = 14    # Limit predictions per scenario (None = all)
+vectornet_map_feature_radius = 100.0     # Only include map features within this distance (meters) from SDC
 # ============== VectorNet Training Configuration ==============
 vectornet_epochs = 30
 vectornet_visualize_every_n_epochs = 5

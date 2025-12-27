@@ -41,7 +41,7 @@ from config import (
     device, vectornet_prefetch_factor,
     use_amp, use_bf16, use_torch_compile, torch_compile_mode,
     vectornet_dropout, vectornet_prediction_horizon, vectornet_history_length,
-    vectornet_num_agents_to_predict, vectornet_min_lr,
+    vectornet_num_agents_to_predict, vectornet_min_lr, vectornet_map_feature_radius,
     vectornet_loss_alpha, vectornet_loss_beta, vectornet_loss_gamma, vectornet_loss_delta,
     vectornet_checkpoint_dir, vectornet_viz_dir, vectornet_visualize_every_n_epochs, 
     vectornet_wandb_project, vectornet_wandb_name, vectornet_gradient_clip)
@@ -65,6 +65,10 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--num_workers', type=int, default=4)
+    
+    # Map feature filtering
+    parser.add_argument('--map_radius', type=float, default=None,
+                       help='Radius (meters) for map feature spatial filtering (default: from config)')
     
     # Node completion task arguments
     parser.add_argument('--node_mask_ratio', type=float, default=0.15,
@@ -636,6 +640,9 @@ def main():
     epochs = args.epochs
     num_workers = args.num_workers
     
+    # Map feature filtering
+    map_radius = args.map_radius if args.map_radius is not None else vectornet_map_feature_radius
+    
     # Node completion parameters
     use_node_completion = not args.no_node_completion
     node_mask_ratio = args.node_mask_ratio
@@ -647,6 +654,10 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Print map feature settings
+    print(f"\nMap Feature Filtering: {map_radius:.1f}m radius from SDC")
+    print(f"  Features are sorted by distance (closest first) and limited to {256} polylines")
     
     # Print node completion settings
     if use_node_completion:
@@ -692,6 +703,7 @@ def main():
         future_len=vectornet_prediction_horizon,
         max_scenarios=max_train_scenarios,
         num_agents_to_predict=vectornet_num_agents_to_predict,
+        map_feature_radius=map_radius,
     )
     val_dataset = VectorNetTFRecordDataset(
         tfrecord_dir=data_dir,
@@ -700,6 +712,7 @@ def main():
         future_len=vectornet_prediction_horizon,
         max_scenarios=max_val_scenarios,
         num_agents_to_predict=vectornet_num_agents_to_predict,
+        map_feature_radius=map_radius,
     )
     print(f"Training scenarios: {len(train_dataset)}")
     print(f"Validation scenarios: {len(val_dataset)}")
