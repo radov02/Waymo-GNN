@@ -643,6 +643,7 @@ def run_testing(test_dataset_path=test_hdf5_path,
     
     # Save results
     results_path = os.path.join(gcn_checkpoint_dir_autoreg, 'gcn_test_results.pt')
+    os.makedirs(gcn_checkpoint_dir, exist_ok=True)
     os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
     torch.save(results, results_path)
     print(f"Results saved to {results_path}")

@@ -1479,11 +1479,15 @@ def run_autoregressive_finetuning(
     if model_type == "gat":
         checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
+        # Ensure parent directories exist first
+        os.makedirs(gat_checkpoint_dir, exist_ok=True)
         os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
     elif model_type == "gcn":
         checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
+        # Ensure parent directories exist first
+        os.makedirs(gcn_checkpoint_dir, exist_ok=True)
         os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gcn_viz_dir_autoreg, exist_ok=True)
 
