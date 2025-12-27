@@ -196,11 +196,7 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-    # Guarantee final epoch reaches max sampling
-    # CRITICAL: Cap at 0.5 (50%) to prevent model collapse from excessive autoregressive exposure
-    # Higher values cause compounding errors that destabilize training
-    if epoch >= total_epochs - 1:
-        return 0.5
+
     
     # During warmup, use small amount of model predictions to start learning
     if epoch < warmup_epochs:
@@ -214,8 +210,7 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
     progress = adjusted_epoch / max(1, remaining_epochs - 1)
     progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
     
-    # Scale from 0.1 (end of warmup) to 0.5 (final epoch)
-    # CRITICAL: Max capped at 0.5 to maintain training stability
+    # Scale from min_sampling (end of warmup) to max_sampling (final epoch)
     min_sampling = 0.1
     max_sampling = 0.8
     
@@ -1663,7 +1658,7 @@ def run_autoregressive_finetuning(
             print(f"  - Model learns single-step prediction with perfect input.")
             print(f"  - Visualization (autoregressive) tests multi-step performance.")
         elif sampling_prob > 0.49:
-            print(f"  [MAX SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input (capped at 50%).")
+            print(f"  [MAX SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input.")
         else:
             print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted, {(1-sampling_prob)*100:.0f}% GT input.")
         print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) - target: {num_rollout_steps} steps")
