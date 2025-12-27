@@ -395,7 +395,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         last_pos = agent_trajectories[agent_id]['gt'][-1][1]
                         global_idx = target_scenario_indices[local_idx]
                         if target_graph.y is not None and global_idx < target_graph.y.shape[0]:
-                            disp = target_graph.y[global_idx].cpu().numpy() * POSITION_SCALE
+                            disp = target_graph.y[global_idx].cpu().numpy()  # already in meters
                             pos = last_pos + disp
                         else:
                             pos = last_pos
@@ -459,9 +459,9 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         batch=graph_for_prediction.batch, batch_size=B, batch_num=0, timestep=start_t + step,
                         agent_ids=agent_ids_for_model)
             
-            # Model predicts normalized displacement [N, 2]: (dx_norm, dy_norm)
-            # Convert to meters for visualization
-            pred_disp = (pred * POSITION_SCALE).cpu().numpy()  # [N, 2] in meters
+            # Model predicts displacement in meters [N, 2]: (dx, dy)
+            # Same scale as GT y - no conversion needed
+            pred_disp = pred.cpu().numpy()  # [N, 2] in meters
             dt = 0.1  # timestep in seconds (for velocity calculations)
             
             # DEBUG: Print prediction stats on first few steps
@@ -492,7 +492,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                         # GT is in batched_graph_sequence[start_t].y (normalized displacement to next step)
                         source_graph = batched_graph_sequence[start_t + step]
                         if source_graph.y is not None and first_agent_idx < source_graph.y.shape[0]:
-                            gt_disp = source_graph.y[first_agent_idx].cpu().numpy() * POSITION_SCALE
+                            gt_disp = source_graph.y[first_agent_idx].cpu().numpy()  # already in meters
                             gt_vx = gt_disp[0] / dt
                             gt_vy = gt_disp[1] / dt
                             gt_speed = np.sqrt(gt_disp[0]**2 + gt_disp[1]**2) / dt
@@ -529,8 +529,8 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                 # Update position using agent alignment (same fix as training)
                 if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
                     current_gt_graph = batched_graph_sequence[start_t + step]
-                    # Model predicts normalized displacement directly
-                    pred_displacement = pred * POSITION_SCALE  # [N, 2] in meters, on device
+                    # Model predicts displacement in meters (same scale as GT y)
+                    pred_displacement = pred  # [N, 2] in meters, on device
                     
                     # CRITICAL: Only update positions for agents that exist in BOTH graphs
                     if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
@@ -1048,10 +1048,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                             # Fallback: use target_graph.y directly (assumes alignment)
                             target = source_gt_graph.y[target_indices].to(pred.dtype)
                     else:
-                        # No GT displacement available - compute from positions
+                        # No GT displacement available - compute from positions (both in meters)
                         gt_current_pos = source_gt_graph.pos[target_indices].to(pred.dtype)
                         gt_next_pos = target_graph.pos[target_indices].to(pred.dtype)
-                        target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
+                        target = gt_next_pos - gt_current_pos  # displacement in meters
                 else:
                     pred_aligned = pred
                     # Same: always use GT displacement
@@ -1059,10 +1059,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     if source_gt_graph.y is not None:
                         target = source_gt_graph.y.to(pred.dtype)
                     else:
-                        # Compute from GT positions
+                        # Compute from GT positions (both in meters)
                         gt_current_pos = source_gt_graph.pos.to(pred.dtype)
                         gt_next_pos = target_graph.pos.to(pred.dtype)
-                        target = (gt_next_pos - gt_current_pos) / POSITION_SCALE
+                        target = gt_next_pos - gt_current_pos  # displacement in meters
             
             # Check for NaN in predictions or targets before computing loss
             if torch.isnan(pred_aligned).any() or torch.isnan(target).any():
@@ -1103,8 +1103,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 count += 1
                 
                 # Track per-agent displacement errors for ADE/FDE computation
-                # Convert displacement error to meters
-                step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE  # [num_agents]
+                # pred_aligned and target are both in meters (same scale as GT y)
+                step_errors_meters = torch.norm(pred_aligned - target, dim=1)  # [num_agents] already in meters
                 
                 # Initialize error tensor on first step with correct aligned agent count
                 if current_rollout_errors is None:
@@ -1326,27 +1326,21 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     # When using predicted positions, target is displacement from current predicted pos to GT next pos
                     gt_next_pos = target_graph.pos.to(pred.dtype)
                     current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
-                    target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                    # Both positions are in meters, displacement is in meters
+                    target = gt_next_pos - current_pred_pos
                 else:
-                    # First step uses GT position
+                    # First step uses GT displacement (already in meters)
                     target = target_graph.y.to(pred.dtype)
                 
-                # Model outputs 2D velocity - convert to displacement for loss
-                dt = 0.1
-                pred_vx_norm = pred[:, 0]
-                pred_vy_norm = pred[:, 1]
-                pred_vx = pred_vx_norm * MAX_SPEED
-                pred_vy = pred_vy_norm * MAX_SPEED
-                pred_dx_norm = (pred_vx * dt) / POSITION_SCALE
-                pred_dy_norm = (pred_vy * dt) / POSITION_SCALE
-                pred_disp_for_loss = torch.stack([pred_dx_norm, pred_dy_norm], dim=1)
+                # Model outputs displacement directly (dx, dy) in meters - no conversion needed
+                pred_disp_for_loss = pred
                 
-                # Simplified loss - just displacement
+                # Simplified loss - just displacement MSE
                 mse = F.mse_loss(pred_disp_for_loss, target)
                 
                 # Track per-agent displacement error at each step for ADE/FDE
-                # Error in meters: ||pred_disp - target_disp|| * POSITION_SCALE
-                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents]
+                # Error in meters: ||pred_disp - target_disp|| (both already in meters)
+                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1)  # [num_agents] already in meters
                 
                 # Initialize error tensor on first step with actual agent count
                 if current_rollout_errors is None:
@@ -1850,7 +1844,7 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     """
     Update graph for next autoregressive step using PREDICTED DISPLACEMENT.
     
-    Model predicts 2D normalized displacement [N, 2] → we derive all features:
+    Model predicts 2D displacement [N, 2] in meters → we derive all features:
         [0-1]   vx, vy - calculated from displacement/dt
         [2]     speed - calculated as sqrt(vx² + vy²)
         [3]     heading - calculated as atan2(vy, vx)
@@ -1891,8 +1885,9 @@ def update_graph_with_prediction(graph, pred_displacement, device):
         pred_displacement[nan_mask] = 0.0
     
     # ============ UPDATE POSITIONS FROM PREDICTED DISPLACEMENT ============
-    # Denormalize displacement (pred_displacement is normalized by POSITION_SCALE=100)
-    displacement_meters = pred_displacement * POSITION_SCALE  # [N, 2] in meters
+    # Model predicts displacement in METERS (same scale as GT y)
+    # No need to multiply by POSITION_SCALE - predictions are already in meters
+    displacement_meters = pred_displacement  # [N, 2] in meters
     
     # Update positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:

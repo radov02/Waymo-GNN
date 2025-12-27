@@ -267,10 +267,10 @@ class SpatioTemporalGATBatched(nn.Module):
         # 6. Skip connection: concatenate temporal features with original node features
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         
-        # 7. Decode predictions - predicts 2D velocity (vx_norm, vy_norm)
+        # 7. Decode predictions - predicts 2D displacement (dx, dy) in meters
         predictions = self.decoder(decoder_input)
         
-        # Clamp velocity predictions to reasonable range [-2, 2] (normalized)
+        # Clamp displacement predictions to reasonable range [-2, 2] meters per timestep
         predictions = torch.clamp(predictions, min=-2.0, max=2.0)
         
         if debug_mode:

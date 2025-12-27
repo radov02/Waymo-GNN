@@ -536,20 +536,18 @@ def visualize_training_progress(model, batch_dict, epoch, save_dir, scenario_id=
                 # This shouldn't happen with properly saved HDF5 files
                 raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
-            # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
-            pred_displacement_norm = model(graph.x, graph.edge_index, 
+            # Get predicted displacement - model outputs displacement in meters directly
+            pred_displacement = model(graph.x, graph.edge_index, 
                                           edge_weight=None,  # edge_weight=graph.edge_attr, 
                                           batch=graph.batch, batch_size=B).cpu()
             
-            # Denormalize displacement and add to current position to get predicted next position
-            pred_displacement = pred_displacement_norm * POSITION_SCALE
+            # Add displacement (already in meters) to current position to get predicted next position
             pred_next_pos = curr_pos + pred_displacement
             
             # Get actual next position from ground truth labels
-            # graph.y contains the normalized displacement to next position
+            # graph.y contains the displacement to next position in meters
             if graph.y is not None:
-                actual_displacement_norm = graph.y.cpu()
-                actual_displacement = actual_displacement_norm * POSITION_SCALE
+                actual_displacement = graph.y.cpu()  # already in meters
                 actual_next_pos = curr_pos + actual_displacement
             else:
                 # If no ground truth, use current position as fallback

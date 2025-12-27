@@ -411,7 +411,7 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         for step_pred in predictions:
             pred_np = step_pred.cpu().numpy()
             if idx < len(pred_np):
-                displacement = pred_np[idx] * POSITION_SCALE
+                displacement = pred_np[idx]  # already in meters
                 current_pos = current_pos + displacement
                 pred_positions[agent_id].append(current_pos.copy())
     
@@ -512,15 +512,25 @@ def run_testing(test_dataset_path=test_hdf5_path,
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
-        # Try autoregressive checkpoint first (new location), then root dir (old location), then base checkpoint
-        autoreg_path = os.path.join(gcn_checkpoint_dir_autoreg, 'finetuned_scheduled_sampling_best.pt')
+        # Try autoregressive checkpoint first with new naming pattern, then legacy names
+        # New pattern: best_gcn_autoreg_{steps}step_B{batch}_{strategy}_E{epochs}.pt
+        import glob
+        autoreg_pattern = os.path.join(gcn_checkpoint_dir_autoreg, 'best_gcn_autoreg_*.pt')
+        autoreg_matches = glob.glob(autoreg_pattern)
+        
+        # Legacy paths
+        legacy_path = os.path.join(gcn_checkpoint_dir_autoreg, 'finetuned_scheduled_sampling_best.pt')
         root_autoreg_path = os.path.join('checkpoints', 'finetuned_scheduled_sampling_best.pt')
         base_path = os.path.join(gcn_checkpoint_dir, 'best_model.pt')
         root_base_path = os.path.join('checkpoints', 'best_model.pt')
         
-        if os.path.exists(autoreg_path):
-            checkpoint_path = autoreg_path
-            print(f"Using autoregressive fine-tuned checkpoint: {autoreg_path}")
+        if autoreg_matches:
+            # Use most recent autoregressive checkpoint
+            checkpoint_path = max(autoreg_matches, key=os.path.getmtime)
+            print(f"Using autoregressive fine-tuned checkpoint: {checkpoint_path}")
+        elif os.path.exists(legacy_path):
+            checkpoint_path = legacy_path
+            print(f"Using legacy autoregressive checkpoint: {legacy_path}")
         elif os.path.exists(root_autoreg_path):
             checkpoint_path = root_autoreg_path
             print(f"Using autoregressive fine-tuned checkpoint: {root_autoreg_path}")
@@ -532,10 +542,9 @@ def run_testing(test_dataset_path=test_hdf5_path,
             print(f"Using base single-step checkpoint: {root_base_path}")
         else:
             print(f"ERROR: No checkpoint found!")
-            print(f"  Checked: {autoreg_path}")
-            print(f"  Checked: {root_autoreg_path}")
+            print(f"  Checked pattern: {autoreg_pattern}")
+            print(f"  Checked: {legacy_path}")
             print(f"  Checked: {base_path}")
-            print(f"  Checked: {root_base_path}")
             if use_wandb:
                 wandb.finish(exit_code=1)
             return None

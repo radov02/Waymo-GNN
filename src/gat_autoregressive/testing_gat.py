@@ -357,7 +357,7 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         for step_pred in predictions:
             pred_np = step_pred.cpu().numpy()
             if idx < len(pred_np):
-                displacement = pred_np[idx] * POSITION_SCALE
+                displacement = pred_np[idx]  # already in meters
                 current_pos = current_pos + displacement
                 pred_positions[agent_id].append(current_pos.copy())
     
@@ -463,16 +463,26 @@ def run_testing(test_dataset_path=test_hdf5_path,
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
-        # Try multiple checkpoint locations and naming patterns
-        autoreg_path = os.path.join(gat_checkpoint_dir_autoreg, 'best_autoregressive_20step.pt')
+        # Try autoregressive checkpoint first with new naming pattern, then legacy names
+        # New pattern: best_gat_autoreg_{steps}step_B{batch}_{strategy}_E{epochs}.pt
+        import glob
+        autoreg_pattern = os.path.join(gat_checkpoint_dir_autoreg, 'best_gat_autoreg_*.pt')
+        autoreg_matches = glob.glob(autoreg_pattern)
+        
+        # Legacy paths
+        legacy_path = os.path.join(gat_checkpoint_dir_autoreg, 'best_autoregressive_20step.pt')
         root_autoreg_path = os.path.join('checkpoints', 'best_autoregressive_20step.pt')
         root_autoreg_50step = os.path.join('checkpoints', 'best_autoregressive_50step.pt')
         base_path = os.path.join(gat_checkpoint_dir, 'best_model.pt')
         root_base_path = os.path.join('checkpoints', 'gat', 'best_model.pt')
         
-        if os.path.exists(autoreg_path):
-            checkpoint_path = autoreg_path
-            print(f"Using GAT autoregressive checkpoint: {autoreg_path}")
+        if autoreg_matches:
+            # Use most recent autoregressive checkpoint
+            checkpoint_path = max(autoreg_matches, key=os.path.getmtime)
+            print(f"Using GAT autoregressive checkpoint: {checkpoint_path}")
+        elif os.path.exists(legacy_path):
+            checkpoint_path = legacy_path
+            print(f"Using legacy GAT autoregressive checkpoint: {legacy_path}")
         elif os.path.exists(root_autoreg_50step):
             checkpoint_path = root_autoreg_50step
             print(f"Using GAT autoregressive checkpoint: {root_autoreg_50step}")
@@ -487,11 +497,9 @@ def run_testing(test_dataset_path=test_hdf5_path,
             print(f"Using GAT base single-step checkpoint: {root_base_path}")
         else:
             print(f"ERROR: No GAT checkpoint found!")
-            print(f"  Checked: {autoreg_path}")
-            print(f"  Checked: {root_autoreg_50step}")
-            print(f"  Checked: {root_autoreg_path}")
+            print(f"  Checked pattern: {autoreg_pattern}")
+            print(f"  Checked: {legacy_path}")
             print(f"  Checked: {base_path}")
-            print(f"  Checked: {root_base_path}")
             if use_wandb:
                 wandb.finish(exit_code=1)
             return None

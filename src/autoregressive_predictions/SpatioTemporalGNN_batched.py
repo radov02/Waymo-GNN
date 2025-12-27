@@ -262,11 +262,11 @@ class SpatioTemporalGNNBatched(nn.Module):
         # Output: [total_nodes, 1, hidden_dim] -> [total_nodes, hidden_dim]
         temporal_features = gru_output.squeeze(1)
         
-        # 3. Skip connection + decode: predict 2D velocity (vx_norm, vy_norm)
+        # 3. Skip connection + decode: predict 2D displacement (dx, dy) in meters
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
         
-        # Clamp velocity predictions to reasonable range [-2, 2] (normalized)
+        # Clamp displacement predictions to reasonable range [-2, 2] meters per timestep
         predictions = torch.clamp(predictions, min=-2.0, max=2.0)
         
         if debug_mode:
