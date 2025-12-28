@@ -80,7 +80,7 @@ autoreg_num_epochs = 10
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 2
 autoreg_skip_map_features = False
-autoreg_learning_rate = 0.005
+autoreg_learning_rate = 0.001        # Lower LR for finetuning stability (was 0.005)
 
 
 # ============== VectorNet model ==============

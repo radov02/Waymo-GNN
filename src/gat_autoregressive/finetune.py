@@ -1086,8 +1086,19 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             target_magnitude = torch.norm(target, dim=1)
             magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
             
-            # Combined displacement loss
-            disp_loss = 0.4 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss
+            # Add velocity consistency regularization: penalize large changes from current velocity
+            # This encourages smooth trajectories and reduces exploding predictions
+            if hasattr(graph_for_prediction, 'x') and graph_for_prediction.x.shape[0] == pred_aligned.shape[0]:
+                current_vx = graph_for_prediction.x[:, 0] * MAX_SPEED  # Denormalize
+                current_vy = graph_for_prediction.x[:, 1] * MAX_SPEED
+                current_displacement = torch.stack([current_vx * 0.1, current_vy * 0.1], dim=1) / POSITION_SCALE  # Normalize
+                velocity_reg = F.mse_loss(pred_aligned, current_displacement.to(pred_aligned.dtype))
+            else:
+                velocity_reg = torch.tensor(0.0, device=pred.device)
+            
+            # Combined displacement loss with velocity regularization
+            # Weight velocity_reg low (0.05) - just for smoothness, not to dominate
+            disp_loss = 0.35 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss + 0.05 * velocity_reg
             
             # Final NaN check
             if torch.isnan(disp_loss):
@@ -1519,19 +1530,34 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     # Initialize dict to store per-agent errors: {agent_key: [errors_over_time]}
                     current_rollout_errors = {}
                 
-                # Store errors for this step - handle each agent individually
-                if hasattr(target_graph, 'agent_ids') and hasattr(target_graph, 'batch'):
-                    target_agent_ids_list = getattr(target_graph, 'agent_ids', None)
-                    target_batch_list = target_graph.batch
-                    target_batch_np = target_batch_list.cpu().numpy()
+                # Store errors for this step - use agent keys from accumulated_displacements
+                # since that's what we used to compute the errors
+                if step_errors_list and accumulated_displacements:
+                    # Get the agent keys that we computed errors for (in order)
+                    computed_agent_keys = []
+                    if (start_agent_ids is not None and target_agent_ids is not None and 
+                        start_batch_np is not None and target_batch_np is not None):
+                        for target_idx in range(len(target_agent_ids)):
+                            if target_idx < len(target_batch_np) and target_idx < target_graph.pos.shape[0]:
+                                bid = int(target_batch_np[target_idx])
+                                aid = target_agent_ids[target_idx]
+                                agent_key = (bid, aid)
+                                if agent_key in accumulated_displacements:
+                                    # Check if we found start position
+                                    has_start = False
+                                    for si in range(len(start_agent_ids)):
+                                        if si < len(start_batch_np):
+                                            if int(start_batch_np[si]) == bid and start_agent_ids[si] == aid:
+                                                if si < start_graph.pos.shape[0]:
+                                                    has_start = True
+                                                break
+                                    if has_start:
+                                        computed_agent_keys.append(agent_key)
                     
-                    # Match each error to its agent
-                    for i, error_val in enumerate(step_errors_list if step_errors_list else []):
-                        if i < len(target_agent_ids_list) and i < len(target_batch_np):
-                            bid = int(target_batch_np[i])
-                            aid = target_agent_ids_list[i]
-                            agent_key = (bid, aid)
-                            
+                    # Now store errors with correct agent keys
+                    for i, error_val in enumerate(step_errors_list):
+                        if i < len(computed_agent_keys):
+                            agent_key = computed_agent_keys[i]
                             if agent_key not in current_rollout_errors:
                                 current_rollout_errors[agent_key] = []
                             current_rollout_errors[agent_key].append(error_val)
@@ -2099,8 +2125,18 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     
     # ============ DERIVE ALL NODE FEATURES FROM DISPLACEMENT ============
     # Calculate velocity from displacement: v = dx / dt
+    # Note: displacement_meters already converted from normalized via * POSITION_SCALE
     pred_vx = displacement_meters[:, 0] / dt  # m/s
     pred_vy = displacement_meters[:, 1] / dt  # m/s
+    
+    # Velocity smoothing: blend predicted velocity with previous to prevent jumps
+    # This reduces compounding errors and is physically realistic (vehicles can't teleport)
+    velocity_smoothing = 0.7  # 70% previous, 30% predicted - conservative smoothing
+    if hasattr(updated_graph, 'x') and updated_graph.x is not None:
+        prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
+        prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
+        pred_vx = (1 - velocity_smoothing) * pred_vx + velocity_smoothing * prev_vx
+        pred_vy = (1 - velocity_smoothing) * pred_vy + velocity_smoothing * prev_vy
     
     # Start with zeros, then fill in calculated values
     new_features = torch.zeros(num_nodes, 15, device=device, dtype=torch.float32)
@@ -2113,21 +2149,35 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_speed = torch.sqrt(pred_vx[:num_nodes]**2 + pred_vy[:num_nodes]**2)
     new_features[:, 2] = pred_speed / MAX_SPEED
     
-    # [3] Heading direction (normalized) - calculate from velocity
+    # [3] Heading direction (normalized) - blend with previous heading for stability
     pred_heading = torch.atan2(pred_vy[:num_nodes], pred_vx[:num_nodes]) / np.pi  # [-1, 1]
+    if hasattr(updated_graph, 'x') and updated_graph.x is not None:
+        prev_heading = updated_graph.x[:num_nodes, 3]
+        # Smooth heading - 20% previous to prevent jumpy orientation
+        heading_smoothing = 0.2
+        # Handle wraparound at +/- pi
+        heading_diff = pred_heading - prev_heading
+        heading_diff = torch.where(heading_diff > 1, heading_diff - 2, heading_diff)
+        heading_diff = torch.where(heading_diff < -1, heading_diff + 2, heading_diff)
+        pred_heading = prev_heading + (1 - heading_smoothing) * heading_diff
+        pred_heading = torch.clamp(pred_heading, -1, 1)
     new_features[:, 3] = pred_heading
     
     # [4] Valid - keep from previous graph (doesn't change)
     new_features[:, 4] = updated_graph.x[:num_nodes, 4]
     
-    # [5-6] Acceleration (normalized) - calculate as velocity change
-    if hasattr(updated_graph, 'x'):
-        prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
-        prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
-        ax = pred_vx[:num_nodes] - prev_vx
-        ay = pred_vy[:num_nodes] - prev_vy
+    # [5-6] Acceleration (normalized) - use smoothed velocities to compute
+    # Note: We already computed prev_vx/prev_vy above for smoothing, reuse that calculation
+    if hasattr(updated_graph, 'x') and updated_graph.x is not None:
+        orig_prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
+        orig_prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
+        ax = (pred_vx[:num_nodes] - orig_prev_vx) / dt  # m/s²
+        ay = (pred_vy[:num_nodes] - orig_prev_vy) / dt
         new_features[:, 5] = ax / MAX_ACCEL
         new_features[:, 6] = ay / MAX_ACCEL
+    else:
+        new_features[:, 5] = 0.0
+        new_features[:, 6] = 0.0
     
     # [7-10] Distances - recalculate from updated positions
     if hasattr(updated_graph, 'pos') and updated_graph.pos is not None:
