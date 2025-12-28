@@ -193,30 +193,37 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
         epoch: Current epoch (0-indexed, so first epoch is epoch=0)
         total_epochs: Total number of training epochs
         strategy: 'linear', 'exponential', or 'inverse_sigmoid'
-        warmup_epochs: [DEPRECATED - now unused for simplicity]
+        warmup_epochs: Number of epochs with low sampling probability (for gradual transition)
     
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
     
-    # Simple linear schedule: epoch 0 → 1/total_epochs, epoch (total_epochs-1) → 1.0
-    # This ensures model sees its own predictions from the start, gradually increasing
-    sampling_prob = (epoch + 1) / total_epochs
+    # Warmup: First 5 epochs use very low sampling probability (max 10%)
+    warmup_epochs = 5
+    if epoch < warmup_epochs:
+        # During warmup: 2% at epoch 0, 4% at epoch 1, ... up to 10% at epoch 4
+        return 0.02 * (epoch + 1)
     
-    # Apply strategy modulation (optional - linear is recommended)
+    # After warmup, apply strategy-based scheduling
+    remaining_epochs = total_epochs - warmup_epochs
+    adjusted_epoch = epoch - warmup_epochs
+    progress = adjusted_epoch / max(1, remaining_epochs - 1)
+    
     if strategy == 'linear':
-        return sampling_prob
+        # Linear from 0.10 to 1.0 after warmup
+        return 0.10 + 0.90 * progress
     elif strategy == 'exponential':
-        # Exponential: slower at start, faster at end
-        progress = epoch / max(1, total_epochs - 1)
-        return 1.0 - np.exp(-3 * progress)  # Reaches ~0.95 at end
+        # Exponential: MUCH slower at start, faster at end
+        # Reaches ~0.50 at halfway, ~0.90 at end
+        # Using a gentler curve: 1 - exp(-2 * progress) instead of -3
+        return 0.10 + 0.90 * (1.0 - np.exp(-2.5 * progress))
     elif strategy == 'inverse_sigmoid':
         # S-curve: very slow at start/end, fast in middle
-        progress = epoch / max(1, total_epochs - 1)
-        k = 8
-        return 1 / (1 + np.exp(-k * (progress - 0.5)))
+        k = 6  # Reduced from 8 for smoother transition
+        return 0.10 + 0.90 / (1 + np.exp(-k * (progress - 0.5)))
     else:
-        return sampling_prob
+        return 0.10 + 0.90 * progress
 
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     """Curriculum learning: gradually increase rollout length.
@@ -736,7 +743,7 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     ax1.set_xlabel('X position (meters)', fontsize=11)
     ax1.set_ylabel('Y position (meters)', fontsize=11)
-    ax1.set_title(f'GAT Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)\n'
+    ax1.set_title(f'{"GAT" if model_type == "gat" else "GCN"} Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)\n'
                   f'Epoch {epoch+1}', fontsize=12, fontweight='bold')
     
     all_legend_elements = agent_legend_elements + line_legend_elements
@@ -852,6 +859,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         # We accumulate displacements and add them to GT start positions to get predicted positions
         # This avoids index alignment issues when agents enter/leave
         accumulated_displacements = {}  # {(batch_idx, agent_id): displacement_tensor}
+        
+        # NEW: Track accumulated PREDICTED displacements WITH gradients for trajectory loss
+        # This allows backprop to flow through all predictions to penalize trajectory drift
+        accumulated_pred_displacements_grad = {}  # {(batch_idx, agent_id): displacement_tensor WITH gradients}
         
         # Initialize per-agent error tracking for ADE/FDE computation
         # Track position error (in meters) per agent per timestep
@@ -1086,19 +1097,99 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             target_magnitude = torch.norm(target, dim=1)
             magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
             
-            # Add velocity consistency regularization: penalize large changes from current velocity
-            # This encourages smooth trajectories and reduces exploding predictions
+            # HEADING-AWARE LOSS: Penalize predictions that don't align with agent's heading
+            # The heading feature (index 3) tells us where the agent is facing
+            # Predictions should generally align with heading for forward-moving vehicles
+            heading_loss = torch.tensor(0.0, device=pred.device)
             if hasattr(graph_for_prediction, 'x') and graph_for_prediction.x.shape[0] == pred_aligned.shape[0]:
-                current_vx = graph_for_prediction.x[:, 0] * MAX_SPEED  # Denormalize
-                current_vy = graph_for_prediction.x[:, 1] * MAX_SPEED
-                current_displacement = torch.stack([current_vx * 0.1, current_vy * 0.1], dim=1) / POSITION_SCALE  # Normalize
-                velocity_reg = F.mse_loss(pred_aligned, current_displacement.to(pred_aligned.dtype))
-            else:
-                velocity_reg = torch.tensor(0.0, device=pred.device)
+                # Get heading from features (index 3, in radians, normalized by pi)
+                heading_normalized = graph_for_prediction.x[:, 3]  # Already normalized by pi
+                if pred_indices is not None:
+                    heading_normalized = heading_normalized[pred_indices]
+                heading_rad = heading_normalized * np.pi  # Denormalize to radians
+                
+                # Expected direction from heading
+                heading_dir = torch.stack([torch.cos(heading_rad), torch.sin(heading_rad)], dim=1)
+                
+                # Compute alignment between prediction and heading direction
+                # Only apply to agents with significant predicted displacement (moving agents)
+                pred_mag = torch.norm(pred_aligned, dim=1, keepdim=True)
+                moving_mask = (pred_mag.squeeze() > 0.001)  # > 0.1m displacement
+                
+                if moving_mask.any():
+                    pred_dir = F.normalize(pred_aligned[moving_mask], p=2, dim=1, eps=1e-6)
+                    heading_dir_moving = heading_dir[moving_mask].to(pred_dir.dtype)
+                    heading_alignment = F.cosine_similarity(pred_dir, heading_dir_moving, dim=1)
+                    # Soft penalty: allow some deviation (turning), but penalize large deviations
+                    # Use (1 - alignment)^2 to penalize more for wrong directions
+                    heading_loss = ((1 - heading_alignment) ** 2).mean()
             
-            # Combined displacement loss with velocity regularization
-            # Weight velocity_reg low (0.05) - just for smoothness, not to dominate
-            disp_loss = 0.35 * huber_loss + 0.2 * mse_loss + 0.3 * cosine_loss + 0.1 * magnitude_loss + 0.05 * velocity_reg
+            # ANGLE LOSS: Explicit angle difference penalty (more sensitive to direction errors)
+            pred_angle = torch.atan2(pred_aligned[:, 1], pred_aligned[:, 0])
+            target_angle = torch.atan2(target[:, 1], target[:, 0])
+            angle_diff = pred_angle - target_angle
+            # Wrap to [-pi, pi]
+            angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+            angle_loss = (angle_diff ** 2).mean()
+            
+            # TRAJECTORY LOSS: Penalize accumulated position error (with gradients!)
+            # This teaches the model that small angle errors compound into large trajectory errors
+            trajectory_loss = torch.tensor(0.0, device=pred.device)
+            if step > 0 and agent_ids_valid and hasattr(target_graph, 'pos') and target_graph.pos is not None:
+                # Accumulate predicted displacements WITH gradients
+                pred_disp_grad = pred_aligned * POSITION_SCALE  # [num_aligned, 2] in meters
+                
+                # Update accumulated displacements for each aligned agent
+                if pred_indices is not None:
+                    pred_batch_np = pred_batch.cpu().numpy()
+                    for i, idx in enumerate(pred_indices.cpu().numpy()):
+                        if idx < len(pred_agent_ids) and i < pred_disp_grad.shape[0]:
+                            bid = int(pred_batch_np[idx])
+                            aid = pred_agent_ids[idx]
+                            agent_key = (bid, aid)
+                            
+                            disp_with_grad = pred_disp_grad[i]
+                            if agent_key in accumulated_pred_displacements_grad:
+                                accumulated_pred_displacements_grad[agent_key] = accumulated_pred_displacements_grad[agent_key] + disp_with_grad
+                            else:
+                                accumulated_pred_displacements_grad[agent_key] = disp_with_grad
+                
+                # Compute trajectory position error for agents we have accumulated displacements
+                source_gt_graph = batched_graph_sequence[t]  # Start graph
+                source_batch_np = source_gt_graph.batch.cpu().numpy() if hasattr(source_gt_graph, 'batch') else None
+                source_agent_ids = getattr(source_gt_graph, 'agent_ids', None)
+                
+                if source_agent_ids is not None and source_batch_np is not None:
+                    traj_errors = []
+                    for i, target_idx in enumerate(target_indices.cpu().numpy()):
+                        if target_idx < len(target_agent_ids):
+                            bid = int(target_batch.cpu().numpy()[target_idx])
+                            aid = target_agent_ids[target_idx]
+                            agent_key = (bid, aid)
+                            
+                            if agent_key in accumulated_pred_displacements_grad:
+                                # Find start position
+                                for si in range(len(source_agent_ids)):
+                                    if si < len(source_batch_np):
+                                        if int(source_batch_np[si]) == bid and source_agent_ids[si] == aid:
+                                            if si < source_gt_graph.pos.shape[0]:
+                                                gt_start = source_gt_graph.pos[si].to(pred.device)
+                                                gt_target = target_graph.pos[target_idx].to(pred.device)
+                                                pred_pos = gt_start + accumulated_pred_displacements_grad[agent_key]
+                                                pos_error = torch.norm(pred_pos - gt_target)
+                                                traj_errors.append(pos_error)
+                                            break
+                    
+                    if traj_errors:
+                        # Mean trajectory error, scaled down to be comparable to displacement loss
+                        trajectory_loss = torch.stack(traj_errors).mean() / POSITION_SCALE
+            
+            # Combined displacement loss - PRIORITIZE DIRECTION over magnitude
+            # Removed velocity_reg as it prevents learning of turns/accelerations
+            # Weights: direction (cosine 0.20 + angle 0.15 + heading 0.10) = 0.45 total for direction
+            #          magnitude (huber 0.20 + mse 0.10 + mag 0.05) = 0.35 total for magnitude
+            #          trajectory (0.20) = 0.20 for accumulated position error
+            disp_loss = 0.20 * huber_loss + 0.10 * mse_loss + 0.20 * cosine_loss + 0.05 * magnitude_loss + 0.15 * angle_loss + 0.10 * heading_loss + 0.20 * trajectory_loss
             
             # Final NaN check
             if torch.isnan(disp_loss):
