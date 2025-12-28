@@ -44,9 +44,9 @@ gat_viz_dir = 'visualizations/gat'
 gat_viz_dir_autoreg = 'visualizations/gat/autoreg'
 gat_viz_dir_testing = 'visualizations/gat/autoreg/testing'
 # ============== Training Configuration: ==============
-epochs = 20
+epochs = 10
 batch_size = 48     # number of graph sequences per batch
-learning_rate = 0.001
+learning_rate = 0.005
 gradient_clip_value = 1.0  # gradient clipping threshold to prevent exploding gradients
 # Learning rate scheduler settings:
 scheduler_patience = 5  # wait scheduler_patience epochs before reducing LR

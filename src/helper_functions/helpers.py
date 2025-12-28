@@ -47,37 +47,9 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.2, beta=0.5, 
         gamma: Velocity consistency weight (default 0.1)
         delta: Cosine similarity weight (default 0.2)
     """
-    # ANGLE LOSS (JIT-compiled):
     angle_loss = _compute_angle_loss(pred, target)
-    
-    # MSE for magnitude - scaled by 100 to be comparable to angle/cosine losses
-    # Since displacements are normalized by 100, typical values are ~0.01
-    # MSE of 0.01 differences = 0.0001, which is too small vs angle loss ~0.01-0.1
-    # Scaling by 100 makes MSE ~0.01 and comparable to other losses
-    mse_loss = F.mse_loss(pred, target) * 100.0
-    
-    # Cosine similarity (JIT-compiled):
+    mse_loss = F.mse_loss(pred, target) * 100.0  # MSE for magnitude - scaled by 100 to be comparable to angle/cosine losses, since displacements are normalized by 100, typical values are ~0.01
     cosine_loss = _compute_cosine_loss(pred, target)
-    
-    # heading direction alignment
-    heading = node_features[:, 3]   # already computed as node feature (atan2(vy, vx) / pi) -> [-1, 1]
-    speed = node_features[:, 2] * MAX_SPEED  # Denormalize speed (normalized by MAX_SPEED=30)
-    
-    moving_mask = speed > 0.5        # filter out stopped/very slow agents (speed < 0.5 m/s)
-    
-    if moving_mask.any():
-        # Calculate angle between prediction and heading direction
-        pred_angle_moving = torch.atan2(pred[moving_mask, 1], pred[moving_mask, 0])
-        heading_moving = heading[moving_mask]
-        
-        # Angular difference between prediction and heading
-        heading_angle_diff = pred_angle_moving - heading_moving
-        heading_angle_diff = torch.atan2(torch.sin(heading_angle_diff), torch.cos(heading_angle_diff))
-        
-        # Heavily penalize predictions that deviate from heading (squared error)
-        heading_direction_loss = (heading_angle_diff ** 2).mean()
-    else:
-        heading_direction_loss = torch.tensor(0.0, device=pred.device)
     
     # velocity magnitude consistency - displacement should roughly match velocity * dt
     # BUT: this is only valid for constant velocity motion, which doesn't hold for turning/accelerating vehicles
@@ -117,11 +89,9 @@ def advanced_directional_loss(pred, target, node_features, alpha=0.2, beta=0.5, 
         diversity_loss = torch.tensor(0.0, device=pred.device)
     
     total_loss = (alpha * angle_loss +                    # target angle (should have big importance)
-                  #gamma * heading_direction_loss +        # heading alignment (also should have big importance)
-                  gamma * velocity_magnitude_loss +       # velocity magnitude
                   beta * mse_loss +                       # MSE magnitude
+                  gamma * velocity_magnitude_loss +       # velocity magnitude
                   delta * cosine_loss #+                    # backup direction
-                  #0.05 * diversity_loss)                  # diversity
     )
     
     # NaN protection: if any component is NaN, return just MSE loss as fallback

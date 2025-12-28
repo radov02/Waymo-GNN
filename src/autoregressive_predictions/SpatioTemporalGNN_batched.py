@@ -262,12 +262,14 @@ class SpatioTemporalGNNBatched(nn.Module):
         # Output: [total_nodes, 1, hidden_dim] -> [total_nodes, hidden_dim]
         temporal_features = gru_output.squeeze(1)
         
-        # 3. Skip connection + decode: predict 2D displacement (dx, dy) in meters
+        # 3. Skip connection + decode: predict 2D NORMALIZED displacement (dx, dy) / POSITION_SCALE
+        # Model output matches GT y scale (actual_displacement_meters / 100)
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
         
-        # Clamp displacement predictions to reasonable range [-2, 2] meters per timestep
-        predictions = torch.clamp(predictions, min=-2.0, max=2.0)
+        # Clamp displacement predictions to reasonable range in NORMALIZED space
+        # [-0.05, 0.05] normalized = [-5, 5] meters per 0.1s timestep = [-50, 50] m/s
+        predictions = torch.clamp(predictions, min=-0.05, max=0.05)
         
         if debug_mode:
             print(f"------ Batched GNN Forward (B={batch_size}) at timestep {timestep}: ------")

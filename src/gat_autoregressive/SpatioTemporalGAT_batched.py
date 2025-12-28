@@ -267,11 +267,13 @@ class SpatioTemporalGATBatched(nn.Module):
         # 6. Skip connection: concatenate temporal features with original node features
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         
-        # 7. Decode predictions - predicts 2D displacement (dx, dy) in meters
+        # 7. Decode predictions - predicts 2D NORMALIZED displacement (dx, dy) / POSITION_SCALE
+        # Model output matches GT y scale (actual_displacement_meters / 100)
         predictions = self.decoder(decoder_input)
         
-        # Clamp displacement predictions to reasonable range [-2, 2] meters per timestep
-        predictions = torch.clamp(predictions, min=-2.0, max=2.0)
+        # Clamp displacement predictions to reasonable range in NORMALIZED space
+        # [-0.05, 0.05] normalized = [-5, 5] meters per 0.1s timestep = [-50, 50] m/s
+        predictions = torch.clamp(predictions, min=-0.05, max=0.05)
         
         if debug_mode:
             print(f"------ Batched GAT Forward (B={batch_size}) at timestep {timestep}: ------")
@@ -345,20 +347,9 @@ class SpatioTemporalGATBatched(nn.Module):
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
         
-        # Clamp to reasonable ranges to prevent explosive predictions
-        # Features [0-2]: velocity and speed (normalized, should be in [-2, 2] range)
-        predictions[:, 0:3] = torch.clamp(predictions[:, 0:3], min=-2.0, max=2.0)
-        # Feature [3]: heading direction (normalized to [-1, 1])
-        predictions[:, 3] = torch.clamp(predictions[:, 3], min=-1.0, max=1.0)
-        # Feature [4]: validity (0 or 1)
-        predictions[:, 4] = torch.sigmoid(predictions[:, 4])  # Use sigmoid for binary validity
-        # Features [5-6]: acceleration (normalized, should be in [-2, 2] range)
-        predictions[:, 5:7] = torch.clamp(predictions[:, 5:7], min=-2.0, max=2.0)
-        # Features [7-10]: relative positions and distances (normalized to [-1, 1] or [0, 1])
-        predictions[:, 7:10] = torch.clamp(predictions[:, 7:10], min=-2.0, max=2.0)
-        predictions[:, 10] = torch.clamp(predictions[:, 10], min=0.0, max=2.0)
-        # Features [11-14]: object type (softmax for categorical)
-        predictions[:, 11:15] = torch.softmax(predictions[:, 11:15], dim=-1)
+        # Clamp NORMALIZED displacement to reasonable range
+        # [-0.05, 0.05] normalized = [-5, 5] meters per 0.1s timestep = [-50, 50] m/s
+        predictions = torch.clamp(predictions, min=-0.05, max=0.05)
         
         return predictions
     
@@ -504,9 +495,10 @@ class SpatioTemporalGATBatchedV2(nn.Module):
         
         temporal_features = gru_output.squeeze(0)  # [total_nodes, hidden_dim]
         
-        # 3. Skip connection + decode
+        # 3. Skip connection + decode - outputs NORMALIZED displacement
         decoder_input = torch.cat([temporal_features, x], dim=-1)
         predictions = self.decoder(decoder_input)
-        predictions = torch.clamp(predictions, min=-5.0, max=5.0)
+        # Clamp in NORMALIZED space: [-0.05, 0.05] = [-5, 5] meters per 0.1s
+        predictions = torch.clamp(predictions, min=-0.05, max=0.05)
         
         return predictions

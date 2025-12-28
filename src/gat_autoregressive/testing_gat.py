@@ -357,8 +357,10 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         for step_pred in predictions:
             pred_np = step_pred.cpu().numpy()
             if idx < len(pred_np):
-                displacement = pred_np[idx]  # already in meters
-                current_pos = current_pos + displacement
+                # Model outputs NORMALIZED displacement, multiply by POSITION_SCALE to get meters
+                displacement_normalized = pred_np[idx]
+                displacement_meters = displacement_normalized * POSITION_SCALE
+                current_pos = current_pos + displacement_meters
                 pred_positions[agent_id].append(current_pos.copy())
     
     # Create visualization

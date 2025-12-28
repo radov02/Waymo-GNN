@@ -8,7 +8,8 @@ from helper_functions.graph_creation_functions import timestep_to_pyg_data
 from config import (sequence_length, radius, graph_creation_method, 
                     visualize_every_n_epochs, max_nodes_per_graph_viz, 
                     show_timesteps_viz, max_scenario_files_for_viz,
-                    gcn_viz_dir_autoreg, gat_viz_dir_autoreg, vectornet_viz_dir)
+                    gcn_viz_dir_autoreg, gat_viz_dir_autoreg, vectornet_viz_dir,
+                    POSITION_SCALE)
 import matplotlib.pyplot as plt
 
 # Cache for loaded scenarios to avoid reloading the same scenario multiple times
@@ -536,19 +537,21 @@ def visualize_training_progress(model, batch_dict, epoch, save_dir, scenario_id=
                 # This shouldn't happen with properly saved HDF5 files
                 raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
-            # Get predicted displacement - model outputs displacement in meters directly
-            pred_displacement = model(graph.x, graph.edge_index, 
+            # Get predicted displacement - model outputs NORMALIZED displacement (same scale as GT y)
+            pred_displacement_normalized = model(graph.x, graph.edge_index, 
                                           edge_weight=None,  # edge_weight=graph.edge_attr, 
                                           batch=graph.batch, batch_size=B).cpu()
             
-            # Add displacement (already in meters) to current position to get predicted next position
-            pred_next_pos = curr_pos + pred_displacement
+            # Convert NORMALIZED displacement to meters and add to current position
+            pred_displacement_meters = pred_displacement_normalized * POSITION_SCALE
+            pred_next_pos = curr_pos + pred_displacement_meters
             
             # Get actual next position from ground truth labels
-            # graph.y contains the displacement to next position in meters
+            # graph.y contains NORMALIZED displacement (meters / POSITION_SCALE)
             if graph.y is not None:
-                actual_displacement = graph.y.cpu()  # already in meters
-                actual_next_pos = curr_pos + actual_displacement
+                actual_displacement_normalized = graph.y.cpu()
+                actual_displacement_meters = actual_displacement_normalized * POSITION_SCALE
+                actual_next_pos = curr_pos + actual_displacement_meters
             else:
                 # If no ground truth, use current position as fallback
                 actual_next_pos = curr_pos
