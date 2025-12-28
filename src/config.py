@@ -78,7 +78,7 @@ max_scenario_files_for_viz = 2  # index first n tfrecord files for faster scenar
 autoreg_num_rollout_steps = 50       # Max rollout steps (50 = 5.0s horizon) - curriculum starts at 10
 autoreg_num_epochs = 30              # More epochs for slower sampling schedule
 autoreg_sampling_strategy = 'exponential'  # 'exponential' ramps slower than 'linear'
-autoreg_visualize_every_n_epochs = 3
+autoreg_visualize_every_n_epochs = 1
 autoreg_skip_map_features = False
 autoreg_learning_rate = 0.0001        # Lower LR for finetuning stability (was 0.0002)
 

@@ -1368,13 +1368,11 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             # Save rollout errors for ADE/FDE computation - convert dict to array
             if current_rollout_errors and len(current_rollout_errors) > 0:
                 # Convert dict to array [num_agents, num_steps]
+                # Only include agents with complete trajectories (all timesteps present)
                 agent_error_arrays = []
                 for agent_key, errors in current_rollout_errors.items():
-                    if len(errors) > 0:
-                        # Pad to effective_rollout length if needed
-                        while len(errors) < effective_rollout:
-                            errors.append(errors[-1] if isinstance(errors[-1], float) else errors[-1])
-                        agent_error_arrays.append(np.array(errors[:effective_rollout]))
+                    if len(errors) == effective_rollout:
+                        agent_error_arrays.append(np.array(errors))
                 
                 if agent_error_arrays:
                     batch_errors = np.stack(agent_error_arrays, axis=0)
@@ -1735,22 +1733,13 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             # After rollout completes, convert dict to array for ADE/FDE computation
             if current_rollout_errors and len(current_rollout_errors) > 0:
                 # Convert dict {agent_key: [errors]} to numpy array [num_agents, num_steps]
-                # IMPROVED: Only include agents with at least 50% of timesteps
-                # This avoids averaging in padded values for agents that appeared briefly
-                min_timesteps_required = effective_rollout // 2
+                # Only include agents that have errors for ALL timesteps (no padding)
+                # This gives accurate ADE/FDE without artificial inflation from extrapolation
                 agent_error_arrays = []
                 for agent_key, errors in current_rollout_errors.items():
-                    if len(errors) >= min_timesteps_required:
-                        # Pad to effective_rollout length if needed
-                        # Use linear extrapolation for more realistic error growth estimate
-                        while len(errors) < effective_rollout:
-                            if len(errors) >= 2:
-                                # Linear extrapolation based on recent trend
-                                delta = errors[-1] - errors[-2]
-                                errors.append(errors[-1] + delta)
-                            else:
-                                errors.append(errors[-1])
-                        agent_error_arrays.append(np.array(errors[:effective_rollout]))
+                    # Only include agents with complete trajectories (all timesteps present)
+                    if len(errors) == effective_rollout:
+                        agent_error_arrays.append(np.array(errors))
                 
                 if agent_error_arrays:
                     batch_errors = np.stack(agent_error_arrays, axis=0)  # [num_agents, num_steps]
@@ -1773,8 +1762,14 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
         # Concatenate all rollout errors: [total_agents, num_steps]
         all_errors = np.concatenate(all_agent_errors, axis=0)  # [total_agents, num_steps]
         
+        # Sanity check: errors should always be non-negative (Euclidean distances)
+        if all_errors.min() < 0:
+            print(f"  [WARNING] Negative errors detected! min={all_errors.min():.4f} - this indicates a bug")
+            print(f"            Setting negative values to 0 and continuing...")
+            all_errors = np.maximum(all_errors, 0.0)
+        
         print(f"  [DEBUG] all_errors shape: {all_errors.shape}, min={all_errors.min():.4f}, max={all_errors.max():.4f}, mean={all_errors.mean():.4f}")
-        print(f"  [DEBUG] Error distribution by timestep (first 10 steps, m):")
+        print(f"  [DEBUG] Position error by timestep (meters):")
         for t_idx in [0, 4, 9, 19, 29, 49] if all_errors.shape[1] > 50 else range(min(10, all_errors.shape[1])):
             if t_idx < all_errors.shape[1]:
                 mean_err = np.mean(all_errors[:, t_idx])
@@ -1796,18 +1791,22 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
         total_agents = 0
     
     # Print horizon error progression (every 10th step)
+    # NOTE: horizon_mse tracks DISPLACEMENT MSE (pred_disp vs GT_disp), NOT position error!
+    # This stays small because each step's displacement is small (~0.1s of motion).
+    # ADE/FDE track ACCUMULATED POSITION ERROR which grows over the rollout.
     final_mse = total_mse / max(1, count)
     final_rmse_meters = (final_mse ** 0.5) * 100.0
-    print(f"  [VAL METRICS] Per-step MSE={final_mse:.6f} | Per-step RMSE={final_rmse_meters:.2f}m")
-    print(f"  [VAL HORIZON] Step-wise RMSE (meters): ", end="")
+    print(f"  [VAL METRICS] Displacement MSE={final_mse:.6f} | Displacement RMSE={final_rmse_meters:.2f}m")
+    print(f"  [VAL HORIZON] Per-step displacement RMSE (NOT position error): ", end="")
     for h in [0, 9, 19, 29, 49, 69, 88]:
         if h < len(horizon_avg_mse) and horizon_counts[h] > 0:
             rmse_h = (horizon_avg_mse[h] ** 0.5) * 100.0
             print(f"t{h+1}={rmse_h:.1f}m ", end="")
     print()
     
-    # Print key metrics (ADE/FDE like VectorNet)
-    print(f"\n[VALIDATION] ADE: {ade:.2f}m | FDE: {fde:.2f}m (across {total_agents} agents)")
+    # Print position-based metrics (ADE/FDE) - these show true trajectory accuracy
+    print(f"\n[VALIDATION] Position-based: ADE: {ade:.2f}m | FDE: {fde:.2f}m (across {total_agents} complete agent trajectories)")
+    print(f"  (Note: Only agents present for all {num_rollout_steps} timesteps are included - no padding/extrapolation)")
     
     return {
         'loss': total_loss / max(1, steps),
