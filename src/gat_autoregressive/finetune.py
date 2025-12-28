@@ -854,10 +854,10 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         graph_for_prediction = current_graph
         is_using_predicted_positions = False  # Track if we're using our predictions
         
-        # CRITICAL: Track predicted positions separately for correct ADE/FDE computation
-        # We cannot use graph_for_prediction.pos because update_graph_with_prediction() modifies it
-        # Start with GT positions at t=0
-        predicted_positions = current_graph.pos.clone() if hasattr(current_graph, 'pos') else None
+        # CRITICAL: Track accumulated displacements for correct ADE/FDE computation
+        # We accumulate displacements and add them to GT start positions to get predicted positions
+        # This avoids index alignment issues when agents enter/leave
+        accumulated_displacements = {}  # {(batch_idx, agent_id): displacement_tensor}
         
         # Initialize per-agent error tracking for ADE/FDE computation
         # Track position error (in meters) per agent per timestep
@@ -1119,35 +1119,73 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # We need to compute: ||predicted_position - gt_position|| at each timestep
                 
                 # Convert predicted displacement to meters
-                pred_disp_meters = pred_aligned * POSITION_SCALE  # [num_agents, 2] in meters
+                pred_disp_meters = pred_aligned * POSITION_SCALE  # [num_aligned_agents, 2] in meters
                 
-                # Update tracked predicted positions with new displacement
-                # Handle alignment: if indices were used, we need to update only aligned agents
-                if pred_indices is not None and predicted_positions is not None:
-                    # Only update positions for aligned agents
-                    predicted_positions[pred_indices] = predicted_positions[pred_indices] + pred_disp_meters
-                    pred_positions_for_error = predicted_positions[pred_indices]
-                elif predicted_positions is not None:
-                    # No alignment needed, update all
-                    predicted_positions = predicted_positions + pred_disp_meters
-                    pred_positions_for_error = predicted_positions
-                else:
-                    # Fallback: start from displacement (shouldn't happen)
-                    pred_positions_for_error = pred_disp_meters
+                # Accumulate displacements per agent for position error computation
+                # This handles agent alignment correctly by using global agent IDs
+                if agent_ids_valid:
+                    # Update accumulated displacements for each aligned agent
+                    pred_batch_np = pred_batch.cpu().numpy()
+                    for i, idx in enumerate(pred_indices.cpu().numpy()):
+                        if idx < len(pred_agent_ids) and i < pred_disp_meters.shape[0]:
+                            bid = int(pred_batch_np[idx])
+                            aid = pred_agent_ids[idx]
+                            agent_key = (bid, aid)
+                            
+                            # Get displacement for this agent
+                            disp = pred_disp_meters[i].cpu()
+                            
+                            # Accumulate (or initialize if first time)
+                            if agent_key in accumulated_displacements:
+                                accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
+                            else:
+                                accumulated_displacements[agent_key] = disp
                 
-                # Get GT positions at next timestep
-                if hasattr(target_graph, 'pos') and target_graph.pos is not None:
-                    # Align GT positions using target_indices if available
-                    if target_indices is not None:
-                        gt_next_pos = target_graph.pos[target_indices]  # [num_aligned_agents, 2]
-                    else:
-                        gt_next_pos = target_graph.pos  # [num_agents, 2]
+                # Compute position errors using accumulated displacements
+                # predicted_position = GT_start_position + accumulated_displacement
+                if hasattr(target_graph, 'pos') and target_graph.pos is not None and agent_ids_valid:
+                    # Get GT start positions (from t=0 graph) and target positions
+                    source_gt_graph = batched_graph_sequence[t]
+                    source_batch_np = source_gt_graph.batch.cpu().numpy() if hasattr(source_gt_graph, 'batch') else None
+                    source_agent_ids = getattr(source_gt_graph, 'agent_ids', None)
                     
-                    # Position error: Euclidean distance between predicted and GT positions
-                    step_errors_meters = torch.norm(pred_positions_for_error - gt_next_pos, dim=1)  # [num_agents] in meters
+                    target_batch_np = target_batch.cpu().numpy()
+                    
+                    step_errors_list = []
+                    for i, target_idx in enumerate(target_indices.cpu().numpy()):
+                        if target_idx < len(target_agent_ids):
+                            bid = int(target_batch_np[target_idx])
+                            aid = target_agent_ids[target_idx]
+                            agent_key = (bid, aid)
+                            
+                            # Get GT target position
+                            gt_target_pos = target_graph.pos[target_idx].cpu()
+                            
+                            # Compute predicted position: start_pos + accumulated_displacement
+                            if agent_key in accumulated_displacements and source_agent_ids is not None:
+                                # Find start position in source graph
+                                source_idx = None
+                                for si in range(len(source_agent_ids)):
+                                    if si < len(source_batch_np):
+                                        if int(source_batch_np[si]) == bid and source_agent_ids[si] == aid:
+                                            source_idx = si
+                                            break
+                                
+                                if source_idx is not None and source_idx < source_gt_graph.pos.shape[0]:
+                                    gt_start_pos = source_gt_graph.pos[source_idx].cpu()
+                                    predicted_pos = gt_start_pos + accumulated_displacements[agent_key]
+                                    
+                                    # Compute position error
+                                    error = torch.norm(predicted_pos - gt_target_pos).item()
+                                    step_errors_list.append(error)
+                    
+                    if step_errors_list:
+                        step_errors_meters = torch.tensor(step_errors_list, device=device)
+                    else:
+                        # Fallback
+                        step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE
                 else:
                     # Fallback: if no positions available, use displacement error (less accurate)
-                    # This maintains backward compatibility but is not the correct ADE/FDE metric
                     step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE
                 
                 # Initialize error tensor on first step with correct aligned agent count
@@ -1334,10 +1372,9 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             rollout_loss = 0.0
             is_using_predicted_positions = False
             
-            # CRITICAL: Track predicted positions separately to compute correct errors
-            # We cannot use graph_for_prediction.pos because it gets modified by update_graph_with_prediction()
-            # Start with GT positions at start_t
-            predicted_positions = current_graph.pos.clone() if hasattr(current_graph, 'pos') else None
+            # CRITICAL: Track accumulated displacements for correct ADE/FDE computation
+            # We accumulate displacements and add them to GT start positions to get predicted positions
+            accumulated_displacements = {}  # {(batch_idx, agent_id): displacement_tensor}
             
             # Initialize per-agent error tracking for this batch's rollout
             # Will be resized after first step when we know aligned agent count
@@ -1377,20 +1414,74 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Convert predicted displacement from normalized to meters for position update
                 pred_disp_meters = pred * POSITION_SCALE  # [N, 2] in meters
                 
-                # Update predicted positions with new displacement
-                if predicted_positions is not None:
-                    predicted_positions = predicted_positions + pred_disp_meters
-                else:
-                    # Fallback: shouldn't happen but handle gracefully
-                    predicted_positions = pred_disp_meters
-                
-                # Get GT positions at next timestep for error tracking
-                # NOTE: We don't use these to compute "target displacement" - only for error metrics
-                if hasattr(target_graph, 'pos') and target_graph.pos is not None:
-                    gt_next_pos = target_graph.pos  # [N, 2] in meters
+                # Accumulate displacements for position error computation
+                # Store displacement for each agent by (batch_idx, agent_id)
+                if hasattr(graph_for_prediction, 'agent_ids') and hasattr(graph_for_prediction, 'batch'):
+                    pred_agent_ids = graph_for_prediction.agent_ids
+                    pred_batch = graph_for_prediction.batch
+                    pred_batch_np = pred_batch.cpu().numpy()
                     
-                    # Track position error (Euclidean distance between predicted and GT positions)
-                    step_errors_meters = torch.norm(predicted_positions - gt_next_pos, dim=1)  # [N] in meters
+                    for node_idx in range(pred_disp_meters.shape[0]):
+                        if node_idx < len(pred_agent_ids) and node_idx < len(pred_batch_np):
+                            bid = int(pred_batch_np[node_idx])
+                            aid = pred_agent_ids[node_idx]
+                            agent_key = (bid, aid)
+                            
+                            disp = pred_disp_meters[node_idx].cpu()
+                            
+                            # Accumulate displacement
+                            if agent_key in accumulated_displacements:
+                                accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
+                            else:
+                                accumulated_displacements[agent_key] = disp
+                
+                # Compute position errors: predicted_pos = start_pos + accumulated_displacement
+                if hasattr(target_graph, 'pos') and target_graph.pos is not None:
+                    start_graph = batched_graph_sequence[start_t]
+                    start_agent_ids = getattr(start_graph, 'agent_ids', None)
+                    start_batch = getattr(start_graph, 'batch', None)
+                    start_batch_np = start_batch.cpu().numpy() if start_batch is not None else None
+                    
+                    target_agent_ids = getattr(target_graph, 'agent_ids', None)
+                    target_batch = getattr(target_graph, 'batch', None)
+                    target_batch_np = target_batch.cpu().numpy() if target_batch is not None else None
+                    
+                    step_errors_list = []
+                    if (start_agent_ids is not None and target_agent_ids is not None and 
+                        start_batch_np is not None and target_batch_np is not None):
+                        
+                        for target_idx in range(len(target_agent_ids)):
+                            if target_idx < len(target_batch_np) and target_idx < target_graph.pos.shape[0]:
+                                bid = int(target_batch_np[target_idx])
+                                aid = target_agent_ids[target_idx]
+                                agent_key = (bid, aid)
+                                
+                                # Get GT target position
+                                gt_target_pos = target_graph.pos[target_idx].cpu()
+                                
+                                # Find start position
+                                if agent_key in accumulated_displacements:
+                                    start_idx = None
+                                    for si in range(len(start_agent_ids)):
+                                        if si < len(start_batch_np):
+                                            if int(start_batch_np[si]) == bid and start_agent_ids[si] == aid:
+                                                start_idx = si
+                                                break
+                                    
+                                    if start_idx is not None and start_idx < start_graph.pos.shape[0]:
+                                        gt_start_pos = start_graph.pos[start_idx].cpu()
+                                        predicted_pos = gt_start_pos + accumulated_displacements[agent_key]
+                                        
+                                        # Position error
+                                        error = torch.norm(predicted_pos - gt_target_pos).item()
+                                        step_errors_list.append(error)
+                    
+                    if step_errors_list:
+                        step_errors_meters = torch.tensor(step_errors_list, device=device)
+                    else:
+                        # Fallback: displacement error
+                        gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
+                        step_errors_meters = torch.norm(pred_disp_meters - gt_disp, dim=1)
                 else:
                     # No GT positions available - use displacement error as fallback
                     gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
