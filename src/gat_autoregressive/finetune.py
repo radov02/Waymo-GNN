@@ -1109,10 +1109,34 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 total_cosine += cos_sim.mean().item()
                 count += 1
                 
-                # Track per-agent displacement errors for ADE/FDE computation
-                # pred_aligned and target are both NORMALIZED (divided by 100)
-                # Multiply by POSITION_SCALE to get error in meters
-                step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE  # [num_agents] in meters
+                # Track per-agent POSITION errors for ADE/FDE computation (not displacement errors!)
+                # ADE/FDE measure how far the predicted trajectory is from GT trajectory in meters
+                # We need to compute: ||predicted_position - gt_position|| at each timestep
+                
+                # Convert predicted displacement to meters and compute predicted next position
+                pred_disp_meters = pred_aligned * POSITION_SCALE  # [num_agents, 2] in meters
+                
+                # Get current and target positions (both in meters)
+                if (hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None and
+                    hasattr(target_graph, 'pos') and target_graph.pos is not None):
+                    
+                    # Align positions using pred_indices/target_indices if they were computed
+                    if pred_indices is not None and target_indices is not None:
+                        current_pos = graph_for_prediction.pos[pred_indices]  # [num_aligned_agents, 2]
+                        gt_next_pos = target_graph.pos[target_indices]        # [num_aligned_agents, 2]
+                    else:
+                        current_pos = graph_for_prediction.pos  # [num_agents, 2]
+                        gt_next_pos = target_graph.pos          # [num_agents, 2]
+                    
+                    # Compute predicted next position
+                    pred_next_pos = current_pos + pred_disp_meters  # [num_agents, 2] in meters
+                    
+                    # Position error: Euclidean distance between predicted and GT positions
+                    step_errors_meters = torch.norm(pred_next_pos - gt_next_pos, dim=1)  # [num_agents] in meters
+                else:
+                    # Fallback: if no positions available, use displacement error (less accurate)
+                    # This maintains backward compatibility but is not the correct ADE/FDE metric
+                    step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE
                 
                 # Initialize error tensor on first step with correct aligned agent count
                 if current_rollout_errors is None:
@@ -1329,27 +1353,45 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     agent_ids=agent_ids_for_model
                 )
                 
-                # CRITICAL: Compute correct target based on current position
-                if is_using_predicted_positions and hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                    # When using predicted positions, target is displacement from current predicted pos to GT next pos
-                    gt_next_pos = target_graph.pos.to(pred.dtype)
-                    current_pred_pos = graph_for_prediction.pos.to(pred.dtype)
-                    # Positions are in meters, but model outputs NORMALIZED displacement
-                    # So we need to normalize the target: (meters) / POSITION_SCALE
-                    target = (gt_next_pos - current_pred_pos) / POSITION_SCALE
+                # PURE AUTOREGRESSIVE EVALUATION: No teacher forcing or loss computation during rollout
+                # Model predicts displacement based purely on current graph features
+                # We only track position errors against GT for metrics (ADE/FDE)
+                
+                # Convert predicted displacement from normalized to meters for position update
+                pred_disp_meters = pred * POSITION_SCALE  # [N, 2] in meters
+                
+                # Get GT positions at current and next timesteps for error tracking
+                # NOTE: We don't use these to compute "target displacement" - only for error metrics
+                if hasattr(target_graph, 'pos') and target_graph.pos is not None:
+                    gt_next_pos = target_graph.pos  # [N, 2] in meters
+                    
+                    # Compute predicted next position from current position + predicted displacement
+                    if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
+                        current_pos = graph_for_prediction.pos  # [N, 2] in meters
+                        pred_next_pos = current_pos + pred_disp_meters  # [N, 2] in meters
+                        
+                        # Track position error (Euclidean distance between predicted and GT positions)
+                        step_errors_meters = torch.norm(pred_next_pos - gt_next_pos, dim=1)  # [N] in meters
+                    else:
+                        # Fallback: if no current position, use displacement error (less accurate)
+                        # This shouldn't happen in normal operation
+                        gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
+                        step_errors_meters = torch.norm(pred_disp_meters - gt_disp, dim=1)
                 else:
-                    # First step uses GT displacement (already normalized in dataset)
-                    target = target_graph.y.to(pred.dtype)
+                    # No GT positions available - use displacement error as fallback
+                    gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
+                    step_errors_meters = torch.norm(pred_disp_meters - gt_disp, dim=1)
                 
-                # Model outputs NORMALIZED displacement - same scale as GT y
-                pred_disp_for_loss = pred
-                
-                # Simplified loss - just displacement MSE (both normalized)
-                mse = F.mse_loss(pred_disp_for_loss, target)
+                # For loss tracking (optional - not used for gradient, just monitoring)
+                # Compute MSE on displacement vs GT displacement (from dataset y attribute)
+                if target_graph.y is not None:
+                    # target_graph.y is GT displacement from (t+step) to (t+step+1) 
+                    # Both pred and target.y are normalized
+                    mse = F.mse_loss(pred, target_graph.y.to(pred.dtype))
+                else:
+                    mse = torch.tensor(0.0, device=pred.device)
                 
                 # Track per-agent displacement error at each step for ADE/FDE
-                # Both pred and target are NORMALIZED, multiply by POSITION_SCALE to get meters
-                step_errors_meters = torch.norm(pred_disp_for_loss - target, dim=1) * POSITION_SCALE  # [num_agents] in meters
                 
                 # Initialize error tensor on first step with actual agent count
                 if current_rollout_errors is None:
@@ -1362,19 +1404,22 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 elif batch_idx == 0 and step < 5:
                     print(f"    [WARNING] Step {step}: Agent count mismatch. expected={aligned_agent_count}, got={step_errors_meters.shape[0]}")
                 
-                # Debug: print position drift for first batch
+                # Debug: print position error progression for first batch
                 if batch_idx == 0 and not debug_printed:
-                    pos_drift = 0.0
-                    if hasattr(graph_for_prediction, 'pos') and hasattr(target_graph, 'pos'):
-                        pos_drift = torch.norm(graph_for_prediction.pos - target_graph.pos, dim=1).mean().item()
-                    if step in [0, 4, 9, 19, 49, 88]:
-                        print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, pos_drift={pos_drift:.1f}m, auto={is_using_predicted_positions}")
+                    avg_pos_error = step_errors_meters.mean().item()
+                    max_pos_error = step_errors_meters.max().item()
+                    if step in [0, 4, 9, 19, 49, 69, 88]:
+                        print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, avg_pos_error={avg_pos_error:.2f}m, max_pos_error={max_pos_error:.2f}m")
                     if step == 88:
                         debug_printed = True
                 
-                pred_norm = F.normalize(pred_disp_for_loss, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                # Compute cosine similarity on displacement direction (for monitoring)
+                if target_graph.y is not None:
+                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                    target_norm = F.normalize(target_graph.y.to(pred.dtype), p=2, dim=1, eps=1e-6)
+                    cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                else:
+                    cos_sim = torch.tensor(1.0, device=pred.device)
                 
                 rollout_loss += mse
                 total_mse += mse.item()
