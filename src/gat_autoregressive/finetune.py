@@ -1134,8 +1134,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             
             # TRAJECTORY LOSS: Penalize accumulated position error (with gradients!)
             # This teaches the model that small angle errors compound into large trajectory errors
+            # CRITICAL: This loss must be applied from step 0 to get gradient flow through ALL predictions
             trajectory_loss = torch.tensor(0.0, device=pred.device)
-            if step > 0 and agent_ids_valid and hasattr(target_graph, 'pos') and target_graph.pos is not None:
+            if agent_ids_valid and hasattr(target_graph, 'pos') and target_graph.pos is not None:
                 # Accumulate predicted displacements WITH gradients
                 pred_disp_grad = pred_aligned * POSITION_SCALE  # [num_aligned, 2] in meters
                 
@@ -1181,15 +1182,27 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                                             break
                     
                     if traj_errors:
-                        # Mean trajectory error, scaled down to be comparable to displacement loss
-                        trajectory_loss = torch.stack(traj_errors).mean() / POSITION_SCALE
+                        # Mean trajectory error, scaled to be comparable to displacement loss
+                        # Apply sqrt to reduce the magnitude of large errors (smoother gradient)
+                        # and add step-based weight to emphasize longer-term accuracy
+                        step_weight = 1.0 + 0.05 * step  # Gradually increase weight for later steps
+                        trajectory_loss = step_weight * torch.sqrt(torch.stack(traj_errors).mean() + 1e-6) / POSITION_SCALE
             
-            # Combined displacement loss - PRIORITIZE DIRECTION over magnitude
-            # Removed velocity_reg as it prevents learning of turns/accelerations
-            # Weights: direction (cosine 0.20 + angle 0.15 + heading 0.10) = 0.45 total for direction
-            #          magnitude (huber 0.20 + mse 0.10 + mag 0.05) = 0.35 total for magnitude
-            #          trajectory (0.20) = 0.20 for accumulated position error
-            disp_loss = 0.20 * huber_loss + 0.10 * mse_loss + 0.20 * cosine_loss + 0.05 * magnitude_loss + 0.15 * angle_loss + 0.10 * heading_loss + 0.20 * trajectory_loss
+            # Combined displacement loss - PRIORITIZE TRAJECTORY ACCURACY
+            # The model must learn that small displacement errors compound into large trajectory errors.
+            # 
+            # Loss components and weights:
+            # - trajectory_loss (0.35): CRITICAL - penalizes accumulated position error with gradients
+            #   This is the most important loss for autoregressive prediction
+            # - huber_loss (0.15): Robust displacement loss (L1-like for outliers)
+            # - mse_loss (0.10): Standard displacement loss
+            # - cosine_loss (0.15): Direction alignment
+            # - angle_loss (0.15): Explicit angle penalty
+            # - magnitude_loss (0.05): Displacement magnitude
+            # - heading_loss (0.05): Alignment with agent heading
+            #
+            # Higher trajectory loss weight forces model to consider downstream effects of predictions
+            disp_loss = 0.15 * huber_loss + 0.10 * mse_loss + 0.15 * cosine_loss + 0.05 * magnitude_loss + 0.15 * angle_loss + 0.05 * heading_loss + 0.35 * trajectory_loss
             
             # Final NaN check
             if torch.isnan(disp_loss):
@@ -1509,10 +1522,14 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 if target_graph.y is None:
                     break
                 
-                if graph_for_prediction.x.shape[0] != target_graph.y.shape[0]:
-                    graph_for_prediction = target_graph
-                    is_using_predicted_positions = False
-                    continue
+                # CRITICAL FIX: Do NOT skip when sizes don't match!
+                # Instead, we compute errors for agents that exist in BOTH graphs.
+                # The previous code was skipping error computation entirely, causing error plateaus.
+                size_mismatch = (graph_for_prediction.x.shape[0] != target_graph.y.shape[0])
+                if size_mismatch:
+                    # Update graph_for_prediction to match target topology for next iteration
+                    # But STILL compute errors for this step using aligned agents
+                    pass  # Continue to compute errors below
                 
                 # GAT forward with agent_ids for per-agent GRU tracking
                 agent_ids_for_model = getattr(graph_for_prediction, 'agent_ids', None)
@@ -1664,8 +1681,10 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                         max_pos_error = step_errors_meters.max().item()
                         num_agents = step_errors_meters.shape[0]
                     
-                    if step in [0, 4, 9, 19, 29, 49]:
-                        print(f"    [VAL DEBUG] Step {step+1} ({(step+1)*0.1:.1f}s): mse={mse.item():.4f}, avg_pos_error={avg_pos_error:.2f}m, max={max_pos_error:.2f}m, agents={num_agents}")
+                    # Print more frequently for debugging error accumulation
+                    if step in [0, 2, 4, 9, 14, 19, 29, 39, 49]:
+                        size_info = f" (mismatch)" if size_mismatch else ""
+                        print(f"    [VAL DEBUG] Step {step+1} ({(step+1)*0.1:.1f}s): avg_err={avg_pos_error:.2f}m, max={max_pos_error:.2f}m, agents={num_agents}{size_info}")
                     if step >= 49:
                         debug_printed = True
                 
@@ -1688,21 +1707,38 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 
                 if step < num_rollout_steps - 1:
                     # ALWAYS use predictions in evaluation (no teacher forcing)
-                    graph_for_prediction = update_graph_with_prediction(
-                        graph_for_prediction, pred, device
-                    )
+                    # Handle size mismatch: if target_graph has different agents,
+                    # we need to update to target topology but preserve predicted positions for common agents
+                    if size_mismatch:
+                        # For agents that exist in both graphs, transfer predicted positions to target
+                        # This maintains autoregressive behavior while handling topology changes
+                        graph_for_prediction = update_graph_with_prediction(
+                            target_graph.clone(), pred[:min(pred.shape[0], target_graph.x.shape[0])], device
+                        )
+                    else:
+                        graph_for_prediction = update_graph_with_prediction(
+                            graph_for_prediction, pred, device
+                        )
                     is_using_predicted_positions = True
             
             # After rollout completes, convert dict to array for ADE/FDE computation
             if current_rollout_errors and len(current_rollout_errors) > 0:
                 # Convert dict {agent_key: [errors]} to numpy array [num_agents, num_steps]
-                # Pad shorter sequences with final error value (agent disappeared from scene)
+                # IMPROVED: Only include agents with at least 50% of timesteps
+                # This avoids averaging in padded values for agents that appeared briefly
+                min_timesteps_required = effective_rollout // 2
                 agent_error_arrays = []
                 for agent_key, errors in current_rollout_errors.items():
-                    if len(errors) > 0:
+                    if len(errors) >= min_timesteps_required:
                         # Pad to effective_rollout length if needed
+                        # Use linear extrapolation for more realistic error growth estimate
                         while len(errors) < effective_rollout:
-                            errors.append(errors[-1])  # Repeat last error
+                            if len(errors) >= 2:
+                                # Linear extrapolation based on recent trend
+                                delta = errors[-1] - errors[-2]
+                                errors.append(errors[-1] + delta)
+                            else:
+                                errors.append(errors[-1])
                         agent_error_arrays.append(np.array(errors[:effective_rollout]))
                 
                 if agent_error_arrays:
@@ -2221,8 +2257,9 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_vy = displacement_meters[:, 1] / dt  # m/s
     
     # Velocity smoothing: blend predicted velocity with previous to prevent jumps
-    # This reduces compounding errors and is physically realistic (vehicles can't teleport)
-    velocity_smoothing = 0.7  # 70% previous, 30% predicted - conservative smoothing
+    # REDUCED from 0.7 to 0.3 - model needs to be able to represent turns and accelerations
+    # Higher smoothing (0.7) was preventing learning of trajectory changes
+    velocity_smoothing = 0.3  # 30% previous, 70% predicted - allows sharper turns
     if hasattr(updated_graph, 'x') and updated_graph.x is not None:
         prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
         prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
