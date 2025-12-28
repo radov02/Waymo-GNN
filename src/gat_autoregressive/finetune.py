@@ -182,47 +182,41 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
     
     return model, is_parallel, checkpoint
 
-def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=5):
+def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=0):
     """Calculate probability of using model's own prediction vs ground truth.
     
-    Ensures sampling_prob reaches exactly 1.0 at the final epoch (epoch == total_epochs - 1).
+    Simple linear schedule: sampling_prob increases from (1/total_epochs) to 1.0.
+    For 10 epochs: 0.1, 0.2, 0.3, ..., 0.9, 1.0
+    This gives the model immediate and increasing exposure to its own predictions.
     
     Args:
-        epoch: Current epoch (0-indexed)
+        epoch: Current epoch (0-indexed, so first epoch is epoch=0)
         total_epochs: Total number of training epochs
-        strategy: 'linear', 'exponential', 'inverse_sigmoid', or 'delayed_linear'
-        warmup_epochs: Number of epochs before increasing scheduled sampling
+        strategy: 'linear', 'exponential', or 'inverse_sigmoid'
+        warmup_epochs: [DEPRECATED - now unused for simplicity]
     
     Returns:
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
-
     
-    # During warmup, use small amount of model predictions to start learning
-    if epoch < warmup_epochs:
-        # Linear ramp from 0.0 to 0.1 during warmup for smoother transition
-        return 0.1 * (epoch / max(1, warmup_epochs))
+    # Simple linear schedule: epoch 0 → 1/total_epochs, epoch (total_epochs-1) → 1.0
+    # This ensures model sees its own predictions from the start, gradually increasing
+    sampling_prob = (epoch + 1) / total_epochs
     
-    # Calculate progress from warmup_epochs to total_epochs-1
-    # At epoch=warmup_epochs: progress=0, at epoch=total_epochs-1: progress=1
-    remaining_epochs = total_epochs - warmup_epochs
-    adjusted_epoch = epoch - warmup_epochs
-    progress = adjusted_epoch / max(1, remaining_epochs - 1)
-    progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
-    
-    # Scale from min_sampling (end of warmup) to max_sampling (final epoch)
-    min_sampling = 0.1
-    max_sampling = 0.8
-    
-    if strategy == 'linear' or strategy == 'delayed_linear':
-        return min_sampling + progress * (max_sampling - min_sampling)
+    # Apply strategy modulation (optional - linear is recommended)
+    if strategy == 'linear':
+        return sampling_prob
     elif strategy == 'exponential':
-        return min_sampling + (1 - np.exp(-5 * progress)) * (max_sampling - min_sampling)
+        # Exponential: slower at start, faster at end
+        progress = epoch / max(1, total_epochs - 1)
+        return 1.0 - np.exp(-3 * progress)  # Reaches ~0.95 at end
     elif strategy == 'inverse_sigmoid':
-        k = 10
-        return min_sampling + (1 / (1 + np.exp(-k * (progress - 0.5)))) * (max_sampling - min_sampling)
+        # S-curve: very slow at start/end, fast in middle
+        progress = epoch / max(1, total_epochs - 1)
+        k = 8
+        return 1 / (1 + np.exp(-k * (progress - 0.5)))
     else:
-        return min_sampling + progress * (max_sampling - min_sampling)
+        return sampling_prob
 
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     """Curriculum learning: gradually increase rollout length.
@@ -1858,14 +1852,13 @@ def run_autoregressive_finetuning(
         curr_rollout = curriculum_rollout_steps(epoch, num_rollout_steps, num_epochs)
         
         # Explain what sampling_prob means for clarity
-        if sampling_prob < 0.01:
-            print(f"  [TEACHER FORCING] Using GT graphs as input for each step.")
-            print(f"  - Model learns single-step prediction with perfect input.")
-            print(f"  - Visualization (autoregressive) tests multi-step performance.")
-        elif sampling_prob > 0.49:
-            print(f"  [MAX SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input.")
+        print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted input, {(1-sampling_prob)*100:.0f}% GT input")
+        if sampling_prob < 0.15:
+            print(f"  - Mostly teacher forcing: model learning from clean GT inputs")
+        elif sampling_prob < 0.5:
+            print(f"  - Balanced mix: model learning to handle some prediction errors")
         else:
-            print(f"  [SCHEDULED SAMPLING] {sampling_prob*100:.0f}% predicted, {(1-sampling_prob)*100:.0f}% GT input.")
+            print(f"  - Mostly autoregressive: model learning to handle its own predictions")
         print(f"  [CURRICULUM] Rollout: {curr_rollout} steps ({curr_rollout*0.1:.1f}s) - target: {num_rollout_steps} steps")
         
 
