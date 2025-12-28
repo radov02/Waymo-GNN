@@ -1162,8 +1162,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                             gt_target_pos = target_graph.pos[target_idx].cpu()
                             
                             # Compute predicted position: start_pos + accumulated_displacement
+                            # NOTE: We use GT start position (at t=0) even when scheduled sampling uses
+                            # predicted graphs, because ADE/FDE measure total deviation from GT start.
+                            # Mathematically: predicted_pos_t = pos_0 + sum(displacements_0_to_t)
+                            # This is equivalent to iterative: pos_t = pos_{t-1} + disp_t
+                            # Each displacement was predicted from either GT or predicted state (scheduled sampling).
                             if agent_key in accumulated_displacements and source_agent_ids is not None:
-                                # Find start position in source graph
+                                # Find start position in source graph (t=0)
                                 source_idx = None
                                 for si in range(len(source_agent_ids)):
                                     if si < len(source_batch_np):
@@ -1188,14 +1193,21 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     # Fallback: if no positions available, use displacement error (less accurate)
                     step_errors_meters = torch.norm(pred_aligned - target, dim=1) * POSITION_SCALE
                 
-                # Initialize error tensor on first step with correct aligned agent count
+                # Initialize error dict on first step - track per agent
                 if current_rollout_errors is None:
-                    aligned_agent_count = step_errors_meters.shape[0]
-                    current_rollout_errors = torch.zeros(aligned_agent_count, effective_rollout, device=device)
+                    current_rollout_errors = {}
                 
-                # Store errors for this step - only if agent count matches
-                if step < effective_rollout and step_errors_meters.shape[0] == aligned_agent_count:
-                    current_rollout_errors[:, step] = step_errors_meters
+                # Store errors for this step - handle each agent individually  
+                if agent_ids_valid and hasattr(target_graph, 'agent_ids'):
+                    for i, target_idx in enumerate(target_indices.cpu().numpy()):
+                        if target_idx < len(target_agent_ids) and i < len(step_errors_list):
+                            bid = int(target_batch_np[target_idx])
+                            aid = target_agent_ids[target_idx]
+                            agent_key = (bid, aid)
+                            
+                            if agent_key not in current_rollout_errors:
+                                current_rollout_errors[agent_key] = []
+                            current_rollout_errors[agent_key].append(step_errors_list[i])
             
             if step < num_rollout_steps - 1:
                 # Scheduled sampling: sometimes use prediction, sometimes use GT
@@ -1244,9 +1256,20 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             total_loss += rollout_loss.item()
             steps += 1
             
-            # Save rollout errors for ADE/FDE computation - only if initialized
-            if current_rollout_errors is not None and current_rollout_errors.abs().sum() > 0:
-                train_agent_errors.append(current_rollout_errors.cpu().numpy())
+            # Save rollout errors for ADE/FDE computation - convert dict to array
+            if current_rollout_errors and len(current_rollout_errors) > 0:
+                # Convert dict to array [num_agents, num_steps]
+                agent_error_arrays = []
+                for agent_key, errors in current_rollout_errors.items():
+                    if len(errors) > 0:
+                        # Pad to effective_rollout length if needed
+                        while len(errors) < effective_rollout:
+                            errors.append(errors[-1] if isinstance(errors[-1], float) else errors[-1])
+                        agent_error_arrays.append(np.array(errors[:effective_rollout]))
+                
+                if agent_error_arrays:
+                    batch_errors = np.stack(agent_error_arrays, axis=0)
+                    train_agent_errors.append(batch_errors)
         
         if batch_idx % 20 == 0:
             loss_val = rollout_loss.item() if rollout_loss is not None and hasattr(rollout_loss, 'item') else 0.0
@@ -1497,25 +1520,42 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     mse = torch.tensor(0.0, device=pred.device)
                 
                 # Track per-agent displacement error at each step for ADE/FDE
-                
-                # Initialize error tensor on first step with actual agent count
+                # Use dict to handle agent count mismatches gracefully
                 if current_rollout_errors is None:
-                    aligned_agent_count = step_errors_meters.shape[0]
-                    current_rollout_errors = torch.zeros(aligned_agent_count, effective_rollout, device=device)
+                    # Initialize dict to store per-agent errors: {agent_key: [errors_over_time]}
+                    current_rollout_errors = {}
                 
-                # Store errors for this step - only if agent count matches
-                if step < effective_rollout and step_errors_meters.shape[0] == aligned_agent_count:
-                    current_rollout_errors[:, step] = step_errors_meters
-                elif batch_idx == 0 and step < 5:
-                    print(f"    [WARNING] Step {step}: Agent count mismatch. expected={aligned_agent_count}, got={step_errors_meters.shape[0]}")
+                # Store errors for this step - handle each agent individually
+                if hasattr(target_graph, 'agent_ids') and hasattr(target_graph, 'batch'):
+                    target_agent_ids_list = getattr(target_graph, 'agent_ids', None)
+                    target_batch_list = target_graph.batch
+                    target_batch_np = target_batch_list.cpu().numpy()
+                    
+                    # Match each error to its agent
+                    for i, error_val in enumerate(step_errors_list if step_errors_list else []):
+                        if i < len(target_agent_ids_list) and i < len(target_batch_np):
+                            bid = int(target_batch_np[i])
+                            aid = target_agent_ids_list[i]
+                            agent_key = (bid, aid)
+                            
+                            if agent_key not in current_rollout_errors:
+                                current_rollout_errors[agent_key] = []
+                            current_rollout_errors[agent_key].append(error_val)
                 
                 # Debug: print position error progression for first batch
                 if batch_idx == 0 and not debug_printed:
-                    avg_pos_error = step_errors_meters.mean().item()
-                    max_pos_error = step_errors_meters.max().item()
-                    if step in [0, 4, 9, 19, 49, 69, 88]:
-                        print(f"    [VAL DEBUG] Step {step}: mse={mse.item():.4f}, avg_pos_error={avg_pos_error:.2f}m, max_pos_error={max_pos_error:.2f}m")
-                    if step == 88:
+                    if step_errors_list:
+                        avg_pos_error = np.mean(step_errors_list)
+                        max_pos_error = np.max(step_errors_list)
+                        num_agents = len(step_errors_list)
+                    else:
+                        avg_pos_error = step_errors_meters.mean().item()
+                        max_pos_error = step_errors_meters.max().item()
+                        num_agents = step_errors_meters.shape[0]
+                    
+                    if step in [0, 4, 9, 19, 29, 49]:
+                        print(f"    [VAL DEBUG] Step {step+1} ({(step+1)*0.1:.1f}s): mse={mse.item():.4f}, avg_pos_error={avg_pos_error:.2f}m, max={max_pos_error:.2f}m, agents={num_agents}")
+                    if step >= 49:
                         debug_printed = True
                 
                 # Compute cosine similarity on displacement direction (for monitoring)
@@ -1542,14 +1582,21 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     )
                     is_using_predicted_positions = True
             
-            # After rollout completes, save errors for ADE/FDE computation
-            # Only save if we have valid error data (non-zero)
-            if current_rollout_errors.numel() > 0:
-                # Check if any errors were actually stored (non-zero)
-                if current_rollout_errors.abs().sum() > 0:
-                    all_agent_errors.append(current_rollout_errors.cpu().numpy())
-                elif batch_idx == 0:
-                    print(f"    [WARNING] Batch {batch_idx}: all_zeros in current_rollout_errors (shape: {current_rollout_errors.shape})")
+            # After rollout completes, convert dict to array for ADE/FDE computation
+            if current_rollout_errors and len(current_rollout_errors) > 0:
+                # Convert dict {agent_key: [errors]} to numpy array [num_agents, num_steps]
+                # Pad shorter sequences with final error value (agent disappeared from scene)
+                agent_error_arrays = []
+                for agent_key, errors in current_rollout_errors.items():
+                    if len(errors) > 0:
+                        # Pad to effective_rollout length if needed
+                        while len(errors) < effective_rollout:
+                            errors.append(errors[-1])  # Repeat last error
+                        agent_error_arrays.append(np.array(errors[:effective_rollout]))
+                
+                if agent_error_arrays:
+                    batch_errors = np.stack(agent_error_arrays, axis=0)  # [num_agents, num_steps]
+                    all_agent_errors.append(batch_errors)
             
             total_loss += rollout_loss.item() if isinstance(rollout_loss, torch.Tensor) else rollout_loss
             steps += 1
@@ -1569,6 +1616,12 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
         all_errors = np.concatenate(all_agent_errors, axis=0)  # [total_agents, num_steps]
         
         print(f"  [DEBUG] all_errors shape: {all_errors.shape}, min={all_errors.min():.4f}, max={all_errors.max():.4f}, mean={all_errors.mean():.4f}")
+        print(f"  [DEBUG] Error distribution by timestep (first 10 steps, m):")
+        for t_idx in [0, 4, 9, 19, 29, 49] if all_errors.shape[1] > 50 else range(min(10, all_errors.shape[1])):
+            if t_idx < all_errors.shape[1]:
+                mean_err = np.mean(all_errors[:, t_idx])
+                max_err = np.max(all_errors[:, t_idx])
+                print(f"    t={t_idx+1} ({(t_idx+1)*0.1:.1f}s): mean={mean_err:.2f}m, max={max_err:.2f}m")
         
         # ADE: First compute per-agent average across timesteps, then average across agents
         # This gives equal weight to each agent regardless of trajectory length
