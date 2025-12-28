@@ -1626,9 +1626,13 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # For loss tracking (optional - not used for gradient, just monitoring)
                 # Compute MSE on displacement vs GT displacement (from dataset y attribute)
                 if target_graph.y is not None:
-                    # target_graph.y is GT displacement from (t+step) to (t+step+1) 
-                    # Both pred and target.y are normalized
-                    mse = F.mse_loss(pred, target_graph.y.to(pred.dtype))
+                    # Handle size mismatch: only compute loss for overlapping nodes
+                    if size_mismatch:
+                        # Use only the common size
+                        min_size = min(pred.shape[0], target_graph.y.shape[0])
+                        mse = F.mse_loss(pred[:min_size], target_graph.y[:min_size].to(pred.dtype))
+                    else:
+                        mse = F.mse_loss(pred, target_graph.y.to(pred.dtype))
                 else:
                     mse = torch.tensor(0.0, device=pred.device)
                 
@@ -1690,9 +1694,16 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 
                 # Compute cosine similarity on displacement direction (for monitoring)
                 if target_graph.y is not None:
-                    pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
-                    target_norm = F.normalize(target_graph.y.to(pred.dtype), p=2, dim=1, eps=1e-6)
-                    cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                    # Handle size mismatch: only compute similarity for overlapping nodes
+                    if size_mismatch:
+                        min_size = min(pred.shape[0], target_graph.y.shape[0])
+                        pred_norm = F.normalize(pred[:min_size], p=2, dim=1, eps=1e-6)
+                        target_norm = F.normalize(target_graph.y[:min_size].to(pred.dtype), p=2, dim=1, eps=1e-6)
+                        cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                    else:
+                        pred_norm = F.normalize(pred, p=2, dim=1, eps=1e-6)
+                        target_norm = F.normalize(target_graph.y.to(pred.dtype), p=2, dim=1, eps=1e-6)
+                        cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
                 else:
                     cos_sim = torch.tensor(1.0, device=pred.device)
                 
