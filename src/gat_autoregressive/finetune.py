@@ -854,8 +854,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         graph_for_prediction = current_graph
         is_using_predicted_positions = False  # Track if we're using our predictions
         
+        # CRITICAL: Track predicted positions separately for correct ADE/FDE computation
+        # We cannot use graph_for_prediction.pos because update_graph_with_prediction() modifies it
+        # Start with GT positions at t=0
+        predicted_positions = current_graph.pos.clone() if hasattr(current_graph, 'pos') else None
+        
         # Initialize per-agent error tracking for ADE/FDE computation
-        # Track displacement error (in meters) per agent per timestep
+        # Track position error (in meters) per agent per timestep
         # NOTE: This will be resized after first step when we know aligned agent count
         current_rollout_errors = None
         aligned_agent_count = None
@@ -1113,26 +1118,33 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # ADE/FDE measure how far the predicted trajectory is from GT trajectory in meters
                 # We need to compute: ||predicted_position - gt_position|| at each timestep
                 
-                # Convert predicted displacement to meters and compute predicted next position
+                # Convert predicted displacement to meters
                 pred_disp_meters = pred_aligned * POSITION_SCALE  # [num_agents, 2] in meters
                 
-                # Get current and target positions (both in meters)
-                if (hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None and
-                    hasattr(target_graph, 'pos') and target_graph.pos is not None):
-                    
-                    # Align positions using pred_indices/target_indices if they were computed
-                    if pred_indices is not None and target_indices is not None:
-                        current_pos = graph_for_prediction.pos[pred_indices]  # [num_aligned_agents, 2]
-                        gt_next_pos = target_graph.pos[target_indices]        # [num_aligned_agents, 2]
+                # Update tracked predicted positions with new displacement
+                # Handle alignment: if indices were used, we need to update only aligned agents
+                if pred_indices is not None and predicted_positions is not None:
+                    # Only update positions for aligned agents
+                    predicted_positions[pred_indices] = predicted_positions[pred_indices] + pred_disp_meters
+                    pred_positions_for_error = predicted_positions[pred_indices]
+                elif predicted_positions is not None:
+                    # No alignment needed, update all
+                    predicted_positions = predicted_positions + pred_disp_meters
+                    pred_positions_for_error = predicted_positions
+                else:
+                    # Fallback: start from displacement (shouldn't happen)
+                    pred_positions_for_error = pred_disp_meters
+                
+                # Get GT positions at next timestep
+                if hasattr(target_graph, 'pos') and target_graph.pos is not None:
+                    # Align GT positions using target_indices if available
+                    if target_indices is not None:
+                        gt_next_pos = target_graph.pos[target_indices]  # [num_aligned_agents, 2]
                     else:
-                        current_pos = graph_for_prediction.pos  # [num_agents, 2]
-                        gt_next_pos = target_graph.pos          # [num_agents, 2]
-                    
-                    # Compute predicted next position
-                    pred_next_pos = current_pos + pred_disp_meters  # [num_agents, 2] in meters
+                        gt_next_pos = target_graph.pos  # [num_agents, 2]
                     
                     # Position error: Euclidean distance between predicted and GT positions
-                    step_errors_meters = torch.norm(pred_next_pos - gt_next_pos, dim=1)  # [num_agents] in meters
+                    step_errors_meters = torch.norm(pred_positions_for_error - gt_next_pos, dim=1)  # [num_agents] in meters
                 else:
                     # Fallback: if no positions available, use displacement error (less accurate)
                     # This maintains backward compatibility but is not the correct ADE/FDE metric
@@ -1322,6 +1334,11 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
             rollout_loss = 0.0
             is_using_predicted_positions = False
             
+            # CRITICAL: Track predicted positions separately to compute correct errors
+            # We cannot use graph_for_prediction.pos because it gets modified by update_graph_with_prediction()
+            # Start with GT positions at start_t
+            predicted_positions = current_graph.pos.clone() if hasattr(current_graph, 'pos') else None
+            
             # Initialize per-agent error tracking for this batch's rollout
             # Will be resized after first step when we know aligned agent count
             current_rollout_errors = None
@@ -1360,23 +1377,20 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                 # Convert predicted displacement from normalized to meters for position update
                 pred_disp_meters = pred * POSITION_SCALE  # [N, 2] in meters
                 
-                # Get GT positions at current and next timesteps for error tracking
+                # Update predicted positions with new displacement
+                if predicted_positions is not None:
+                    predicted_positions = predicted_positions + pred_disp_meters
+                else:
+                    # Fallback: shouldn't happen but handle gracefully
+                    predicted_positions = pred_disp_meters
+                
+                # Get GT positions at next timestep for error tracking
                 # NOTE: We don't use these to compute "target displacement" - only for error metrics
                 if hasattr(target_graph, 'pos') and target_graph.pos is not None:
                     gt_next_pos = target_graph.pos  # [N, 2] in meters
                     
-                    # Compute predicted next position from current position + predicted displacement
-                    if hasattr(graph_for_prediction, 'pos') and graph_for_prediction.pos is not None:
-                        current_pos = graph_for_prediction.pos  # [N, 2] in meters
-                        pred_next_pos = current_pos + pred_disp_meters  # [N, 2] in meters
-                        
-                        # Track position error (Euclidean distance between predicted and GT positions)
-                        step_errors_meters = torch.norm(pred_next_pos - gt_next_pos, dim=1)  # [N] in meters
-                    else:
-                        # Fallback: if no current position, use displacement error (less accurate)
-                        # This shouldn't happen in normal operation
-                        gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
-                        step_errors_meters = torch.norm(pred_disp_meters - gt_disp, dim=1)
+                    # Track position error (Euclidean distance between predicted and GT positions)
+                    step_errors_meters = torch.norm(predicted_positions - gt_next_pos, dim=1)  # [N] in meters
                 else:
                     # No GT positions available - use displacement error as fallback
                     gt_disp = target_graph.y * POSITION_SCALE if target_graph.y is not None else pred_disp_meters
