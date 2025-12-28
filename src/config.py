@@ -37,7 +37,6 @@ gcn_viz_dir_autoreg = 'visualizations/gcn/autoreg'
 gcn_viz_dir_testing = 'visualizations/gcn/autoreg/testing'
 # and GAT-specific configuration:
 gat_num_heads = 8                   # number of attention heads in GAT (increased from 4 for better spatial modeling)
-gat_learning_rate = 0.0001         # GAT-specific LR: 1e-4 for stable attention training (vs 1e-3 for GCN)
 gat_checkpoint_dir = 'checkpoints/gat'
 gat_checkpoint_dir_autoreg = 'checkpoints/gat/autoregressive'
 gat_viz_dir = 'visualizations/gat'
@@ -46,7 +45,8 @@ gat_viz_dir_testing = 'visualizations/gat/autoreg/testing'
 # ============== Training Configuration: ==============
 epochs = 20
 batch_size = 48     # number of graph sequences per batch
-learning_rate = 0.005
+learning_rate = 0.001
+gat_learning_rate = 0.0001         # GAT-specific LR: 1e-4 for stable attention training (vs 1e-3 for GCN)
 gradient_clip_value = 1.0  # gradient clipping threshold to prevent exploding gradients
 # Learning rate scheduler settings:
 scheduler_patience = 5  # wait scheduler_patience epochs before reducing LR
@@ -80,6 +80,7 @@ autoreg_num_epochs = 10
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 2
 autoreg_skip_map_features = False
+autoreg_learning_rate = 0.005
 
 
 # ============== VectorNet model ==============

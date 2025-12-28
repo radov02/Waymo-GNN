@@ -16,7 +16,7 @@ from datetime import datetime
 from gat_autoregressive.SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
-                    input_dim, output_dim, sequence_length, hidden_channels,
+                    input_dim, output_dim, sequence_length, hidden_channels, autoreg_learning_rate,
                     dropout, learning_rate, project_name, dataset_name, epochs, gat_learning_rate,
                     gradient_clip_value, gat_num_heads, gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving, load_model_state,
@@ -1574,7 +1574,7 @@ def run_autoregressive_finetuning(
             "model": "SpatioTemporalGATBatched_Autoregressive" if model_type == "gat" else "SpatioTemporalGCNBatched_Autoregressive",
             "pretrained_from": pretrained_checkpoint,
             "batch_size": batch_size,
-            "learning_rate": gat_learning_rate if model_type == "gat" else learning_rate,
+            "learning_rate": autoreg_learning_rate,
             "dataset": dataset_name,
             "num_rollout_steps": num_rollout_steps,
             "prediction_horizon": f"{num_rollout_steps * 0.1}s",
@@ -1588,8 +1588,7 @@ def run_autoregressive_finetuning(
     
     wandb.watch(model, log='all', log_freq=10)
     
-    finetune_lr = (gat_learning_rate if model_type == "gat" else learning_rate)
-    optimizer = torch.optim.Adam(model.parameters(), lr=finetune_lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=autoreg_learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7)
     
     try:        # Load datasets
@@ -1665,7 +1664,7 @@ def run_autoregressive_finetuning(
     print(f"Batch size: {batch_size} scenarios processed in parallel")
     print(f"Rollout steps: {num_rollout_steps} ({num_rollout_steps * 0.1}s horizon)")
     print(f"Sampling strategy: {sampling_strategy} (with 5-epoch warmup)")
-    print(f"Fine-tuning LR: {finetune_lr}")
+    print(f"Fine-tuning LR: {autoreg_learning_rate}")
     print(f"Epochs: {num_epochs}")
     print(f"Validation: {'Enabled' if val_loader else 'Disabled'}")
     print(f"Mixed Precision (AMP): {'DISABLED for stability' if not use_amp_finetune else 'Enabled'}")
