@@ -34,7 +34,6 @@ from torch.nn.utils import clip_grad_norm_
 import random
 from autoregressive_predictions.SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
 
-
 AUTOREG_REBUILD_EDGES = True  # when enabled, edges are recomputed at each autoregressive step based on updated positions, which captures new spatial relationships as agents move (e.g., agents coming within/out of radius) - more accurate for long rollouts where agents move significantly
 _size_mismatch_warned = False
 
@@ -69,12 +68,12 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
                     checkpoint_hidden_dim = state_dict[key].shape[-1]  # Last dimension is hidden_dim
                 else:
                     checkpoint_hidden_dim = state_dict[key].shape[0] if len(state_dict[key].shape) > 1 else state_dict[key].shape[0]
-                print(f"  ✓ Inferred GAT hidden_dim={checkpoint_hidden_dim} from key: {key}")
+                print(f"  OK: Inferred GAT hidden_dim={checkpoint_hidden_dim} from key: {key}")
                 break
         
         if checkpoint_hidden_dim is None:
             checkpoint_hidden_dim = hidden_channels
-            print(f"  ✗ Could not infer GAT hidden_dim, using config.py default: {checkpoint_hidden_dim}")
+            print(f"  ERROR: Could not infer GAT hidden_dim, using config.py default: {checkpoint_hidden_dim}")
         
         # Recreate model with saved config or use inferred architecture
         if 'config' in checkpoint:
@@ -789,9 +788,6 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     
     # Track per-agent errors for ADE/FDE computation
     train_agent_errors = []  # List of [num_agents, num_steps] arrays
-
-    # TODO: velocity smoothing or only position update?    
-
     
     base_model = model.module if is_parallel else model
     use_amp_local = scaler is not None and torch.cuda.is_available()
