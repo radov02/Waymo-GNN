@@ -76,11 +76,11 @@ max_scenario_files_for_viz = 2  # index first n tfrecord files for faster scenar
 # CURRICULUM LEARNING: Training starts with 10 steps and gradually increases
 # to max_rollout_steps over training. This helps model learn progressively.
 autoreg_num_rollout_steps = 50       # Max rollout steps (50 = 5.0s horizon) - curriculum starts at 10
-autoreg_num_epochs = 10
+autoreg_num_epochs = 20
 autoreg_sampling_strategy = 'linear'  # 'linear', 'exponential', or 'inverse_sigmoid'
 autoreg_visualize_every_n_epochs = 2
 autoreg_skip_map_features = False
-autoreg_learning_rate = 0.001        # Lower LR for finetuning stability (was 0.005)
+autoreg_learning_rate = 0.0002        # Lower LR for finetuning stability (was 0.005)
 
 
 # ============== VectorNet model ==============
