@@ -1070,12 +1070,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                             
                             if valid_mask.any():
                                 # Initialize target with zeros
-                                target = torch.zeros(len(source_indices_list), 2, device=device, dtype=pred.dtype)
+                                target = torch.zeros(source_indices_tensor.shape[0], 2, device=device, dtype=pred.dtype)
                                 # Batch gather valid targets on GPU
                                 valid_source_indices = source_indices_tensor[valid_mask]
                                 target[valid_mask] = source_gt_graph.y[valid_source_indices].to(pred.dtype)
                             else:
-                                target = torch.zeros(len(source_indices_list), 2, device=device, dtype=pred.dtype)
+                                target = torch.zeros(source_indices_tensor.shape[0], 2, device=device, dtype=pred.dtype)
                         else:
                             # Fallback: use target_graph.y directly (assumes alignment)
                             target = source_gt_graph.y[target_indices].to(pred.dtype)
