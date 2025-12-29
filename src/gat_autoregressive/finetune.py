@@ -184,9 +184,10 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=0):
     """Calculate probability of using model's own prediction vs ground truth.
     
-    Simple linear schedule: sampling_prob increases from (1/total_epochs) to 1.0.
-    For 10 epochs: 0.1, 0.2, 0.3, ..., 0.9, 1.0
-    This gives the model immediate and increasing exposure to its own predictions.
+    IMPROVED SCHEDULE: Faster exposure to autoregressive mode.
+    The model needs to learn to correct its own errors early in training,
+    not just at the end. Teacher forcing alone teaches single-step prediction
+    but not error correction.
     
     Args:
         epoch: Current epoch (0-indexed, so first epoch is epoch=0)
@@ -198,37 +199,38 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
         Probability of using model's own prediction (0 = teacher forcing, 1 = autoregressive)
     """
     
-    # Warmup: First 5 epochs use very low sampling probability (max 10%)
-    warmup_epochs = 5
+    # REDUCED warmup: Only 2 epochs of pure teacher forcing
+    # This gets the model stable, then immediately starts autoregressive exposure
+    warmup_epochs = 2
     if epoch < warmup_epochs:
-        # During warmup: 2% at epoch 0, 4% at epoch 1, ... up to 10% at epoch 4
-        return 0.02 * (epoch + 1)
+        # During warmup: 10% at epoch 0, 20% at epoch 1
+        return 0.10 * (epoch + 1)
     
-    # After warmup, apply strategy-based scheduling
+    # After warmup, apply strategy-based scheduling with FASTER ramp-up
     remaining_epochs = total_epochs - warmup_epochs
     adjusted_epoch = epoch - warmup_epochs
     progress = adjusted_epoch / max(1, remaining_epochs - 1)
     
     if strategy == 'linear':
-        # Linear from 0.10 to 1.0 after warmup
-        return 0.10 + 0.90 * progress
+        # Linear from 0.30 to 1.0 after warmup (start higher!)
+        return 0.30 + 0.70 * progress
     elif strategy == 'exponential':
-        # Exponential: MUCH slower at start, faster at end
-        # Reaches ~0.50 at halfway, ~0.90 at end
-        # Using a gentler curve: 1 - exp(-2 * progress) instead of -3
-        return 0.10 + 0.90 * (1.0 - np.exp(-2.5 * progress))
+        # Exponential with faster ramp: reaches ~0.65 at halfway, ~0.95 at end
+        return 0.30 + 0.70 * (1.0 - np.exp(-3.0 * progress))
     elif strategy == 'inverse_sigmoid':
-        # S-curve: very slow at start/end, fast in middle
-        k = 6  # Reduced from 8 for smoother transition
-        return 0.10 + 0.90 / (1 + np.exp(-k * (progress - 0.5)))
+        # S-curve: moderate at start, fast in middle, saturates at end
+        k = 6
+        return 0.30 + 0.70 / (1 + np.exp(-k * (progress - 0.5)))
     else:
-        return 0.10 + 0.90 * progress
+        return 0.30 + 0.70 * progress
 
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     """Curriculum learning: gradually increase rollout length.
     
-    Start with short rollouts (easier) and increase over training.
-    This helps the model learn to handle error accumulation gradually.
+    IMPROVED: Start with moderate rollouts and increase faster.
+    The model needs to experience trajectory divergence early to learn
+    how to correct it. Starting too short means the model never sees
+    the accumulated error problem until late in training.
     
     Args:
         epoch: Current epoch (0-indexed)
@@ -238,9 +240,16 @@ def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     Returns:
         Number of rollout steps to use this epoch
     """
-    # Start with 10 steps, linearly increase to max over training
-    min_steps = 10
-    progress = epoch / max(1, total_epochs - 1)
+    # Start with 20 steps (2 seconds) - enough to see trajectory divergence
+    # Increase faster: reach max at 60% of training, not 100%
+    min_steps = 20
+    
+    # Use 60% of epochs to reach max, then maintain max for remaining 40%
+    ramp_epochs = int(total_epochs * 0.6)
+    if epoch >= ramp_epochs:
+        return max_rollout_steps
+    
+    progress = epoch / max(1, ramp_epochs - 1)
     steps = int(min_steps + (max_rollout_steps - min_steps) * progress)
     return min(steps, max_rollout_steps)
 
@@ -1178,36 +1187,51 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                                             break
                     
                     if traj_errors:
-                        # Mean trajectory error, scaled to be comparable to displacement loss
-                        # Apply sqrt to reduce the magnitude of large errors (smoother gradient)
-                        # and add step-based weight to emphasize longer-term accuracy
-                        step_weight = 1.0 + 0.05 * step  # Gradually increase weight for later steps
-                        trajectory_loss = step_weight * torch.sqrt(torch.stack(traj_errors).mean() + 1e-6) / POSITION_SCALE
+                        # Mean trajectory error - DIRECT position error in meters
+                        # Use linear scaling (not sqrt) to maintain strong gradient for large errors
+                        # This forces the model to care about trajectory drift from the very first step
+                        # 
+                        # Key insight: sqrt was dampening the gradient for large errors, but we WANT
+                        # strong gradients when trajectory diverges significantly
+                        traj_error_tensor = torch.stack(traj_errors)
+                        # Use Huber-like formulation: linear for small errors, sqrt for very large
+                        # This prevents gradient explosion while maintaining strong signal
+                        trajectory_loss = torch.where(
+                            traj_error_tensor < 5.0,  # Under 5 meters: linear penalty
+                            traj_error_tensor / POSITION_SCALE,
+                            (torch.sqrt(traj_error_tensor) + 2.76) / POSITION_SCALE  # sqrt(5) + 5 - sqrt(5) = smooth transition
+                        ).mean()
             
-            # Combined displacement loss - PRIORITIZE TRAJECTORY ACCURACY
-            # The model must learn that small displacement errors compound into large trajectory errors.
+            # IMPROVED LOSS FUNCTION - Focus on trajectory following
             # 
-            # Loss components and weights:
-            # - trajectory_loss (0.35): CRITICAL - penalizes accumulated position error with gradients
-            #   This is the most important loss for autoregressive prediction
-            # - huber_loss (0.15): Robust displacement loss (L1-like for outliers)
-            # - mse_loss (0.10): Standard displacement loss
-            # - cosine_loss (0.15): Direction alignment
-            # - angle_loss (0.15): Explicit angle penalty
-            # - magnitude_loss (0.05): Displacement magnitude
-            # - heading_loss (0.05): Alignment with agent heading
+            # Key insight from visualizations: predictions diverge in both direction AND magnitude.
+            # The model needs stronger direct supervision on:
+            # 1. The actual displacement vector (where to go)
+            # 2. Accumulated position error (trajectory drift)
             #
-            # Higher trajectory loss weight forces model to consider downstream effects of predictions
-            disp_loss = 0.15 * huber_loss + 0.10 * mse_loss + 0.15 * cosine_loss + 0.05 * magnitude_loss + 0.15 * angle_loss + 0.05 * heading_loss + 0.35 * trajectory_loss
+            # SIMPLIFIED loss with 4 focused components:
+            # - huber_loss (0.30): Robust displacement loss - primary supervision signal
+            # - cosine_loss (0.25): Direction alignment - fixes direction issues
+            # - magnitude_loss (0.15): Displacement magnitude - fixes magnitude issues
+            # - trajectory_loss (0.30): Accumulated position error - prevents drift
+            #
+            # REMOVED: heading_loss (counterproductive - prevents learning turns)
+            # REMOVED: angle_loss (redundant with cosine_loss)
+            # REMOVED: mse_loss (redundant with huber_loss)
+            
+            disp_loss = 0.30 * huber_loss + 0.25 * cosine_loss + 0.15 * magnitude_loss + 0.30 * trajectory_loss
             
             # Final NaN check
             if torch.isnan(disp_loss):
                 print(f"  [ERROR] NaN in loss computation at step {step}! Skipping.")
                 continue
             
-            # Temporal discount for autoregressive stability
-            discount = 0.97 ** step
-            step_loss = disp_loss * discount
+            # INVERTED temporal weighting: later steps get MORE weight, not less!
+            # Error accumulates over time, so we need to pay more attention to later steps
+            # where trajectory divergence is most severe.
+            # Weight increases from 1.0 at step 0 to 1.5 at max steps
+            step_weight = 1.0 + 0.5 * (step / max(1, effective_rollout - 1))
+            step_loss = disp_loss * step_weight
             
             if rollout_loss is None:
                 rollout_loss = step_loss
@@ -2263,9 +2287,10 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_vy = displacement_meters[:, 1] / dt  # m/s
     
     # Velocity smoothing: blend predicted velocity with previous to prevent jumps
-    # REDUCED from 0.7 to 0.3 - model needs to be able to represent turns and accelerations
-    # Higher smoothing (0.7) was preventing learning of trajectory changes
-    velocity_smoothing = 0.3  # 30% previous, 70% predicted - allows sharper turns
+    # FURTHER REDUCED from 0.3 to 0.1 - allow model to fully express trajectory changes
+    # The model must be able to represent turns, lane changes, and accelerations
+    # Too much smoothing was preventing learning of trajectory changes!
+    velocity_smoothing = 0.1  # 10% previous, 90% predicted - near-zero smoothing
     if hasattr(updated_graph, 'x') and updated_graph.x is not None:
         prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
         prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
@@ -2283,12 +2308,14 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_speed = torch.sqrt(pred_vx[:num_nodes]**2 + pred_vy[:num_nodes]**2)
     new_features[:, 2] = pred_speed / MAX_SPEED
     
-    # [3] Heading direction (normalized) - blend with previous heading for stability
+    # [3] Heading direction (normalized) - directly from velocity, minimal smoothing
+    # The heading should accurately reflect the predicted direction of travel
+    # Too much smoothing here prevented the model from learning turns!
     pred_heading = torch.atan2(pred_vy[:num_nodes], pred_vx[:num_nodes]) / np.pi  # [-1, 1]
     if hasattr(updated_graph, 'x') and updated_graph.x is not None:
         prev_heading = updated_graph.x[:num_nodes, 3]
-        # Smooth heading - 20% previous to prevent jumpy orientation
-        heading_smoothing = 0.2
+        # REDUCED heading smoothing from 0.2 to 0.05 - almost direct heading update
+        heading_smoothing = 0.05
         # Handle wraparound at +/- pi
         heading_diff = pred_heading - prev_heading
         heading_diff = torch.where(heading_diff > 1, heading_diff - 2, heading_diff)
