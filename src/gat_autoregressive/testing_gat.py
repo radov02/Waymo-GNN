@@ -1,13 +1,16 @@
-"""Testing script for GAT-based autoregressive trajectory prediction.
+"""Testing script for GNN-based autoregressive trajectory prediction.
 
-This module evaluates trained GAT models using autoregressive multi-step prediction
+This module evaluates trained GCN/GAT models using autoregressive multi-step prediction
 on the validation set (or test set), logs metrics to wandb, and creates visualizations.
+
+Supports both GAT and GCN model types via the model_type parameter.
 
 Uses validation dataset by default (90 timesteps) since test dataset may have shorter
 sequences that don't support proper 5-second rollouts.
 
 Usage:
     python src/gat_autoregressive/testing_gat.py
+    python src/gat_autoregressive/testing_gat.py --model_type gcn
     python src/gat_autoregressive/testing_gat.py --checkpoint path/to/model.pt
     python src/gat_autoregressive/testing_gat.py --max_scenarios 50 --no_wandb
     python src/gat_autoregressive/testing_gat.py --test_data path/to/test.hdf5
@@ -18,6 +21,7 @@ import os
 import argparse
 from datetime import datetime
 import json
+import glob
 
 # Add parent directory (src/) to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,14 +34,19 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import wandb
+
+# Import both model types
 from gat_autoregressive.SpatioTemporalGAT_batched import SpatioTemporalGATBatched
+from autoregressive_predictions.SpatioTemporalGNN_batched import SpatioTemporalGNNBatched
+
 from dataset import HDF5ScenarioDataset
-from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
+from config import (device, batch_size, gat_num_workers, gcn_num_workers, num_layers, num_gru_layers,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, gat_num_heads, project_name, print_gpu_info,
                     num_gpus, use_data_parallel, setup_model_parallel, load_model_state,
                     use_gradient_checkpointing, POSITION_SCALE,
                     gat_checkpoint_dir, gat_checkpoint_dir_autoreg, gat_viz_dir_testing,
+                    gcn_checkpoint_dir, gcn_checkpoint_dir_autoreg, gcn_viz_dir_testing,
                     test_hdf5_path, test_num_rollout_steps, test_max_scenarios,
                     test_visualize, test_visualize_max, test_use_wandb, test_horizons,
                     autoreg_skip_map_features, max_scenario_files_for_viz, use_edge_weights)
@@ -57,33 +66,88 @@ from gat_autoregressive.finetune import (update_graph_with_prediction,
                                           filter_to_scenario)
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing_gat.py
+# PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing_gat.py --model_type gcn
 
-def load_trained_model(checkpoint_path, device):
-    """Load a trained GAT model from checkpoint."""
+
+def get_model_config(model_type):
+    """Get model-specific configuration based on model type.
+    
+    Args:
+        model_type: Either 'gat' or 'gcn'
+        
+    Returns:
+        dict with checkpoint_dir, checkpoint_dir_autoreg, viz_dir_testing, num_workers
+    """
+    if model_type == 'gat':
+        return {
+            'checkpoint_dir': gat_checkpoint_dir,
+            'checkpoint_dir_autoreg': gat_checkpoint_dir_autoreg,
+            'viz_dir_testing': gat_viz_dir_testing,
+            'num_workers': gat_num_workers,
+            'legacy_checkpoint_names': ['best_autoregressive_20step.pt', 'best_autoregressive_50step.pt'],
+            'autoreg_pattern': 'best_gat_autoreg_*.pt',
+        }
+    else:  # gcn
+        return {
+            'checkpoint_dir': gcn_checkpoint_dir,
+            'checkpoint_dir_autoreg': gcn_checkpoint_dir_autoreg,
+            'viz_dir_testing': gcn_viz_dir_testing,
+            'num_workers': gcn_num_workers,
+            'legacy_checkpoint_names': ['finetuned_scheduled_sampling_best.pt'],
+            'autoreg_pattern': 'best_gcn_autoreg_*.pt',
+        }
+
+
+def load_trained_model(checkpoint_path, device, model_type='gat'):
+    """Load a trained GAT or GCN model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        device: Device to load model on
+        model_type: Either 'gat' or 'gcn'
+        
+    Returns:
+        (model, checkpoint) tuple
+    """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
-    print(f"Loading GAT model from {checkpoint_path}...")
+    model_name = model_type.upper()
+    print(f"Loading {model_name} model from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     config = checkpoint.get('config', {})
-    model = SpatioTemporalGATBatched(
-        input_dim=config.get('input_dim', input_dim),
-        hidden_dim=config.get('hidden_channels', hidden_channels),
-        output_dim=config.get('output_dim', output_dim),
-        num_gat_layers=config.get('num_layers', num_layers),
-        num_gru_layers=config.get('num_gru_layers', num_gru_layers),
-        dropout=config.get('dropout', dropout),
-        num_heads=config.get('num_heads', gat_num_heads),
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        max_agents_per_scenario=128
-    )
+    
+    if model_type == 'gat':
+        model = SpatioTemporalGATBatched(
+            input_dim=config.get('input_dim', input_dim),
+            hidden_dim=config.get('hidden_channels', hidden_channels),
+            output_dim=config.get('output_dim', output_dim),
+            num_gat_layers=config.get('num_layers', num_layers),
+            num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+            dropout=config.get('dropout', dropout),
+            num_heads=config.get('num_heads', gat_num_heads),
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            max_agents_per_scenario=128
+        )
+    else:  # gcn
+        model = SpatioTemporalGNNBatched(
+            input_dim=config.get('input_dim', input_dim),
+            hidden_dim=config.get('hidden_channels', hidden_channels),
+            output_dim=config.get('output_dim', output_dim),
+            num_gcn_layers=config.get('num_layers', num_layers),
+            num_gru_layers=config.get('num_gru_layers', num_gru_layers),
+            dropout=config.get('dropout', dropout),
+            use_gat=config.get('use_gat', False),
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            max_agents_per_scenario=128
+        )
     
     model, is_parallel = setup_model_parallel(model, device)
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     model.eval()
     
-    print(f" GAT Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
+    print(f"  {model_name} Model loaded from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_loss' in checkpoint:
         print(f"  Validation loss: {checkpoint['val_loss']:.6f}")
     if 'train_loss' in checkpoint:
@@ -149,9 +213,19 @@ def autoregressive_rollout(model, initial_graph, num_steps, device, batch_size=1
     return all_predictions, updated_graphs
 
 
-def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_scenarios=None):
-    """Evaluate GAT model using autoregressive rollout on test set."""
+def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_scenarios=None, model_type='gat'):
+    """Evaluate model using autoregressive rollout on test set.
+    
+    Args:
+        model: The trained model (GAT or GCN)
+        dataloader: DataLoader for test/validation data
+        num_rollout_steps: Number of autoregressive rollout steps
+        device: Device to run on
+        max_scenarios: Maximum number of scenarios to evaluate
+        model_type: Either 'gat' or 'gcn' (for logging)
+    """
     model.eval()
+    model_name = model_type.upper()
     
     # Use horizons from config, capped at rollout steps
     horizons = [h for h in test_horizons if h <= num_rollout_steps]
@@ -162,7 +236,7 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
     all_scenario_results = []
     scenario_count = 0
     
-    print(f"\nEvaluating GAT with {num_rollout_steps}-step autoregressive rollout...")
+    print(f"\nEvaluating {model_name} with {num_rollout_steps}-step autoregressive rollout...")
     print(f"Horizons: {[f'{h*0.1}s' for h in horizons]}")
     
     with torch.no_grad():
@@ -287,7 +361,7 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             scenario_count += 1
     
     print("\n" + "="*70)
-    print("GAT TEST RESULTS")
+    print(f"{model_name} TEST RESULTS")
     print("="*70)
     
     results = {
@@ -609,8 +683,9 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
                 max_scenarios=None,
                 visualize=True,
                 visualize_max=10,
-                use_wandb=True):
-    """Run testing with autoregressive multi-step prediction using GAT model.
+                use_wandb=True,
+                model_type='gat'):
+    """Run testing with autoregressive multi-step prediction using GAT or GCN model.
     
     Args:
         test_dataset_path: Path to test HDF5 file
@@ -620,9 +695,13 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
         visualize: Whether to generate visualizations
         visualize_max: Maximum scenarios to visualize
         use_wandb: Whether to log results to wandb
+        model_type: Either 'gat' or 'gcn'
     """
+    model_name = model_type.upper()
+    model_config = get_model_config(model_type)
+    
     print("\n" + "="*70)
-    print("GAT MODEL TESTING - Autoregressive Multi-Step Prediction")
+    print(f"{model_name} MODEL TESTING - Autoregressive Multi-Step Prediction")
     print("="*70)
     
     # Print GPU info
@@ -633,62 +712,67 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
         wandb.login()
         run = wandb.init(
             project=project_name,
-            name=f"gat-testing-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=f"{model_type}-testing-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             config={
-                "model_type": "gat",
+                "model_type": model_type,
                 "task": "testing",
                 "num_rollout_steps": num_rollout_steps,
                 "max_scenarios": max_scenarios,
                 "test_dataset": test_dataset_path,
             },
-            tags=["gat", "testing", "autoregressive"]
+            tags=[model_type, "testing", "autoregressive"]
         )
     
     # Use autoregressive checkpoint by default
     if checkpoint_path is None:
+        checkpoint_dir_autoreg = model_config['checkpoint_dir_autoreg']
+        checkpoint_dir = model_config['checkpoint_dir']
+        autoreg_pattern_name = model_config['autoreg_pattern']
+        legacy_names = model_config['legacy_checkpoint_names']
+        
         # Try autoregressive checkpoint first with new naming pattern, then legacy names
-        # New pattern: best_gat_autoreg_{steps}step_B{batch}_{strategy}_E{epochs}.pt
-        import glob
-        autoreg_pattern = os.path.join(gat_checkpoint_dir_autoreg, 'best_gat_autoreg_*.pt')
+        autoreg_pattern = os.path.join(checkpoint_dir_autoreg, autoreg_pattern_name)
         autoreg_matches = glob.glob(autoreg_pattern)
         
-        # Legacy paths
-        legacy_path = os.path.join(gat_checkpoint_dir_autoreg, 'best_autoregressive_20step.pt')
-        root_autoreg_path = os.path.join('checkpoints', 'best_autoregressive_20step.pt')
-        root_autoreg_50step = os.path.join('checkpoints', 'best_autoregressive_50step.pt')
-        base_path = os.path.join(gat_checkpoint_dir, 'best_model.pt')
-        root_base_path = os.path.join('checkpoints', 'gat', 'best_model.pt')
+        # Build legacy paths
+        legacy_paths = [os.path.join(checkpoint_dir_autoreg, name) for name in legacy_names]
+        legacy_paths += [os.path.join('checkpoints', name) for name in legacy_names]
+        
+        base_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        root_base_path = os.path.join('checkpoints', model_type, 'best_model.pt')
         
         if autoreg_matches:
             # Use most recent autoregressive checkpoint
             checkpoint_path = max(autoreg_matches, key=os.path.getmtime)
-            print(f"Using GAT autoregressive checkpoint: {checkpoint_path}")
-        elif os.path.exists(legacy_path):
-            checkpoint_path = legacy_path
-            print(f"Using legacy GAT autoregressive checkpoint: {legacy_path}")
-        elif os.path.exists(root_autoreg_50step):
-            checkpoint_path = root_autoreg_50step
-            print(f"Using GAT autoregressive checkpoint: {root_autoreg_50step}")
-        elif os.path.exists(root_autoreg_path):
-            checkpoint_path = root_autoreg_path
-            print(f"Using GAT autoregressive checkpoint: {root_autoreg_path}")
-        elif os.path.exists(base_path):
-            checkpoint_path = base_path
-            print(f"Using GAT base single-step checkpoint: {base_path}")
-        elif os.path.exists(root_base_path):
-            checkpoint_path = root_base_path
-            print(f"Using GAT base single-step checkpoint: {root_base_path}")
+            print(f"Using {model_name} autoregressive checkpoint: {checkpoint_path}")
         else:
-            print(f"ERROR: No GAT checkpoint found!")
-            print(f"  Checked pattern: {autoreg_pattern}")
-            print(f"  Checked: {legacy_path}")
-            print(f"  Checked: {base_path}")
-            if use_wandb:
-                wandb.finish(exit_code=1)
-            return None
+            # Try legacy paths
+            found_legacy = False
+            for legacy_path in legacy_paths:
+                if os.path.exists(legacy_path):
+                    checkpoint_path = legacy_path
+                    print(f"Using {model_name} legacy checkpoint: {legacy_path}")
+                    found_legacy = True
+                    break
+            
+            if not found_legacy:
+                if os.path.exists(base_path):
+                    checkpoint_path = base_path
+                    print(f"Using {model_name} base single-step checkpoint: {base_path}")
+                elif os.path.exists(root_base_path):
+                    checkpoint_path = root_base_path
+                    print(f"Using {model_name} base single-step checkpoint: {root_base_path}")
+                else:
+                    print(f"ERROR: No {model_name} checkpoint found!")
+                    print(f"  Checked pattern: {autoreg_pattern}")
+                    print(f"  Checked legacy: {legacy_paths}")
+                    print(f"  Checked base: {base_path}")
+                    if use_wandb:
+                        wandb.finish(exit_code=1)
+                    return None
     
     # Load model
-    model, checkpoint = load_trained_model(checkpoint_path, device)
+    model, checkpoint = load_trained_model(checkpoint_path, device, model_type=model_type)
     
     if use_wandb:
         wandb.config.update({"checkpoint_path": checkpoint_path})
@@ -705,18 +789,21 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
     dataset_type = "validation" if "validation" in test_dataset_path else "test"
     print(f"Loaded {dataset_type} dataset: {len(test_dataset)} scenarios (seq_len={sequence_length})")
     
+    num_workers = model_config['num_workers']
+    viz_dir_testing = model_config['viz_dir_testing']
+    
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=gat_num_workers,
+        num_workers=num_workers,
         collate_fn=collate_graph_sequences_to_batch,
         drop_last=False
     )
     
     effective_rollout = min(num_rollout_steps, sequence_length - 2)
     
-    print(f"\nGAT Test Configuration:")
+    print(f"\n{model_name} Test Configuration:")
     print(f"  Device: {device}")
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Rollout steps: {effective_rollout} ({effective_rollout * 0.1:.1f}s)")
@@ -724,7 +811,7 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
     print(f"  W&B logging: {use_wandb}")
     
     # Create visualization directory
-    os.makedirs(gat_viz_dir_testing, exist_ok=True)
+    os.makedirs(viz_dir_testing, exist_ok=True)
     
     # Run evaluation with visualization using finetuning's visualization function
     # This ensures consistent visualization with proper trajectory tracking
@@ -747,9 +834,9 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
                 num_rollout_steps=effective_rollout,
                 device=device,
                 is_parallel=is_parallel,
-                save_dir=gat_viz_dir_testing,
+                save_dir=viz_dir_testing,
                 total_epochs=1,
-                model_type="gat"
+                model_type=model_type
             )
             
             if final_error is not None:
@@ -760,8 +847,7 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
                     scenario_ids = batch_dict.get("scenario_ids", [])
                     scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{batch_idx}"
                     # Find the most recent visualization file
-                    import glob
-                    pattern = os.path.join(gat_viz_dir_testing, f'gat_autoreg_epoch001_{scenario_id}_*.png')
+                    pattern = os.path.join(viz_dir_testing, f'{model_type}_autoreg_epoch001_{scenario_id}_*.png')
                     matches = glob.glob(pattern)
                     if matches:
                         latest_viz = max(matches, key=os.path.getmtime)
@@ -770,14 +856,14 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
         if viz_count > 0:
             print(f"\nVisualization Summary:")
             print(f"  Scenarios visualized: {viz_count}")
-            print(f"  Saved to: {gat_viz_dir_testing}")
+            print(f"  Saved to: {viz_dir_testing}")
             
             if use_wandb and viz_images:
                 wandb.log({"test_visualizations": viz_images})
     
     # Run full evaluation
     results = evaluate_autoregressive(
-        model, test_dataloader, effective_rollout, device, max_scenarios
+        model, test_dataloader, effective_rollout, device, max_scenarios, model_type=model_type
     )
     
     # Log results to wandb
@@ -803,21 +889,25 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
             wandb.run.summary["final_fde_2s"] = results['horizons']['2.0s']['fde_mean']
     
     # Save results
-    results_path = os.path.join(gat_checkpoint_dir, 'gat_test_results.pt')
-    os.makedirs(gat_checkpoint_dir, exist_ok=True)
+    checkpoint_dir = model_config['checkpoint_dir']
+    checkpoint_dir_autoreg = model_config['checkpoint_dir_autoreg']
+    
+    results_path = os.path.join(checkpoint_dir, f'{model_type}_test_results.pt')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir_autoreg, exist_ok=True)
     torch.save(results, results_path)
     print(f"Results saved to {results_path}")
     
     # Also save as JSON for easy reading
     json_results = {
-        'model_type': 'gat',
+        'model_type': model_type,
         'checkpoint': checkpoint_path,
         'test_dataset': test_dataset_path,
         'num_scenarios': len(results.get('scenarios', [])),
         'horizons': results.get('horizons', {}),
         'timestamp': datetime.now().isoformat()
     }
-    json_path = os.path.join(gat_checkpoint_dir_autoreg, 'gat_test_results.json')
+    json_path = os.path.join(checkpoint_dir_autoreg, f'{model_type}_test_results.json')
     with open(json_path, 'w') as f:
         json.dump(json_results, f, indent=2)
     print(f"JSON results saved to {json_path}")
@@ -830,7 +920,9 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='GAT Model Testing')
+    parser = argparse.ArgumentParser(description='GNN Model Testing (GAT/GCN)')
+    parser.add_argument('--model_type', type=str, default='gat', choices=['gat', 'gcn'],
+                        help='Model type: gat or gcn (default: gat)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint (default: auto-detect)')
     parser.add_argument('--test_data', type=str, default=val_hdf5_path,  # Use validation dataset by default (90 timesteps)
@@ -855,7 +947,8 @@ def main():
         max_scenarios=args.max_scenarios,
         visualize=not args.no_visualize,
         visualize_max=args.visualize_max,
-        use_wandb=not args.no_wandb
+        use_wandb=not args.no_wandb,
+        model_type=args.model_type
     )
     
     return results
