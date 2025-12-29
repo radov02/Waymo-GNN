@@ -823,6 +823,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_loss = 0.0
     total_mse = 0.0
     total_cosine = 0.0
+    total_magnitude_ratio = 0.0  # Track magnitude ratio loss
+    total_overshoot = 0.0  # Track overshoot penalty
+    total_trajectory = 0.0  # Track trajectory loss
     steps = 0
     count = 0
     
@@ -1168,6 +1171,24 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
             angle_loss = (angle_diff ** 2).mean()
             
+            # MAGNITUDE RATIO LOSS: Penalize when predicted magnitude differs from GT magnitude
+            # This is critical for preventing overshoot/undershoot issues seen in visualizations
+            # Use log ratio to make it symmetric and scale-invariant
+            eps = 1e-6
+            magnitude_ratio = (pred_magnitude + eps) / (target_magnitude + eps)
+            # Log ratio: log(pred/target) = 0 when perfect, positive when overshoot, negative when undershoot
+            log_ratio = torch.log(magnitude_ratio + eps)
+            magnitude_ratio_loss = (log_ratio ** 2).mean()
+            
+            # OVERSHOOT PENALTY: Extra penalty when prediction magnitude exceeds GT magnitude
+            # This is asymmetric because overshooting causes more visible trajectory divergence
+            overshoot_mask = pred_magnitude > target_magnitude
+            if overshoot_mask.any():
+                overshoot_amount = (pred_magnitude[overshoot_mask] - target_magnitude[overshoot_mask])
+                overshoot_penalty = (overshoot_amount ** 2).mean()
+            else:
+                overshoot_penalty = torch.tensor(0.0, device=pred.device)
+            
             # TRAJECTORY LOSS: Penalize accumulated position error (with gradients!)
             # This teaches the model that small angle errors compound into large trajectory errors
             # CRITICAL: This loss must be applied from step 0 to get gradient flow through ALL predictions
@@ -1255,32 +1276,39 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         # Key insight: sqrt was dampening the gradient for large errors, but we WANT
                         # strong gradients when trajectory diverges significantly
                         traj_error_tensor = torch.stack(traj_errors)
-                        # Use Huber-like formulation: linear for small errors, sqrt for very large
-                        # This prevents gradient explosion while maintaining strong signal
-                        trajectory_loss = torch.where(
-                            traj_error_tensor < 5.0,  # Under 5 meters: linear penalty
-                            traj_error_tensor / POSITION_SCALE,
-                            (torch.sqrt(traj_error_tensor) + 2.76) / POSITION_SCALE  # sqrt(5) + 5 - sqrt(5) = smooth transition
-                        ).mean()
+                        # IMPROVED: Direct L2 loss on position error, normalized by POSITION_SCALE
+                        # No sqrt dampening - we WANT strong gradients for large trajectory errors
+                        # This is the most important loss for trajectory following
+                        trajectory_loss = (traj_error_tensor / POSITION_SCALE).mean()
             
-            # IMPROVED LOSS FUNCTION - Focus on trajectory following
+            # ========== IMPROVED LOSS FUNCTION v2 - Magnitude Control & Trajectory Focus ==========
             # 
-            # Key insight from visualizations: predictions diverge in both direction AND magnitude.
-            # The model needs stronger direct supervision on:
-            # 1. The actual displacement vector (where to go)
-            # 2. Accumulated position error (trajectory drift)
+            # KEY INSIGHT from visualizations (Epoch 1 & 5):
+            # - Predictions have correct general direction but WRONG MAGNITUDE
+            # - Agents are predicted to move too far (overshoot) or in slightly wrong directions
+            # - This causes trajectory drift that accumulates over 50 steps
             #
-            # SIMPLIFIED loss with 4 focused components:
-            # - huber_loss (0.30): Robust displacement loss - primary supervision signal
-            # - cosine_loss (0.25): Direction alignment - fixes direction issues
-            # - magnitude_loss (0.15): Displacement magnitude - fixes magnitude issues
-            # - trajectory_loss (0.30): Accumulated position error - prevents drift
+            # SOLUTION: Increase weight on magnitude-related losses and add explicit overshoot penalty
             #
-            # REMOVED: heading_loss (counterproductive - prevents learning turns)
-            # REMOVED: angle_loss (redundant with cosine_loss)
-            # REMOVED: mse_loss (redundant with huber_loss)
+            # Loss components:
+            # - huber_loss (0.20): Robust displacement loss - reduced to give room for specialized losses
+            # - cosine_loss (0.15): Direction alignment - kept for direction accuracy
+            # - magnitude_loss (0.15): Displacement magnitude MSE
+            # - magnitude_ratio_loss (0.15): NEW - log-ratio penalty for scale errors
+            # - overshoot_penalty (0.10): NEW - asymmetric penalty for overshooting
+            # - trajectory_loss (0.25): Accumulated position error - critical for long rollouts
+            #
+            # Total magnitude-related: 0.40 (was 0.15)
+            # Total trajectory-related: 0.25 (was 0.30)
+            # Total direction-related: 0.15 (was 0.25)
+            # Total displacement: 0.20 (was 0.30)
             
-            disp_loss = 0.30 * huber_loss + 0.25 * cosine_loss + 0.15 * magnitude_loss + 0.30 * trajectory_loss
+            disp_loss = (0.20 * huber_loss + 
+                        0.15 * cosine_loss + 
+                        0.15 * magnitude_loss + 
+                        0.15 * magnitude_ratio_loss +
+                        0.10 * overshoot_penalty +
+                        0.25 * trajectory_loss)
             
             # Final NaN check
             if torch.isnan(disp_loss):
@@ -1302,6 +1330,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             with torch.no_grad():
                 total_mse += mse_loss.item()
                 total_cosine += cos_sim.mean().item()
+                total_magnitude_ratio += magnitude_ratio_loss.item()
+                total_overshoot += overshoot_penalty.item() if isinstance(overshoot_penalty, torch.Tensor) else overshoot_penalty
+                total_trajectory += trajectory_loss.item() if isinstance(trajectory_loss, torch.Tensor) else trajectory_loss
                 count += 1
                 
                 # Track per-agent POSITION errors for ADE/FDE computation (not displacement errors!)
@@ -1485,6 +1516,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     final_rmse = (final_mse ** 0.5) * 100.0
     final_loss = total_loss / max(1, steps)
     final_cosine = total_cosine / max(1, count)
+    final_magnitude_ratio = total_magnitude_ratio / max(1, count)
+    final_overshoot = total_overshoot / max(1, count)
+    final_trajectory = total_trajectory / max(1, count)
     
     # Compute ADE and FDE from accumulated agent errors
     train_ade = 0.0
@@ -1503,6 +1537,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     
     print(f"\n[TRAIN EPOCH SUMMARY]")
     print(f"  Loss: {final_loss:.6f} | Avg per-step MSE: {final_mse:.6f} | Avg per-step RMSE: {final_rmse:.2f}m | CosSim: {final_cosine:.4f}")
+    print(f"  Magnitude Losses: ratio_loss={final_magnitude_ratio:.6f} | overshoot={final_overshoot:.6f} | trajectory={final_trajectory:.6f}")
     print(f"  ADE: {train_ade:.2f}m | FDE: {train_fde:.2f}m (across {total_train_agents} agent rollouts)")
     print(f"  Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
@@ -1513,6 +1548,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         'loss': final_loss,
         'mse': final_mse,
         'cosine_sim': final_cosine,
+        'magnitude_ratio_loss': final_magnitude_ratio,
+        'overshoot_loss': final_overshoot,
+        'trajectory_loss': final_trajectory,
         'ade': train_ade,
         'fde': train_fde
     }
