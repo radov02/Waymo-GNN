@@ -1,12 +1,16 @@
 """Testing script for GCN-based autoregressive trajectory prediction.
 
 This module evaluates trained GCN models using autoregressive multi-step prediction
-on the test set, logs metrics to wandb, and creates visualizations.
+on the validation set (or test set), logs metrics to wandb, and creates visualizations.
+
+Uses validation dataset by default (90 timesteps) since test dataset may have shorter
+sequences that don't support proper 5-second rollouts.
 
 Usage:
     python src/autoregressive_predictions/testing.py
     python src/autoregressive_predictions/testing.py --checkpoint path/to/model.pt
     python src/autoregressive_predictions/testing.py --max_scenarios 50 --no_wandb
+    python src/autoregressive_predictions/testing.py --test_data path/to/test.hdf5
 """
 
 import sys
@@ -43,6 +47,12 @@ from helper_functions.helpers import compute_metrics
 from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features,
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 import matplotlib.pyplot as plt
+
+# Validation dataset path (longer sequences for proper testing)
+val_hdf5_path = f'data/graphs/validation/validation_seqlen{sequence_length}.hdf5'
+
+# Import visualization function from GAT finetuning for consistency
+from gat_autoregressive.finetune import visualize_autoregressive_rollout, filter_to_scenario
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/autoregressive_predictions/testing.py
 
@@ -204,36 +214,41 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             num_nodes = batched_graph_sequence[0].num_nodes
             model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
             
-            # Warm-up: process first half of sequence to initialize GRU states
-            warmup_steps = T // 2
-            print(f"Scenario {scenario_count+1} ({scenario_ids[0] if scenario_ids else 'unknown'}): "
-                  f"Warming up with {warmup_steps} steps, then rolling out {num_rollout_steps} steps...")
+            # Use T//3 for warmup to match GAT finetuning validation approach
+            warmup_steps = T // 3
+            actual_rollout = min(num_rollout_steps, T - warmup_steps - 1)
             
+            if actual_rollout <= 0:
+                print(f"  Skipping scenario {scenario_count+1}: not enough timesteps (T={T}, need at least {warmup_steps + 2})")
+                continue
+            
+            print(f"Scenario {scenario_count+1} ({scenario_ids[0] if scenario_ids else 'unknown'}): "
+                  f"T={T}, warmup={warmup_steps} steps, rollout={actual_rollout} steps ({actual_rollout * 0.1:.1f}s)")
+            
+            # WARM UP GRU: Run through timesteps 0 to warmup_steps to build temporal context
             for t in range(warmup_steps):
                 graph = batched_graph_sequence[t]
                 _ = predict_single_step(model, graph, device, use_edge_weights)
             
-            # Start autoregressive rollout from warmup_steps
-            if warmup_steps + num_rollout_steps > T:
-                num_rollout_steps = T - warmup_steps - 1
-            
-            if num_rollout_steps <= 0:
-                print(f"  Skipping: not enough timesteps for rollout")
-                continue
-            
+            # Start rollout from warmup_steps (after warmup)
             initial_graph = batched_graph_sequence[warmup_steps]
             predictions, _ = autoregressive_rollout(
-                model, initial_graph, num_rollout_steps, device, use_edge_weights
+                model, initial_graph, actual_rollout, device, use_edge_weights
             )
             
-            # Collect ground truth
+            # Collect ground truth displacements for comparison
             ground_truths = []
-            for step in range(1, num_rollout_steps + 1):
+            for step in range(1, actual_rollout + 1):
                 if warmup_steps + step < T:
                     gt_graph = batched_graph_sequence[warmup_steps + step]
                     ground_truths.append(gt_graph.y.cpu())
                 else:
                     break
+            
+            # Debug: Check if we have enough rollout steps
+            if len(predictions) < min(horizons):
+                print(f"  WARNING: Only {len(predictions)} predictions (need {min(horizons)} for shortest horizon)")
+                print(f"           T={T}, warmup_steps={warmup_steps}, actual_rollout={actual_rollout}")
             
             # Compute metrics at different horizons
             scenario_metrics = {}
@@ -481,7 +496,7 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     return avg_error
 
 
-def run_testing(test_dataset_path=test_hdf5_path,
+def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 90 timesteps vs test's 9)
                 checkpoint_path=None,
                 num_rollout_steps=20,
                 max_scenarios=None,
@@ -567,7 +582,8 @@ def run_testing(test_dataset_path=test_hdf5_path,
     
     # Determine sequence length from dataset
     test_dataset = HDF5ScenarioDataset(test_dataset_path, seq_len=sequence_length)
-    print(f"Loaded test dataset: {len(test_dataset)} scenarios")
+    dataset_type = "validation" if "validation" in test_dataset_path else "test"
+    print(f"Loaded {dataset_type} dataset: {len(test_dataset)} scenarios (seq_len={sequence_length})")
     
     test_dataloader = DataLoader(
         test_dataset,
@@ -592,34 +608,50 @@ def run_testing(test_dataset_path=test_hdf5_path,
     # Create visualization directory
     os.makedirs(gcn_viz_dir_testing, exist_ok=True)
     
-    # Run evaluation with visualization
+    # Run evaluation with visualization using GAT finetuning's visualization function
+    # This ensures consistent visualization with proper trajectory tracking
     viz_images = []
+    is_parallel = hasattr(model, 'module')
+    
     if visualize:
-        print(f"\nGenerating visualizations (max {visualize_max} scenarios)...")
+        print(f"\nGenerating visualizations using finetuning's visualization (max {visualize_max} scenarios)...")
         viz_count = 0
-        total_ade = 0
         
         for batch_idx, batch_dict in enumerate(test_dataloader):
             if viz_count >= visualize_max:
                 break
             
-            ade = visualize_test_scenario(model, batch_dict, batch_idx, gcn_viz_dir_testing, device)
-            if ade is not None:
-                total_ade += ade
+            # Use GAT finetuning's visualization function for proper trajectory tracking
+            final_error = visualize_autoregressive_rollout(
+                model=model,
+                batch_dict=batch_dict,
+                epoch=0,  # Treat as epoch 0 for naming
+                num_rollout_steps=effective_rollout,
+                device=device,
+                is_parallel=is_parallel,
+                save_dir=gcn_viz_dir_testing,
+                total_epochs=1,
+                model_type="gcn"
+            )
+            
+            if final_error is not None:
                 viz_count += 1
                 
                 # Log visualization to wandb
                 if use_wandb:
                     scenario_ids = batch_dict.get("scenario_ids", [])
                     scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{batch_idx}"
-                    save_path = os.path.join(gcn_viz_dir_testing, f'gcn_test_scenario_{batch_idx:04d}_{scenario_id}.png')
-                    if os.path.exists(save_path):
-                        viz_images.append(wandb.Image(save_path, caption=f"Scenario {scenario_id} (ADE: {ade:.2f}m)"))
+                    # Find the most recent visualization file
+                    import glob
+                    pattern = os.path.join(gcn_viz_dir_testing, f'gcn_autoreg_epoch001_{scenario_id}_*.png')
+                    matches = glob.glob(pattern)
+                    if matches:
+                        latest_viz = max(matches, key=os.path.getmtime)
+                        viz_images.append(wandb.Image(latest_viz, caption=f"Scenario {scenario_id} (Error: {final_error:.2f}m)"))
         
         if viz_count > 0:
             print(f"\nVisualization Summary:")
             print(f"  Scenarios visualized: {viz_count}")
-            print(f"  Average ADE: {total_ade / viz_count:.2f}m")
             print(f"  Saved to: {gcn_viz_dir_testing}")
             
             if use_wandb and viz_images:
@@ -684,8 +716,8 @@ def main():
     parser = argparse.ArgumentParser(description='GCN Model Testing')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint (default: auto-detect)')
-    parser.add_argument('--test_data', type=str, default=test_hdf5_path,
-                        help='Path to test HDF5 file')
+    parser.add_argument('--test_data', type=str, default=val_hdf5_path,  # Use validation dataset by default (90 timesteps)
+                        help='Path to test/validation HDF5 file (default: validation dataset)')
     parser.add_argument('--num_rollout_steps', type=int, default=test_num_rollout_steps,
                         help='Number of rollout steps')
     parser.add_argument('--max_scenarios', type=int, default=test_max_scenarios,
