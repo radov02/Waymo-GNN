@@ -10,6 +10,7 @@ data/graphs/training/*
 checkpoints/*
 
 .env
+venv
 wandb/*
 
 __pycache__/
@@ -22,6 +23,7 @@ visualizations/scenario_sequence/*.png
 visualizations/training/*
 visualizations/autoreg/*.png
 visualizations/autoreg/gat/*.png
+visualizations/vectornet/*.png
 
 src/wandb/*
 
@@ -31,3 +33,9 @@ src/autoregressive_model/checkpoints/*
 *.pt
 *.tfrecord
 *.hdf5
+
+src/vectornet/data/training/*
+src/vectornet/data/validation/*
+src/vectornet/data/testing/*
+
+.github

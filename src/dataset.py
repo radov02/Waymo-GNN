@@ -3,46 +3,26 @@ import h5py
 import numpy as np
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
-from functools import lru_cache
 import threading
 
 
 class HDF5ScenarioDataset(Dataset):
-    """Optimized HDF5 dataset for scenario graph sequences.
-    
-    Improvements:
-    - Thread-safe file handle per worker (avoids reopening)
-    - Optional in-memory caching for small datasets
-    - Contiguous memory loading with numpy optimizations
-    - Pre-sorted timestep keys to avoid repeated sorting
-    """
-    
+   
     def __init__(self, hdf5_path, seq_len=10, cache_in_memory=False, max_cache_size=100):
-        """
-        Args:
-            hdf5_path: Path to HDF5 file
-            seq_len: Maximum sequence length to load
-            cache_in_memory: If True, cache loaded scenarios in RAM
-            max_cache_size: Maximum number of scenarios to cache
-        """
         self.hdf5_path = hdf5_path
         self.seq_len = seq_len
         self.cache_in_memory = cache_in_memory
         self.max_cache_size = max_cache_size
+        self._local = threading.local()     # thread-local storage for file handles (one per worker)
         
-        # Thread-local storage for file handles (one per worker)
-        self._local = threading.local()
-        
-        # Pre-load metadata to avoid repeated file opens
-        with h5py.File(hdf5_path, "r", swmr=True) as f:
+        with h5py.File(hdf5_path, "r", swmr=True) as f:     # pre-load metadata to avoid repeated file opens
             self.scenario_ids = list(f["scenarios"].keys())
-            # Pre-compute sorted timestep keys for each scenario
-            self._timestep_cache = {}
+            self._timestep_cache = {}       # pre-compute sorted timestep keys for each scenario
             for sid in self.scenario_ids:
                 snaps = f["scenarios"][sid]["snapshot_graphs"]
                 self._timestep_cache[sid] = sorted(snaps.keys(), key=lambda x: int(x))[:self.seq_len]
         
-        # Optional in-memory cache for frequently accessed data
+        # optional in-memory cache for frequently accessed data:
         self._memory_cache = {} if cache_in_memory else None
         self._cache_lock = threading.Lock() if cache_in_memory else None
 
@@ -84,16 +64,13 @@ class HDF5ScenarioDataset(Dataset):
         # Next __getitem__ call will open a new handle for this worker
 
     def _load_tensor_fast(self, dataset, dtype=torch.float32):
-        """Optimized tensor loading using direct numpy buffer."""
-        # Read directly into contiguous numpy array, then convert
+        # read tensor directly into contiguous numpy array, then convert
         arr = np.ascontiguousarray(dataset[:])
         return torch.from_numpy(arr).to(dtype)
 
     def __getitem__(self, idx):
         scenario_id = self.scenario_ids[idx]
-        
-        # Check memory cache first
-        if self._memory_cache is not None:
+        if self._memory_cache is not None:   # check memory cache first
             with self._cache_lock:
                 if scenario_id in self._memory_cache:
                     return self._memory_cache[scenario_id]
@@ -101,15 +78,13 @@ class HDF5ScenarioDataset(Dataset):
         h5file = self._get_h5file()
         snaps = h5file["scenarios"][scenario_id]["snapshot_graphs"]
         
-        # Use pre-computed sorted timesteps
-        timesteps = self._timestep_cache[scenario_id]
+        timesteps = self._timestep_cache[scenario_id]   # use pre-computed sorted timesteps
         
         data_list = []
         for timestep in timesteps:
             group = snaps[timestep]
             
-            # Optimized tensor loading
-            x = self._load_tensor_fast(group["x"], torch.float32)
+            x = self._load_tensor_fast(group["x"], torch.float32)       # optimized tensor loading
             edge_index = self._load_tensor_fast(group["edge_index"], torch.long)
             
             edge_weight = None
@@ -128,8 +103,7 @@ class HDF5ScenarioDataset(Dataset):
             if "agent_ids" in group:
                 agent_ids = group["agent_ids"][:].tolist()
             
-            # Create PyG Data object
-            data = Data(
+            data = Data(        # create PyG Data object
                 x=x,
                 edge_index=edge_index,
                 edge_attr=edge_weight,
@@ -142,8 +116,7 @@ class HDF5ScenarioDataset(Dataset):
                 data.agent_ids = agent_ids
             data_list.append(data)
         
-        # Cache if enabled and under limit
-        if self._memory_cache is not None:
+        if self._memory_cache is not None:      # cache if enabled and under limit
             with self._cache_lock:
                 if len(self._memory_cache) < self.max_cache_size:
                     self._memory_cache[scenario_id] = data_list
@@ -160,11 +133,7 @@ class HDF5ScenarioDataset(Dataset):
                     pass
     
     def preload_to_memory(self, indices=None):
-        """Preload specified scenarios into memory cache.
-        
-        Args:
-            indices: List of indices to preload. If None, preload first max_cache_size.
-        """
+        """Preload specified scenarios (from indices list, or first max_cache_size if None) into memory cache"""
         if self._memory_cache is None:
             print("Warning: cache_in_memory=False, cannot preload")
             return
@@ -173,4 +142,4 @@ class HDF5ScenarioDataset(Dataset):
             indices = range(min(len(self), self.max_cache_size))
         
         for idx in indices:
-            _ = self[idx]  # This will cache automatically
+            _ = self[idx]  # this will cache automatically

@@ -6,7 +6,7 @@ import time
 import math
 import numpy as np
 import tensorflow as tf
-from config import batch_size, num_workers, sequence_length, radius, graph_creation_method
+from config import batch_size, gcn_num_workers, sequence_length, radius, graph_creation_method, MAX_SPEED, MAX_ACCEL, MAX_DIST_SDC, MAX_DIST_NEAREST 
 from torch_geometric.data import Data, Batch
 from torch.utils.data import DataLoader
 
@@ -341,12 +341,6 @@ def initial_feature_vector(agent, timestep, scenario=None, all_positions=None):
     
     state = agent.states[timestep]
     
-    # Normalization constants
-    MAX_SPEED = 30.0        # ~108 km/h, reasonable max speed
-    MAX_ACCEL = 10.0        # ~1g acceleration
-    MAX_DIST_SDC = 100.0    # 100m max distance to SDC for normalization
-    MAX_DIST_NEAREST = 50.0 # 50m max distance to nearest neighbor
-    
     # Basic velocity features (normalized)
     vx = state.velocity_x
     vy = state.velocity_y
@@ -616,7 +610,7 @@ def test_hdf5_and_lazy_loading(path):
     # Initialize dataset
     from dataset import HDF5ScenarioDataset
     dataset = HDF5ScenarioDataset(path, seq_len=sequence_length)
-    print(f"\n✓ Dataset loaded: {len(dataset)} total scenarios")
+    print(f"Dataset loaded: {len(dataset)} total scenarios")
 
     # Test 1: Check a few individual scenario sequences
     print("\n" + "-" * 80)
@@ -648,11 +642,11 @@ def test_hdf5_and_lazy_loading(path):
         dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers,
+        num_workers=gcn_num_workers,
         collate_fn=collate_graph_sequences_to_batch,
         drop_last=True
     )
-    print(f"DataLoader config: batch_size={batch_size}, num_workers={num_workers}, shuffle=False")
+    print(f"DataLoader config: batch_size={batch_size}, num_workers={gcn_num_workers}, shuffle=False")
     print(f"Expected batches: ~{len(dataset) // batch_size}")
     print(f"Each batch contains {batch_size} different scenarios, each with {sequence_length} timesteps\n")
 
@@ -678,13 +672,13 @@ def test_hdf5_and_lazy_loading(path):
         print(f"    - edge_index: {first_timestep.edge_index.shape}")
         print(f"    - y: {first_timestep.y.shape if first_timestep.y is not None else None}")
         print(f"    - pos: {first_timestep.pos.shape if hasattr(first_timestep, 'pos') and first_timestep.pos is not None else None}")
-        print(f"    - batch: {first_timestep.batch.shape} (node→graph mapping)")
+        print(f"    - batch: {first_timestep.batch.shape} (node->graph mapping)")
         if hasattr(first_timestep, 'agent_ids') and first_timestep.agent_ids:
             print(f"    - agent_ids: {len(first_timestep.agent_ids)} total agents")
         print()
 
     print(f"Total batches processed: {batch_idx + 1}")
-    print("\n✓ This matches training: Each batch has B={batch_size} different scenarios,")
+    print("This matches training: Each batch has B={batch_size} different scenarios,")
     print(f"  and you iterate through T={sequence_length} timesteps sequentially in training loop")
 
     # Test 3: Verify Lazy Loading (memory check)
@@ -698,7 +692,7 @@ def test_hdf5_and_lazy_loading(path):
         data_list = dataset[idx]
         first_graph = data_list[0]
         print(f"  Index {idx}: scenario={first_graph.scenario_id}, timesteps={len(data_list)}, nodes={first_graph.x.shape[0]}")
-    print("✓ If this was fast, lazy loading is working correctly!")
+    print("If this was fast, lazy loading is working correctly!")
 
     print("\n" + "=" * 80)
     print("TESTING COMPLETE")

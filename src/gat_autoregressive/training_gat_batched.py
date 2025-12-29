@@ -1,16 +1,6 @@
-"""Batched Training script for GAT-based autoregressive trajectory prediction.
+"""Batched GAT training for trajectory prediction. Supports batch_size > 1.
 
-This version supports batch_size > 1 for better GPU utilization.
-Key improvements:
-- Process multiple scenarios in parallel
-- 2-4x speedup on modern GPUs
-- Same model quality as batch_size=1
-
-Usage:
-    python src/gat_autoregressive/training_gat_batched.py
-
-Checkpoints: checkpoints/gat/
-Visualizations: visualizations/autoreg/gat/
+Usage: python src/gat_autoregressive/training_gat_batched.py
 """
 
 import sys
@@ -62,17 +52,17 @@ except Exception:
 
 from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
-from config import (device, num_workers, num_layers, num_gru_layers, epochs, 
+from config import (device, gat_num_workers, num_layers, num_gru_layers, epochs, 
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
                     dropout, learning_rate, project_name, dataset_name,
                     visualize_every_n_epochs, debug_mode,
                     gradient_clip_value, loss_alpha, loss_beta, loss_gamma, loss_delta,
-                    scheduler_patience, scheduler_factor, min_lr,
-                    early_stopping_patience, early_stopping_min_delta,
+                    gat_learning_rate, gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta,
+                    scheduler_patience, scheduler_factor, min_lr, gat_prefetch_factor,
                     num_gpus, use_data_parallel, setup_model_parallel, get_model_for_saving,
-                    print_gpu_info, pin_memory, prefetch_factor, use_amp, use_bf16,
+                    print_gpu_info, pin_memory, gat_prefetch_factor, use_amp, use_bf16,
                     use_torch_compile, torch_compile_mode, use_gradient_checkpointing,
-                    cache_validation_data, max_validation_scenarios, batch_size)
+                    cache_validation_data, max_validation_scenarios, batch_size, gat_checkpoint_dir, gat_num_heads)
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
@@ -81,78 +71,7 @@ from torch.nn.utils import clip_grad_norm_
 from helper_functions.visualization_functions import visualize_epoch, visualize_training_progress
 from helper_functions.helpers import advanced_directional_loss, compute_metrics
 import config as cfg
-
-# ============== BATCHED TRAINING CONFIGURATION ==============
-# batch_size is imported from config.py
-BATCHED_BATCH_SIZE = batch_size  # Use batch_size from config.py
-
-# GAT-specific directories
-CHECKPOINT_DIR = 'checkpoints/gat'
-VIZ_DIR = 'visualizations/autoreg/gat'
-cfg.viz_training_dir = VIZ_DIR
-
-
-class OverfittingDetector:
-    """Detect overfitting by tracking when train loss decreases but val loss increases.
-    
-    Stops training after patience consecutive epochs of overfitting.
-    """
-    
-    def __init__(self, patience=4, min_delta=0.001, verbose=True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.verbose = verbose
-        self.overfit_counter = 0
-        self.best_val_loss = None
-        self.prev_train_loss = None
-        self.prev_val_loss = None
-        self.should_stop = False
-        
-    def __call__(self, train_loss, val_loss):
-        """Check if we're overfitting: train loss decreasing but val loss increasing."""
-        
-        # Initialize on first call
-        if self.best_val_loss is None:
-            self.best_val_loss = val_loss
-            self.prev_train_loss = train_loss
-            self.prev_val_loss = val_loss
-            return
-        
-        # Track best validation loss
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-        
-        # Detect overfitting: train improves but val gets worse
-        train_improved = train_loss < (self.prev_train_loss - self.min_delta)
-        val_worsened = val_loss > (self.prev_val_loss + self.min_delta)
-        
-        if train_improved and val_worsened:
-            self.overfit_counter += 1
-            if self.verbose:
-                print(f"  Overfitting detected: train↓ {self.prev_train_loss:.4f}→{train_loss:.4f}, "
-                      f"val↑ {self.prev_val_loss:.4f}→{val_loss:.4f} "
-                      f"({self.overfit_counter}/{self.patience})")
-            
-            if self.overfit_counter >= self.patience:
-                self.should_stop = True
-                if self.verbose:
-                    print(f"\n  STOPPING: Overfitting detected for {self.patience} consecutive epochs!")
-        else:
-            # Reset counter if not overfitting
-            if self.overfit_counter > 0 and self.verbose:
-                print(f"  No overfitting this epoch, counter reset")
-            self.overfit_counter = 0
-        
-        self.prev_train_loss = train_loss
-        self.prev_val_loss = val_loss
-            
-    def reset(self):
-        self.overfit_counter = 0
-        self.best_val_loss = None
-        self.prev_train_loss = None
-        self.prev_val_loss = None
-        self.should_stop = False
-
+from config import (batch_size, gat_viz_dir)
 
 # ============== WORKER INIT FUNCTION (MODULE LEVEL FOR PICKLING) ==============
 def worker_init_fn(worker_id):
@@ -183,15 +102,20 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                                 visualize_callback=None):
     """Train for one epoch with BATCHED scenario processing.
     
-    Key difference from original: Processes B scenarios in parallel per batch.
+    Optimized for GPU utilization:
+    - Accumulates metrics on GPU tensors to reduce CPU-GPU sync
+    - Batches data transfer with non_blocking=True
+    - Minimizes .item() calls (only at batch end)
+    - Uses fused operations where possible
     """
     model.train()
     total_loss_epoch = 0.0
     steps = 0
     
-    total_cosine_sim = 0.0
-    total_mse = 0.0
-    total_angular = 0.0
+    # Use GPU tensors for metric accumulation (avoid per-timestep CPU sync)
+    total_cosine_sim = torch.tensor(0.0, device=device)
+    total_mse = torch.tensor(0.0, device=device)
+    total_angular = torch.tensor(0.0, device=device)
     metric_count = 0
     
     last_batch_dict = None
@@ -210,10 +134,10 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         total_edges = batched_graph_sequence[0].edge_index.size(1)
         
         if batch_idx % log_every_n_batches == 0:
-            # Compute running averages for display
-            avg_mse_so_far = total_mse / max(1, metric_count)
-            avg_cos_so_far = total_cosine_sim / max(1, metric_count)
-            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
+            # Sync metrics only for logging (reduces sync frequency)
+            avg_mse_so_far = (total_mse / max(1, metric_count)).item() if metric_count > 0 else 0.0
+            avg_cos_so_far = (total_cosine_sim / max(1, metric_count)).item() if metric_count > 0 else 0.0
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             
             if torch.cuda.is_available():
                 print(f"\n[Epoch {epoch+1}] Batch {batch_idx}/{total_batches} | "
@@ -226,22 +150,39 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                 if metric_count > 0:
                     print(f"  MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
 
-        # Move all timesteps to device
+        # Move all timesteps to device in batch (non-blocking for async transfer)
         for t in range(T):
             batched_graph_sequence[t] = batched_graph_sequence[t].to(device, non_blocking=True)
+        
+        # Sync point to ensure all data is on GPU before processing
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
 
         # Reset GRU hidden states for this batch of scenarios
-        # The model internally handles per-scenario hidden states
         base_model = get_module(model)
         base_model.gru_hidden = None  # Reset for new batch
         
         optimizer.zero_grad(set_to_none=True)
-        accumulated_loss = 0.0
+        
+        # Use GPU tensor for loss accumulation
+        accumulated_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        valid_timesteps = 0
+        
+        # Batch-level metric accumulators (GPU tensors)
+        batch_mse = torch.tensor(0.0, device=device)
+        batch_cos = torch.tensor(0.0, device=device)
+        batch_angular = torch.tensor(0.0, device=device)
+        batch_metric_count = 0
         
         for t, batched_graph in enumerate(batched_graph_sequence):
-            if batched_graph.y is None or torch.all(batched_graph.y == 0):
+            # Fast validity check using tensor ops
+            if batched_graph.y is None:
+                continue
+            y_sum = batched_graph.y.abs().sum()
+            if y_sum == 0:
                 continue
             
+            # Check for NaN using efficient tensor op
             if torch.isnan(batched_graph.x).any() or torch.isnan(batched_graph.y).any():
                 print(f"  Warning: NaN in input at batch {batch_idx}, t={t}, skipping...")
                 continue
@@ -251,54 +192,76 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                 out_predictions = model(
                     batched_graph.x, 
                     batched_graph.edge_index,
-                    batch=batched_graph.batch,  # Which scenario each node belongs to
-                    batch_size=B,  # Number of scenarios
+                    batch=batched_graph.batch,
+                    batch_size=B,
                     batch_num=batch_idx, 
                     timestep=t
                 )
                 
+                # Fast NaN check
                 if torch.isnan(out_predictions).any():
                     print(f"  Warning: NaN in predictions at batch {batch_idx}, t={t}, skipping...")
                     continue
                 
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
-                               batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
-                               gamma=loss_gamma, delta=loss_delta)
+                target_y = batched_graph.y.to(out_predictions.dtype)
+                loss_t = loss_fn(out_predictions, target_y, 
+                                batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
+                                gamma=loss_gamma, delta=loss_delta)
                 
                 if torch.isnan(loss_t):
                     print(f"  Warning: NaN loss at batch {batch_idx}, t={t}, skipping...")
                     continue
-                    
-            accumulated_loss += loss_t
             
+            # Accumulate loss (gradient flows through)
+            accumulated_loss = accumulated_loss + loss_t
+            valid_timesteps += 1
+            
+            # Detailed loss debugging every 100 batches on first timestep
+            if batch_idx % 100 == 0 and t == 0:
+                with torch.no_grad():
+                    from helper_functions.helpers import _compute_angle_loss, _compute_cosine_loss
+                    angle_loss_val = _compute_angle_loss(out_predictions, batched_graph.y)
+                    mse_val = F.mse_loss(out_predictions, batched_graph.y) * 100.0
+                    cos_loss_val = _compute_cosine_loss(out_predictions, batched_graph.y)
+                    print(f"  [Loss Debug] angle={angle_loss_val:.4f}, mse={mse_val:.4f}, cos={cos_loss_val:.4f}, total={loss_t.item():.4f}")
+            
+            # Compute metrics efficiently on GPU (no .item() calls in loop)
             with torch.no_grad():
-                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                # MSE - direct computation
+                mse = F.mse_loss(out_predictions, target_y)
                 
+                # Cosine similarity - fused operation
+                cos_sim = F.cosine_similarity(out_predictions, target_y, dim=1).mean()
+                
+                # Angular error - vectorized with efficient wrap
                 pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
-                target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
-                angle_diff = torch.atan2(torch.sin(pred_angle - target_angle), 
-                                        torch.cos(pred_angle - target_angle))
-                mean_angle_error = torch.abs(angle_diff).mean()
+                target_angle = torch.atan2(target_y[:, 1], target_y[:, 0])
+                angle_diff = pred_angle - target_angle
+                # Wrap to [-pi, pi] using efficient formula
+                angle_diff = torch.remainder(angle_diff + 3.141592653589793, 6.283185307179586) - 3.141592653589793
+                mean_angle_error = angle_diff.abs().mean()
                 
-                # Only accumulate if values are valid (not NaN)
+                # Accumulate on GPU (no sync)
                 if not torch.isnan(mse):
-                    total_mse += mse.item()
+                    batch_mse = batch_mse + mse
                 if not torch.isnan(cos_sim):
-                    total_cosine_sim += cos_sim.item()
+                    batch_cos = batch_cos + cos_sim
                 if not torch.isnan(mean_angle_error):
-                    total_angular += mean_angle_error.item()
-                metric_count += 1
+                    batch_angular = batch_angular + mean_angle_error
+                batch_metric_count += 1
         
-        if accumulated_loss == 0.0:
+        # Skip if no valid timesteps
+        if valid_timesteps == 0:
             print(f"  Warning: No valid loss at batch {batch_idx}, skipping backward")
             continue
-            
-        if isinstance(accumulated_loss, torch.Tensor) and torch.isnan(accumulated_loss):
+        
+        # Check for NaN in accumulated loss
+        if torch.isnan(accumulated_loss):
             print(f"  Warning: NaN accumulated loss at batch {batch_idx}, skipping")
             continue
+        
+        # Average loss across timesteps for proper learning signal
+        accumulated_loss = accumulated_loss / valid_timesteps
         
         # Backward pass
         if scaler is not None:
@@ -311,20 +274,16 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             accumulated_loss.backward()
             clip_grad_norm_(model.parameters(), gradient_clip_value)
             optimizer.step()
-            
+        
+        # Accumulate epoch metrics (still on GPU)
+        total_mse = total_mse + batch_mse
+        total_cosine_sim = total_cosine_sim + batch_cos
+        total_angular = total_angular + batch_angular
+        metric_count += batch_metric_count
+        
+        # Single .item() call per batch for loss tracking
         total_loss_epoch += accumulated_loss.item()
         steps += 1
-        
-        # Log per-step metrics to wandb for detailed monitoring
-        if steps % 10 == 0:  # Log every 10 steps to avoid too much data
-            wandb.log({
-                "batch": epoch * len(dataloader) + batch_idx,
-                "train/batch_epoch": epoch + 1,  # Which epoch this batch is from
-                "train/batch_loss": accumulated_loss.item(),
-                "train/batch_mse": mse.item() if not torch.isnan(mse) else 0.0,
-                "train/batch_cosine_similarity": cos_sim.item() if not torch.isnan(cos_sim) else 0.0,
-                "train/batch_angle_error": mean_angle_error.item() if not torch.isnan(mean_angle_error) else 0.0,
-            })
         
         last_batch_dict = {
             'batch': [b.cpu() for b in batch_dict['batch']],
@@ -338,15 +297,19 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             torch.cuda.empty_cache()
 
     avg_loss_epoch = total_loss_epoch / max(1, steps)
-    avg_cosine_sim = total_cosine_sim / max(1, metric_count)
-    avg_mse = total_mse / max(1, metric_count)
-    avg_angle_error = total_angular / max(1, metric_count)
+    # Final sync: convert GPU tensors to Python floats for return
+    avg_cosine_sim = (total_cosine_sim / max(1, metric_count)).item()
+    avg_mse = (total_mse / max(1, metric_count)).item()
+    avg_angle_error = (total_angular / max(1, metric_count)).item()
     
     # Print epoch summary with RMSE in meters
     rmse_meters = (avg_mse ** 0.5) * 100.0
     print(f"\n[TRAIN EPOCH {epoch+1} SUMMARY]")
-    print(f"  Loss: {avg_loss_epoch:.6f} | MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
+    print(f"  AVERAGED LOSS (per timestep): {avg_loss_epoch:.6f}")
+    print(f"  MSE: {avg_mse:.6f} | RMSE: {rmse_meters:.2f}m")
     print(f"  CosSim: {avg_cosine_sim:.4f} | AngleErr: {avg_angle_error:.4f} rad")
+    if avg_cosine_sim < 0.5:
+        print(f"  WARNING: Low cosine similarity indicates poor direction learning!")
     
     # Call visualization AFTER epoch completes (model is still in train mode but no backward pending)
     if visualize_callback is not None and last_batch_dict is not None:
@@ -357,14 +320,18 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
 
 def validate_single_epoch_batched(model, dataloader, loss_fn, 
                                    loss_alpha, loss_beta, loss_gamma, loss_delta, device):
-    """Run batched validation loop."""
+    """Run batched validation loop.
+    
+    Optimized for GPU utilization with batched metric computation.
+    """
     model.eval()
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0, device=device)
     steps = 0
     
-    total_cosine_sim = 0.0
-    total_mse = 0.0
-    total_angular = 0.0
+    # GPU tensors for metric accumulation
+    total_cosine_sim = torch.tensor(0.0, device=device)
+    total_mse = torch.tensor(0.0, device=device)
+    total_angular = torch.tensor(0.0, device=device)
     metric_count = 0
     
     total_batches = len(dataloader)
@@ -379,17 +346,28 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
             B = batch_dict["B"]
             T = batch_dict["T"]
 
+            # Batch transfer to GPU
             for t in range(T):
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device, non_blocking=True)
+            
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
 
             # Reset GRU for this validation batch
             base_model = get_module(model)
             base_model.gru_hidden = None
             
-            accumulated_loss = 0.0
+            batch_loss = torch.tensor(0.0, device=device)
+            batch_mse = torch.tensor(0.0, device=device)
+            batch_cos = torch.tensor(0.0, device=device)
+            batch_angular = torch.tensor(0.0, device=device)
+            batch_count = 0
+            valid_timesteps = 0
             
             for t, batched_graph in enumerate(batched_graph_sequence):
-                if batched_graph.y is None or torch.all(batched_graph.y == 0):
+                if batched_graph.y is None:
+                    continue
+                if batched_graph.y.abs().sum() == 0:
                     continue
                 
                 out_predictions = model(
@@ -401,34 +379,45 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
                     timestep=t
                 )
                 
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
-                               batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
-                               gamma=loss_gamma, delta=loss_delta)
-                accumulated_loss += loss_t
+                target_y = batched_graph.y.to(out_predictions.dtype)
+                loss_t = loss_fn(out_predictions, target_y, 
+                                batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
+                                gamma=loss_gamma, delta=loss_delta)
+                batch_loss = batch_loss + loss_t
+                valid_timesteps += 1
                 
-                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                # Efficient metric computation
+                mse = F.mse_loss(out_predictions, target_y)
+                cos_sim = F.cosine_similarity(out_predictions, target_y, dim=1).mean()
                 
                 pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
-                target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
-                angle_diff = torch.atan2(torch.sin(pred_angle - target_angle),
-                                        torch.cos(pred_angle - target_angle))
-                mean_angle_error = torch.abs(angle_diff).mean()
+                target_angle = torch.atan2(target_y[:, 1], target_y[:, 0])
+                angle_diff = pred_angle - target_angle
+                angle_diff = torch.remainder(angle_diff + 3.141592653589793, 6.283185307179586) - 3.141592653589793
+                mean_angle_error = angle_diff.abs().mean()
                 
-                total_mse += mse.item()
-                total_cosine_sim += cos_sim.item()
-                total_angular += mean_angle_error.item()
-                metric_count += 1
+                batch_mse = batch_mse + mse
+                batch_cos = batch_cos + cos_sim
+                batch_angular = batch_angular + mean_angle_error
+                batch_count += 1
             
-            total_loss += accumulated_loss.item()
+            # Average loss across timesteps
+            if valid_timesteps > 0:
+                batch_loss = batch_loss / valid_timesteps
+            
+            # Accumulate batch results
+            total_loss = total_loss + batch_loss
+            total_mse = total_mse + batch_mse
+            total_cosine_sim = total_cosine_sim + batch_cos
+            total_angular = total_angular + batch_angular
+            metric_count += batch_count
             steps += 1
 
-    avg_loss = total_loss / max(1, steps)
-    avg_cosine_sim = total_cosine_sim / max(1, metric_count)
-    avg_mse = total_mse / max(1, metric_count)
-    avg_angle_error = total_angular / max(1, metric_count)
+    # Final sync: convert GPU tensors to Python floats
+    avg_loss = (total_loss / max(1, steps)).item()
+    avg_cosine_sim = (total_cosine_sim / max(1, metric_count)).item()
+    avg_mse = (total_mse / max(1, metric_count)).item()
+    avg_angle_error = (total_angular / max(1, metric_count)).item()
     
     # Print validation summary with RMSE in meters
     rmse_meters = (avg_mse ** 0.5) * 100.0
@@ -441,7 +430,7 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
 
 def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.hdf5", 
                          validation_path="./data/graphs/validation/validation_seqlen90.hdf5",
-                         batch_size=BATCHED_BATCH_SIZE,
+                         batch_size=batch_size,
                          wandb_run=None, return_viz_batch=False):
     """Run batched GAT training with batch_size > 1 for better GPU utilization."""
     
@@ -454,8 +443,8 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Expected speedup: ~{batch_size}x over batch_size=1")
     print(f"{'='*60}\n")
     
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(VIZ_DIR, exist_ok=True)
+    os.makedirs(gat_checkpoint_dir, exist_ok=True)
+    os.makedirs(gat_viz_dir, exist_ok=True)
     
     should_finish_wandb = False
     if wandb_run is None:
@@ -465,30 +454,28 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             config={
                 "model": "SpatioTemporalGAT_Batched",
                 "batch_size": batch_size,
-                "learning_rate": learning_rate,
+                "learning_rate": gat_learning_rate,
                 "dataset": dataset_name,
                 "dropout": dropout,
                 "hidden_channels": hidden_channels,
                 "num_gat_layers": num_layers,
                 "num_gru_layers": num_gru_layers,
                 "use_gat": True,
-                "num_heads": 4,
+                "num_heads": gat_num_heads,
                 "epochs": epochs,
-                "loss_alpha": loss_alpha,
-                "loss_beta": loss_beta,
-                "loss_gamma": loss_gamma,
-                "loss_delta": loss_delta,
+                "loss_alpha": gat_loss_alpha,
+                "loss_beta": gat_loss_beta,
+                "loss_gamma": gat_loss_gamma,
+                "loss_delta": gat_loss_delta,
                 "scheduler": "ReduceLROnPlateau",
-                "early_stopping_patience": early_stopping_patience,
                 "batched_training": True
             },
-            name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}",
+            name=f"SpatioTemporalGAT_Batched_B{batch_size}_r{radius}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}",
             dir="../wandb"
         )
         should_finish_wandb = True    
     # Define custom x-axes for wandb metrics
     wandb.define_metric("epoch")
-    wandb.define_metric("batch")  # Global batch counter across all epochs
     
     # Epoch-based metrics (plotted vs epoch)
     wandb.define_metric("train/loss", step_metric="epoch")
@@ -501,15 +488,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     wandb.define_metric("val/angle_error", step_metric="epoch")
     wandb.define_metric("learning_rate", step_metric="epoch")
     wandb.define_metric("train_val_gap", step_metric="epoch")
-    
-    # Batch-based metrics (plotted vs batch - fine-grained within-epoch progress)
-    wandb.define_metric("train/batch_loss", step_metric="batch")
-    wandb.define_metric("train/batch_mse", step_metric="batch")
-    wandb.define_metric("train/batch_cosine_similarity", step_metric="batch")
-    wandb.define_metric("train/batch_angle_error", step_metric="batch")
-    wandb.define_metric("train/batch_epoch", step_metric="batch")  # Which epoch this batch belongs to
-    # Initialize batched model
-    num_attention_heads = 4  # Number of attention heads for GAT
+    # Initialize batched model with GAT-specific attention heads
     model = SpatioTemporalGATBatched(
         input_dim=input_dim,
         hidden_dim=hidden_channels,
@@ -517,7 +496,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         num_gat_layers=num_layers,
         num_gru_layers=num_gru_layers,
         dropout=dropout,
-        num_heads=num_attention_heads,
+        num_heads=gat_num_heads,  # Use config value (8 heads for better spatial modeling)
         use_gradient_checkpointing=use_gradient_checkpointing,
         max_agents_per_scenario=128  # Adjust based on your data
     )
@@ -536,7 +515,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     model, is_parallel = setup_model_parallel(model, device)
     wandb.watch(model, log='all', log_freq=10)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=gat_learning_rate)  # Use GAT-specific LR
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor, 
                                   patience=scheduler_patience, min_lr=min_lr)
     loss_fn = advanced_directional_loss
@@ -573,13 +552,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             val_dataset, 
             batch_size=batch_size,  # Use same batch size for validation
             shuffle=False, 
-            num_workers=num_workers,
+            num_workers=gat_num_workers,
             collate_fn=collate_graph_sequences_to_batch, 
             drop_last=False,  # Don't drop last batch in validation
             pin_memory=pin_memory,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True if num_workers > 0 else False,
-            worker_init_fn=worker_init_fn if num_workers > 0 else None
+            prefetch_factor=gat_prefetch_factor,
+            persistent_workers=True if gat_num_workers > 0 else False,
+            worker_init_fn=worker_init_fn if gat_num_workers > 0 else None
         )
     except FileNotFoundError:
         print(f"WARNING: {validation_path} not found! Training without validation.")
@@ -589,19 +568,13 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         dataset, 
         batch_size=batch_size,  # KEY: Process multiple scenarios in parallel!
         shuffle=True, 
-        num_workers=num_workers,
+        num_workers=gat_num_workers,
         collate_fn=collate_graph_sequences_to_batch, 
         drop_last=True,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False,
-        worker_init_fn=worker_init_fn if num_workers > 0 else None
-    )
-
-    overfit_detector = OverfittingDetector(
-        patience=4,  # Stop after 4 consecutive epochs of overfitting
-        min_delta=early_stopping_min_delta, 
-        verbose=True
+        prefetch_factor=gat_prefetch_factor,
+        persistent_workers=True if gat_num_workers > 0 else False,
+        worker_init_fn=worker_init_fn if gat_num_workers > 0 else None
     )
     
     print(f"Training on {device}")
@@ -609,9 +582,11 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     print(f"Batch size: {batch_size} scenarios/batch (GPU parallel)")
     print(f"Batches per epoch: {len(dataloader)}")
     print(f"Sequence length: {sequence_length}")
-    print(f"Learning rate: {learning_rate}")
+    print(f"Learning rate: {gat_learning_rate} (GAT-optimized)")
+    print(f"Attention heads: {gat_num_heads}")
+    print(f"Loss weights: α={gat_loss_alpha}, β={gat_loss_beta}, γ={gat_loss_gamma}, δ={gat_loss_delta}")
     print(f"Mixed Precision: {'BF16' if use_bf16 else 'FP16' if use_amp else 'Disabled'}")
-    print(f"Checkpoints: {CHECKPOINT_DIR}\n")
+    print(f"Checkpoints: {gat_checkpoint_dir}\n")
     
     # AMP setup
     scaler = None
@@ -628,40 +603,45 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
     best_model_state = None
     best_optimizer_state = None
     best_epoch = 0
-    checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_heads{num_attention_heads}_E{epochs}.pt'
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, checkpoint_filename)
+    checkpoint_filename = f'best_gat_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
+    checkpoint_path = os.path.join(gat_checkpoint_dir, checkpoint_filename)
     last_viz_batch = None
+    viz_error = None  # Track visualization error for logging
     
     for epoch in range(epochs):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
+        viz_error = None  # Reset for this epoch
+        
         # Visualization callback
         def viz_callback(ep, batch_dict, mdl, dev, wb):
             nonlocal last_viz_batch
             if ep % visualize_every_n_epochs == 0:
                 try:
-                    # Use visualize_training_progress directly with VIZ_DIR
+                    # Use visualize_training_progress directly with gat_viz_dir
                     filepath, avg_error = visualize_training_progress(
                         mdl, batch_dict, epoch=ep+1,
                         scenario_id=None,
-                        save_dir=VIZ_DIR,  # Use GAT-specific directory
+                        save_dir=gat_viz_dir,  # Use GAT-specific directory
                         device=dev,
                         max_nodes_per_graph=cfg.max_nodes_per_graph_viz,
                         show_timesteps=cfg.show_timesteps_viz
                     )
-                    wb.log({"epoch": ep, "viz_avg_error": avg_error})
+                    # Don't log here - will be logged with other metrics at end of epoch
+                    nonlocal viz_error
+                    viz_error = avg_error
                 except Exception as e:
                     print(f"  Visualization error: {e}")
                     import traceback
                     traceback.print_exc()
             last_viz_batch = batch_dict
         
-        # Training
+        # Training (use GAT-specific loss weights)
         train_loss, train_mse, train_cos, train_angle, _ = train_single_epoch_batched(
             model, dataloader, optimizer, loss_fn,
-            loss_alpha, loss_beta, loss_gamma, loss_delta,
+            gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta,
             device, epoch, scaler=scaler, amp_dtype=amp_dtype,
             visualize_callback=viz_callback
         )
@@ -679,11 +659,15 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             "learning_rate": optimizer.param_groups[0]['lr']
         }
         
-        # Validation
+        # Add visualization error if available
+        if viz_error is not None:
+            log_dict["viz_avg_error"] = viz_error
+        
+        # Validation (use GAT-specific loss weights)
         if val_dataloader is not None:
             val_loss, val_mse, val_cos, val_angle = validate_single_epoch_batched(
                 model, val_dataloader, loss_fn,
-                loss_alpha, loss_beta, loss_gamma, loss_delta, device
+                gat_loss_alpha, gat_loss_beta, gat_loss_gamma, gat_loss_delta, device
             )
             
             print(f"[Valid] Loss: {val_loss:.4f} | MSE: {val_mse:.4f} | "
@@ -695,7 +679,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 "val/mse": val_mse,
                 "val/cosine_similarity": val_cos,
                 "val/angle_error": val_angle,
-                "train_val_gap": train_loss - val_loss  # Track overfitting (positive = overfitting)
+                "train_val_gap": train_loss - val_loss
             })
         
         # Single wandb.log call with all metrics for this epoch
@@ -704,9 +688,7 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
         # Continue with scheduler and checkpoint saving
         if val_dataloader is not None:
             scheduler.step(val_loss)
-            
-            # Check for overfitting with both train and val loss
-            overfit_detector(train_loss, val_loss)
+        
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -718,14 +700,6 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
                 print(f"   New best validation loss: {val_loss:.4f} at epoch {epoch+1}")
         else:
             scheduler.step(train_loss)
-            print("   No validation data - cannot detect overfitting")
-        
-        if overfit_detector.should_stop:
-            print(f"\n{'='*60}")
-            print(f"Training stopped at epoch {epoch+1} due to overfitting")
-            print(f"Best validation loss: {best_val_loss:.4f}")
-            print(f"{'='*60}")
-            break
     
     # Save best model checkpoint after training completes
     if best_model_state is not None:
@@ -740,19 +714,54 @@ def run_training_batched(dataset_path="./data/graphs/training/training_seqlen90.
             'config': {
                 'batch_size': batch_size,
                 'hidden_channels': hidden_channels,
-                'learning_rate': learning_rate,
-                'num_attention_heads': num_attention_heads,
+                'learning_rate': gat_learning_rate,
+                'num_attention_heads': gat_num_heads,
                 'num_layers': num_layers,
                 'num_gru_layers': num_gru_layers,
                 'dropout': dropout,
-                'use_gat': True
+                'use_gat': True,
+                'loss_alpha': gat_loss_alpha,
+                'loss_beta': gat_loss_beta,
+                'loss_gamma': gat_loss_gamma,
+                'loss_delta': gat_loss_delta
             }
         }, checkpoint_path)
         print(f"Best GAT model saved to {checkpoint_filename}")
         print(f"Epoch: {best_epoch} | Val Loss: {best_val_loss:.4f}")
         print(f"{'='*60}\n")
     else:
-        print("\nNo checkpoint saved (no validation data or no improvement)\n")
+        print("\nNo best model checkpoint saved (no validation data or no improvement)\n")
+    
+    # Save final model (current state at last epoch)
+    print(f"\n{'='*60}")
+    print(f"Saving final model from epoch {epoch+1}...")
+    save_model = get_model_for_saving(model, is_parallel)
+    final_checkpoint_filename = f'final_gat_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
+    final_checkpoint_path = os.path.join(gat_checkpoint_dir, final_checkpoint_filename)
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': save_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss if val_dataloader is not None else None,
+        'batch_size': batch_size,
+        'config': {
+            'batch_size': batch_size,
+            'hidden_channels': hidden_channels,
+            'learning_rate': gat_learning_rate,
+            'num_attention_heads': gat_num_heads,
+            'num_layers': num_layers,
+            'num_gru_layers': num_gru_layers,
+            'dropout': dropout,
+            'use_gat': True,
+            'loss_alpha': gat_loss_alpha,
+            'loss_beta': gat_loss_beta,
+            'loss_gamma': gat_loss_gamma,
+            'loss_delta': gat_loss_delta
+        }
+    }, final_checkpoint_path)
+    print(f"Final GAT model saved to {final_checkpoint_filename}")
+    print(f"Epoch: {epoch+1}")
+    print(f"{'='*60}\n")
     
     if should_finish_wandb:
         wandb_run.finish()
@@ -766,8 +775,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Batched GAT Training')
-    parser.add_argument('--batch-size', type=int, default=BATCHED_BATCH_SIZE,
-                        help=f'Batch size (default: {BATCHED_BATCH_SIZE})')
+    parser.add_argument('--batch-size', type=int, default=batch_size,
+                        help=f'Batch size (default: {batch_size})')
     parser.add_argument('--train-path', type=str, 
                         default='./data/graphs/training/training_seqlen90.hdf5',
                         help='Training data path')

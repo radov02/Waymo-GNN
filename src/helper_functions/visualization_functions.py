@@ -5,9 +5,11 @@ import torch
 import os
 from datetime import datetime
 from helper_functions.graph_creation_functions import timestep_to_pyg_data
-from config import (sequence_length, radius, graph_creation_method, viz_scenario_dir, 
-                    viz_training_dir, visualize_every_n_epochs, max_nodes_per_graph_viz, 
-                    show_timesteps_viz, max_scenario_files_for_viz)
+from config import (sequence_length, radius, graph_creation_method, 
+                    visualize_every_n_epochs, max_nodes_per_graph_viz, 
+                    show_timesteps_viz, max_scenario_files_for_viz,
+                    gcn_viz_dir_autoreg, gat_viz_dir_autoreg, vectornet_viz_dir,
+                    POSITION_SCALE)
 import matplotlib.pyplot as plt
 
 # Cache for loaded scenarios to avoid reloading the same scenario multiple times
@@ -92,7 +94,7 @@ def draw_map_features(ax, scenario, x_lim=None, y_lim=None):
     return map_features_drawn
 
 
-def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir=viz_scenario_dir, figsize=(16, 10)):
+def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to_show, save_dir, figsize=(16, 10)):
     """Visualize a temporal sequence of graphs created from a scenario. Shows how the graph structure evolves over time."""
     os.makedirs(save_dir, exist_ok=True)
     T = len(graph_sequence)
@@ -195,7 +197,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
         
         if not sdc_valid or not sdc_found:
             # Add red warning banner
-            warning_text = "⚠ SDC INVALID" if not sdc_valid else "⚠ SDC NOT IN GRAPH"
+            warning_text = "SDC INVALID" if not sdc_valid else "SDC NOT IN GRAPH"
             ax.text(0.5, 0.95, warning_text, 
                    transform=ax.transAxes, ha='center', va='top',
                    fontsize=8, fontweight='bold', color='white',
@@ -242,7 +244,7 @@ def visualize_graph_sequence_creation(scenario, graph_sequence, max_timesteps_to
     
     return filepath
 
-def create_graph_sequence_visualization(scenario, save_dir=viz_scenario_dir, num_timesteps=15):
+def create_graph_sequence_visualization(scenario, save_dir, num_timesteps=15):
     """Creates .png showing graphs for given scenario sequence"""
     from config import radius, graph_creation_method, sequence_length
     from helper_functions.graph_creation_functions import timestep_to_pyg_data
@@ -435,7 +437,7 @@ def load_scenario_by_id(scenario_id, scenario_dirs=None, use_index=True, max_fil
         print(f"  Warning: Could not load scenario {scenario_id}: {e}")
         return None
 
-def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save_dir=viz_training_dir,
+def visualize_training_progress(model, batch_dict, epoch, save_dir, scenario_id=None,
                                 device='cpu', max_nodes_per_graph=10, show_timesteps=8):
     """
     Visualization showing actual vs predicted trajectories with map features.
@@ -535,21 +537,21 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
                 # This shouldn't happen with properly saved HDF5 files
                 raise ValueError("graph.pos is None - HDF5 file may need to be regenerated")
             
-            # Get predicted displacement (normalized) - MUST run for all timesteps to evolve GRU
-            pred_displacement_norm = model(graph.x, graph.edge_index, 
+            # Get predicted displacement - model outputs NORMALIZED displacement (same scale as GT y)
+            pred_displacement_normalized = model(graph.x, graph.edge_index, 
                                           edge_weight=None,  # edge_weight=graph.edge_attr, 
                                           batch=graph.batch, batch_size=B).cpu()
             
-            # Denormalize displacement and add to current position to get predicted next position
-            pred_displacement = pred_displacement_norm * POSITION_SCALE
-            pred_next_pos = curr_pos + pred_displacement
+            # Convert NORMALIZED displacement to meters and add to current position
+            pred_displacement_meters = pred_displacement_normalized * POSITION_SCALE
+            pred_next_pos = curr_pos + pred_displacement_meters
             
             # Get actual next position from ground truth labels
-            # graph.y contains the normalized displacement to next position
+            # graph.y contains NORMALIZED displacement (meters / POSITION_SCALE)
             if graph.y is not None:
-                actual_displacement_norm = graph.y.cpu()
-                actual_displacement = actual_displacement_norm * POSITION_SCALE
-                actual_next_pos = curr_pos + actual_displacement
+                actual_displacement_normalized = graph.y.cpu()
+                actual_displacement_meters = actual_displacement_normalized * POSITION_SCALE
+                actual_next_pos = curr_pos + actual_displacement_meters
             else:
                 # If no ground truth, use current position as fallback
                 actual_next_pos = curr_pos
@@ -1099,7 +1101,17 @@ def visualize_training_progress(model, batch_dict, epoch, scenario_id=None, save
     model.train()
     return filepath, avg_error
 
-def visualize_epoch(epoch, viz_batch, model, device, wandb):
+def visualize_epoch(epoch, viz_batch, model, device, wandb, save_dir):
+    """Visualize training progress at specified epochs.
+    
+    Args:
+        epoch: Current epoch number
+        viz_batch: Batch dictionary with graph data
+        model: The model to visualize predictions from
+        device: Device for inference
+        wandb: W&B run object for logging
+        save_dir: Directory to save visualizations (e.g., gcn_viz_dir_autoreg, gat_viz_dir_autoreg)
+    """
     should_visualize = (epoch + 1) % visualize_every_n_epochs == 0 or epoch == 0
         
     if should_visualize and viz_batch is not None:
@@ -1107,8 +1119,8 @@ def visualize_epoch(epoch, viz_batch, model, device, wandb):
         try:
             filepath, avg_error = visualize_training_progress(
                 model, viz_batch, epoch=epoch+1,
+                save_dir=save_dir,
                 scenario_id=None,  # Will auto-detect from batch data
-                save_dir=viz_training_dir,
                 device=device,
                 max_nodes_per_graph=max_nodes_per_graph_viz,
                 show_timesteps=show_timesteps_viz
