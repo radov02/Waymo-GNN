@@ -550,32 +550,44 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
                     if (hasattr(current_gt_graph, 'agent_ids') and hasattr(gt_graph_next, 'agent_ids') and
                         hasattr(current_gt_graph, 'batch') and hasattr(gt_graph_next, 'batch')):
                         
-                        current_batch_np = current_gt_graph.batch.cpu().numpy()
-                        next_batch_np = gt_graph_next.batch.cpu().numpy()
+                        # Keep batch tensors on GPU for faster processing
+                        current_batch_tensor = current_gt_graph.batch
+                        next_batch_tensor = gt_graph_next.batch
                         
-                        current_id_to_idx = {}
-                        for idx in range(len(current_gt_graph.agent_ids)):
-                            if idx < len(current_batch_np):
-                                bid = int(current_batch_np[idx])
-                                aid = current_gt_graph.agent_ids[idx]
-                                current_id_to_idx[(bid, aid)] = idx
+                        # Build mappings (need CPU for dict keys, but minimize data transfer)
+                        current_batch_np = current_batch_tensor.cpu().numpy()
+                        next_batch_np = next_batch_tensor.cpu().numpy()
                         
-                        next_id_to_idx = {}
-                        for idx in range(len(gt_graph_next.agent_ids)):
-                            if idx < len(next_batch_np):
-                                bid = int(next_batch_np[idx])
-                                aid = gt_graph_next.agent_ids[idx]
-                                next_id_to_idx[(bid, aid)] = idx
+                        # Vectorized dictionary building
+                        num_current = min(len(current_gt_graph.agent_ids), len(current_batch_np))
+                        num_next = min(len(gt_graph_next.agent_ids), len(next_batch_np))
+                        
+                        current_id_to_idx = {(int(current_batch_np[i]), current_gt_graph.agent_ids[i]): i 
+                                            for i in range(num_current)}
+                        next_id_to_idx = {(int(next_batch_np[i]), gt_graph_next.agent_ids[i]): i 
+                                         for i in range(num_next)}
                         
                         common_ids = set(current_id_to_idx.keys()) & set(next_id_to_idx.keys())
                         
-                        for gid in common_ids:
-                            current_idx = current_id_to_idx[gid]
-                            next_idx = next_id_to_idx[gid]
-                            if current_idx < pred_displacement_meters.shape[0] and current_idx < current_gt_graph.pos.shape[0]:
-                                # Ensure both tensors are on the same device
-                                graph_for_prediction.pos[next_idx] = (current_gt_graph.pos[current_idx].to(device) + 
-                                                                       pred_displacement_meters[current_idx].to(device))
+                        if common_ids:
+                            # GPU-accelerated batch update using advanced indexing
+                            current_indices = torch.tensor([current_id_to_idx[gid] for gid in common_ids], 
+                                                          device=device, dtype=torch.long)
+                            next_indices = torch.tensor([next_id_to_idx[gid] for gid in common_ids], 
+                                                       device=device, dtype=torch.long)
+                            
+                            # Validate indices and create valid mask on GPU
+                            valid_mask = (current_indices < pred_displacement_meters.shape[0]) & \
+                                        (current_indices < current_gt_graph.pos.shape[0]) & \
+                                        (next_indices < graph_for_prediction.pos.shape[0])
+                            
+                            if valid_mask.any():
+                                valid_current = current_indices[valid_mask]
+                                valid_next = next_indices[valid_mask]
+                                
+                                # Batch update positions on GPU - single operation!
+                                graph_for_prediction.pos[valid_next] = (current_gt_graph.pos[valid_current] + 
+                                                                        pred_displacement_meters[valid_current])
                     else:
                         # Fallback: only update if sizes match
                         if current_gt_graph.pos.shape[0] == pred_displacement_meters.shape[0] == graph_for_prediction.pos.shape[0]:
@@ -921,18 +933,14 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 pred_batch_np = pred_batch.cpu().numpy()
                 target_batch_np = target_batch.cpu().numpy()
                 
-                # Build mapping: (batch_idx, agent_id) -> node_index
-                pred_id_to_idx = {}
-                for idx in range(pred_num_nodes):
-                    bid = int(pred_batch_np[idx])
-                    aid = pred_agent_ids[idx]
-                    pred_id_to_idx[(bid, aid)] = idx
+                # Build mapping: (batch_idx, agent_id) -> node_index using vectorized operations
+                pred_indices_arr = np.arange(pred_num_nodes)
+                pred_bids = pred_batch_np[pred_indices_arr].astype(int)
+                pred_id_to_idx = {(bid, aid): idx for idx, bid, aid in zip(pred_indices_arr, pred_bids, pred_agent_ids)}
                 
-                target_id_to_idx = {}
-                for idx in range(target_num_nodes):
-                    bid = int(target_batch_np[idx])
-                    aid = target_agent_ids[idx]
-                    target_id_to_idx[(bid, aid)] = idx
+                target_indices_arr = np.arange(target_num_nodes)
+                target_bids = target_batch_np[target_indices_arr].astype(int)
+                target_id_to_idx = {(bid, aid): idx for idx, bid, aid in zip(target_indices_arr, target_bids, target_agent_ids)}
                 
                 # Find common agents (same batch AND same agent ID)
                 common_ids = set(pred_id_to_idx.keys()) & set(target_id_to_idx.keys())
@@ -1037,33 +1045,36 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         
                         if (source_agent_ids is not None and source_batch is not None and
                             len(source_agent_ids) == source_gt_graph.y.shape[0]):
-                            # Build mapping for source graph
+                            # Build mapping for source graph (minimal CPU operation)
                             source_batch_np = source_batch.cpu().numpy()
-                            source_id_to_idx = {}
-                            for idx in range(len(source_agent_ids)):
-                                bid = int(source_batch_np[idx])
-                                aid = source_agent_ids[idx]
-                                source_id_to_idx[(bid, aid)] = idx
+                            source_id_to_idx = {(int(source_batch_np[i]), source_agent_ids[i]): i 
+                                               for i in range(len(source_agent_ids))}
                             
-                            # Get GT displacement for each aligned agent
-                            target_list = []
-                            for i, idx in enumerate(pred_indices.cpu().numpy()):
-                                # Get the agent ID from pred graph
+                            # Get pred info once
+                            pred_batch_np = pred_batch.cpu().numpy()
+                            
+                            # Build list of source indices for each pred index
+                            source_indices_list = []
+                            for idx in pred_indices.cpu().numpy():
                                 if idx < len(pred_agent_ids):
-                                    aid = pred_agent_ids[idx]
-                                    bid = int(pred_batch.cpu().numpy()[idx])
-                                    gid = (bid, aid)
-                                    
-                                    if gid in source_id_to_idx:
-                                        source_idx = source_id_to_idx[gid]
-                                        target_list.append(source_gt_graph.y[source_idx])
-                                    else:
-                                        # Agent not in source - shouldn't happen, use zeros
-                                        target_list.append(torch.zeros(2, device=device))
+                                    gid = (int(pred_batch_np[idx]), pred_agent_ids[idx])
+                                    source_idx = source_id_to_idx.get(gid, -1)
+                                    source_indices_list.append(source_idx)
                                 else:
-                                    target_list.append(torch.zeros(2, device=device))
+                                    source_indices_list.append(-1)
                             
-                            target = torch.stack(target_list).to(pred.dtype)
+                            # GPU-accelerated target gathering using torch.where and indexing
+                            source_indices_tensor = torch.tensor(source_indices_list, device=device, dtype=torch.long)
+                            valid_mask = source_indices_tensor >= 0
+                            
+                            if valid_mask.any():
+                                # Initialize target with zeros
+                                target = torch.zeros(len(source_indices_list), 2, device=device, dtype=pred.dtype)
+                                # Batch gather valid targets on GPU
+                                valid_source_indices = source_indices_tensor[valid_mask]
+                                target[valid_mask] = source_gt_graph.y[valid_source_indices].to(pred.dtype)
+                            else:
+                                target = torch.zeros(len(source_indices_list), 2, device=device, dtype=pred.dtype)
                         else:
                             # Fallback: use target_graph.y directly (assumes alignment)
                             target = source_gt_graph.y[target_indices].to(pred.dtype)
@@ -1145,20 +1156,27 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # Accumulate predicted displacements WITH gradients
                 pred_disp_grad = pred_aligned * POSITION_SCALE  # [num_aligned, 2] in meters
                 
-                # Update accumulated displacements for each aligned agent
+                # Update accumulated displacements for each aligned agent using vectorized operations
                 if pred_indices is not None:
                     pred_batch_np = pred_batch.cpu().numpy()
-                    for i, idx in enumerate(pred_indices.cpu().numpy()):
-                        if idx < len(pred_agent_ids) and i < pred_disp_grad.shape[0]:
-                            bid = int(pred_batch_np[idx])
-                            aid = pred_agent_ids[idx]
-                            agent_key = (bid, aid)
-                            
-                            disp_with_grad = pred_disp_grad[i]
-                            if agent_key in accumulated_pred_displacements_grad:
-                                accumulated_pred_displacements_grad[agent_key] = accumulated_pred_displacements_grad[agent_key] + disp_with_grad
-                            else:
-                                accumulated_pred_displacements_grad[agent_key] = disp_with_grad
+                    pred_indices_np = pred_indices.cpu().numpy()
+                    
+                    # Create masks for valid indices
+                    valid_mask = (pred_indices_np < len(pred_agent_ids)) & (np.arange(len(pred_indices_np)) < pred_disp_grad.shape[0])
+                    valid_pred_indices = pred_indices_np[valid_mask]
+                    valid_i = np.where(valid_mask)[0]
+                    
+                    # Batch update displacements
+                    for i, idx in zip(valid_i, valid_pred_indices):
+                        bid = int(pred_batch_np[idx])
+                        aid = pred_agent_ids[idx]
+                        agent_key = (bid, aid)
+                        
+                        disp_with_grad = pred_disp_grad[i]
+                        if agent_key in accumulated_pred_displacements_grad:
+                            accumulated_pred_displacements_grad[agent_key] = accumulated_pred_displacements_grad[agent_key] + disp_with_grad
+                        else:
+                            accumulated_pred_displacements_grad[agent_key] = disp_with_grad
                 
                 # Compute trajectory position error for agents we have accumulated displacements
                 source_gt_graph = batched_graph_sequence[t]  # Start graph
@@ -1166,25 +1184,48 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 source_agent_ids = getattr(source_gt_graph, 'agent_ids', None)
                 
                 if source_agent_ids is not None and source_batch_np is not None:
-                    traj_errors = []
+                    # Build source mapping (minimal CPU transfer)
+                    num_source = min(len(source_agent_ids), len(source_batch_np), source_gt_graph.pos.shape[0])
+                    source_key_to_idx = {(int(source_batch_np[i]), source_agent_ids[i]): i 
+                                        for i in range(num_source)}
+                    
+                    target_batch_np = target_batch.cpu().numpy()
+                    
+                    # Build parallel lists for GPU batch processing
+                    target_pos_indices = []
+                    source_pos_indices = []
+                    agent_keys_for_grad_update = []
+                    
                     for i, target_idx in enumerate(target_indices.cpu().numpy()):
                         if target_idx < len(target_agent_ids):
-                            bid = int(target_batch.cpu().numpy()[target_idx])
+                            bid = int(target_batch_np[target_idx])
                             aid = target_agent_ids[target_idx]
                             agent_key = (bid, aid)
                             
-                            if agent_key in accumulated_pred_displacements_grad:
-                                # Find start position
-                                for si in range(len(source_agent_ids)):
-                                    if si < len(source_batch_np):
-                                        if int(source_batch_np[si]) == bid and source_agent_ids[si] == aid:
-                                            if si < source_gt_graph.pos.shape[0]:
-                                                gt_start = source_gt_graph.pos[si].to(pred.device)
-                                                gt_target = target_graph.pos[target_idx].to(pred.device)
-                                                pred_pos = gt_start + accumulated_pred_displacements_grad[agent_key]
-                                                pos_error = torch.norm(pred_pos - gt_target)
-                                                traj_errors.append(pos_error)
-                                            break
+                            if agent_key in accumulated_pred_displacements_grad and agent_key in source_key_to_idx:
+                                source_idx = source_key_to_idx[agent_key]
+                                target_pos_indices.append(target_idx)
+                                source_pos_indices.append(source_idx)
+                                agent_keys_for_grad_update.append(agent_key)
+                    
+                    if target_pos_indices:
+                        # GPU batch operations - gather positions in one go
+                        target_pos_tensor = torch.tensor(target_pos_indices, device=device, dtype=torch.long)
+                        source_pos_tensor = torch.tensor(source_pos_indices, device=device, dtype=torch.long)
+                        
+                        # Batch gather GT positions on GPU
+                        gt_starts = source_gt_graph.pos[source_pos_tensor]  # [N, 2]
+                        gt_targets = target_graph.pos[target_pos_tensor]    # [N, 2]
+                        
+                        # Stack accumulated displacements in same order
+                        accum_disps = torch.stack([accumulated_pred_displacements_grad[key] 
+                                                   for key in agent_keys_for_grad_update])  # [N, 2]
+                        
+                        # Batch compute predicted positions and errors on GPU
+                        pred_positions = gt_starts + accum_disps  # [N, 2]
+                        pos_errors = torch.norm(pred_positions - gt_targets, dim=1)  # [N]
+                        
+                        traj_errors = list(pos_errors)  # Keep as tensor list for stacking
                     
                     if traj_errors:
                         # Mean trajectory error - DIRECT position error in meters
@@ -1253,22 +1294,29 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 # Accumulate displacements per agent for position error computation
                 # This handles agent alignment correctly by using global agent IDs
                 if agent_ids_valid:
-                    # Update accumulated displacements for each aligned agent
+                    # Update accumulated displacements using vectorized operations
                     pred_batch_np = pred_batch.cpu().numpy()
-                    for i, idx in enumerate(pred_indices.cpu().numpy()):
-                        if idx < len(pred_agent_ids) and i < pred_disp_meters.shape[0]:
-                            bid = int(pred_batch_np[idx])
-                            aid = pred_agent_ids[idx]
-                            agent_key = (bid, aid)
-                            
-                            # Get displacement for this agent
-                            disp = pred_disp_meters[i].cpu()
-                            
-                            # Accumulate (or initialize if first time)
-                            if agent_key in accumulated_displacements:
-                                accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
-                            else:
-                                accumulated_displacements[agent_key] = disp
+                    pred_indices_np = pred_indices.cpu().numpy()
+                    
+                    # Create validity mask
+                    valid_mask = (pred_indices_np < len(pred_agent_ids)) & (np.arange(len(pred_indices_np)) < pred_disp_meters.shape[0])
+                    valid_pred_indices = pred_indices_np[valid_mask]
+                    valid_i = np.where(valid_mask)[0]
+                    
+                    # Batch process displacements
+                    for i, idx in zip(valid_i, valid_pred_indices):
+                        bid = int(pred_batch_np[idx])
+                        aid = pred_agent_ids[idx]
+                        agent_key = (bid, aid)
+                        
+                        # Get displacement for this agent
+                        disp = pred_disp_meters[i].cpu()
+                        
+                        # Accumulate (or initialize if first time)
+                        if agent_key in accumulated_displacements:
+                            accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
+                        else:
+                            accumulated_displacements[agent_key] = disp
                 
                 # Compute position errors using accumulated displacements
                 # predicted_position = GT_start_position + accumulated_displacement
@@ -1279,39 +1327,45 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     source_agent_ids = getattr(source_gt_graph, 'agent_ids', None)
                     
                     target_batch_np = target_batch.cpu().numpy()
+                    target_indices_np = target_indices.cpu().numpy()
                     
+                    # Build source mapping using vectorized operations
+                    if source_agent_ids is not None and source_batch_np is not None:
+                        source_valid = np.arange(min(len(source_agent_ids), len(source_batch_np)))
+                        source_bids_np = source_batch_np[source_valid].astype(int)
+                        source_aids = [source_agent_ids[i] for i in source_valid]
+                        source_key_to_idx = {(bid, aid): idx for idx, bid, aid in zip(source_valid, source_bids_np, source_aids)}
+                    else:
+                        source_key_to_idx = {}
+                    
+                    # Vectorized position error computation
                     step_errors_list = []
-                    for i, target_idx in enumerate(target_indices.cpu().numpy()):
-                        if target_idx < len(target_agent_ids):
-                            bid = int(target_batch_np[target_idx])
-                            aid = target_agent_ids[target_idx]
-                            agent_key = (bid, aid)
-                            
-                            # Get GT target position
-                            gt_target_pos = target_graph.pos[target_idx].cpu()
-                            
-                            # Compute predicted position: start_pos + accumulated_displacement
-                            # NOTE: We use GT start position (at t=0) even when scheduled sampling uses
-                            # predicted graphs, because ADE/FDE measure total deviation from GT start.
-                            # Mathematically: predicted_pos_t = pos_0 + sum(displacements_0_to_t)
-                            # This is equivalent to iterative: pos_t = pos_{t-1} + disp_t
-                            # Each displacement was predicted from either GT or predicted state (scheduled sampling).
-                            if agent_key in accumulated_displacements and source_agent_ids is not None:
-                                # Find start position in source graph (t=0)
-                                source_idx = None
-                                for si in range(len(source_agent_ids)):
-                                    if si < len(source_batch_np):
-                                        if int(source_batch_np[si]) == bid and source_agent_ids[si] == aid:
-                                            source_idx = si
-                                            break
+                    valid_target_mask = target_indices_np < len(target_agent_ids)
+                    valid_target_indices = target_indices_np[valid_target_mask]
+                    
+                    for target_idx in valid_target_indices:
+                        bid = int(target_batch_np[target_idx])
+                        aid = target_agent_ids[target_idx]
+                        agent_key = (bid, aid)
+                        
+                        # Get GT target position
+                        gt_target_pos = target_graph.pos[target_idx].cpu()
+                        
+                        # Compute predicted position: start_pos + accumulated_displacement
+                        # NOTE: We use GT start position (at t=0) even when scheduled sampling uses
+                        # predicted graphs, because ADE/FDE measure total deviation from GT start.
+                        # Mathematically: predicted_pos_t = pos_0 + sum(displacements_0_to_t)
+                        # This is equivalent to iterative: pos_t = pos_{t-1} + disp_t
+                        # Each displacement was predicted from either GT or predicted state (scheduled sampling).
+                        if agent_key in accumulated_displacements and agent_key in source_key_to_idx:
+                            source_idx = source_key_to_idx[agent_key]
+                            if source_idx < source_gt_graph.pos.shape[0]:
+                                gt_start_pos = source_gt_graph.pos[source_idx].cpu()
+                                predicted_pos = gt_start_pos + accumulated_displacements[agent_key]
                                 
-                                if source_idx is not None and source_idx < source_gt_graph.pos.shape[0]:
-                                    gt_start_pos = source_gt_graph.pos[source_idx].cpu()
-                                    predicted_pos = gt_start_pos + accumulated_displacements[agent_key]
-                                    
-                                    # Compute position error
-                                    error = torch.norm(predicted_pos - gt_target_pos).item()
-                                    step_errors_list.append(error)
+                                # Compute position error
+                                error = torch.norm(predicted_pos - gt_target_pos).item()
+                                step_errors_list.append(error)
                     
                     if step_errors_list:
                         step_errors_meters = torch.tensor(step_errors_list, device=device)
@@ -1575,19 +1629,21 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     pred_batch = graph_for_prediction.batch
                     pred_batch_np = pred_batch.cpu().numpy()
                     
-                    for node_idx in range(pred_disp_meters.shape[0]):
-                        if node_idx < len(pred_agent_ids) and node_idx < len(pred_batch_np):
-                            bid = int(pred_batch_np[node_idx])
-                            aid = pred_agent_ids[node_idx]
-                            agent_key = (bid, aid)
-                            
-                            disp = pred_disp_meters[node_idx].cpu()
-                            
-                            # Accumulate displacement
-                            if agent_key in accumulated_displacements:
-                                accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
-                            else:
-                                accumulated_displacements[agent_key] = disp
+                    # Minimize CPU operations - batch process on GPU then transfer
+                    num_valid = min(pred_disp_meters.shape[0], len(pred_agent_ids), len(pred_batch_np))
+                    
+                    # Process displacements in batch (already on device from pred_disp_meters)
+                    for node_idx in range(num_valid):
+                        bid = int(pred_batch_np[node_idx])
+                        aid = pred_agent_ids[node_idx]
+                        agent_key = (bid, aid)
+                        disp = pred_disp_meters[node_idx].cpu()  # Single transfer per displacement
+                        
+                        # Accumulate displacement
+                        if agent_key in accumulated_displacements:
+                            accumulated_displacements[agent_key] = accumulated_displacements[agent_key] + disp
+                        else:
+                            accumulated_displacements[agent_key] = disp
                 
                 # Compute position errors: predicted_pos = start_pos + accumulated_displacement
                 if hasattr(target_graph, 'pos') and target_graph.pos is not None:
@@ -1604,31 +1660,45 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     if (start_agent_ids is not None and target_agent_ids is not None and 
                         start_batch_np is not None and target_batch_np is not None):
                         
-                        for target_idx in range(len(target_agent_ids)):
-                            if target_idx < len(target_batch_np) and target_idx < target_graph.pos.shape[0]:
-                                bid = int(target_batch_np[target_idx])
-                                aid = target_agent_ids[target_idx]
-                                agent_key = (bid, aid)
-                                
-                                # Get GT target position
-                                gt_target_pos = target_graph.pos[target_idx].cpu()
-                                
-                                # Find start position
-                                if agent_key in accumulated_displacements:
-                                    start_idx = None
-                                    for si in range(len(start_agent_ids)):
-                                        if si < len(start_batch_np):
-                                            if int(start_batch_np[si]) == bid and start_agent_ids[si] == aid:
-                                                start_idx = si
-                                                break
-                                    
-                                    if start_idx is not None and start_idx < start_graph.pos.shape[0]:
-                                        gt_start_pos = start_graph.pos[start_idx].cpu()
-                                        predicted_pos = gt_start_pos + accumulated_displacements[agent_key]
-                                        
-                                        # Position error
-                                        error = torch.norm(predicted_pos - gt_target_pos).item()
-                                        step_errors_list.append(error)
+                        # Build start_key_to_idx mapping (minimal CPU work)
+                        num_start = min(len(start_agent_ids), len(start_batch_np), start_graph.pos.shape[0])
+                        start_key_to_idx = {(int(start_batch_np[i]), start_agent_ids[i]): i 
+                                           for i in range(num_start)}
+                        
+                        # Build parallel lists for GPU batch gather
+                        target_pos_indices = []
+                        start_pos_indices = []
+                        agent_keys_for_errors = []
+                        
+                        num_target = min(len(target_agent_ids), len(target_batch_np), target_graph.pos.shape[0])
+                        for target_idx in range(num_target):
+                            bid = int(target_batch_np[target_idx])
+                            aid = target_agent_ids[target_idx]
+                            agent_key = (bid, aid)
+                            
+                            if agent_key in accumulated_displacements and agent_key in start_key_to_idx:
+                                start_idx = start_key_to_idx[agent_key]
+                                target_pos_indices.append(target_idx)
+                                start_pos_indices.append(start_idx)
+                                agent_keys_for_errors.append(agent_key)
+                        
+                        if target_pos_indices:
+                            # GPU batch gather operations
+                            target_pos_tensor = torch.tensor(target_pos_indices, device=device, dtype=torch.long)
+                            start_pos_tensor = torch.tensor(start_pos_indices, device=device, dtype=torch.long)
+                            
+                            # Batch gather positions on GPU
+                            gt_target_positions = target_graph.pos[target_pos_tensor].cpu()  # [N, 2]
+                            gt_start_positions = start_graph.pos[start_pos_tensor].cpu()    # [N, 2]
+                            
+                            # Stack accumulated displacements (already on CPU)
+                            accum_disps = torch.stack([accumulated_displacements[key] 
+                                                      for key in agent_keys_for_errors])  # [N, 2]
+                            
+                            # Batch compute predicted positions and errors
+                            predicted_positions = gt_start_positions + accum_disps  # [N, 2]
+                            errors = torch.norm(predicted_positions - gt_target_positions, dim=1)  # [N]
+                            step_errors_list = errors.tolist()
                     
                     if step_errors_list:
                         step_errors_meters = torch.tensor(step_errors_list, device=device)
@@ -1667,22 +1737,21 @@ def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_par
                     computed_agent_keys = []
                     if (start_agent_ids is not None and target_agent_ids is not None and 
                         start_batch_np is not None and target_batch_np is not None):
-                        for target_idx in range(len(target_agent_ids)):
-                            if target_idx < len(target_batch_np) and target_idx < target_graph.pos.shape[0]:
-                                bid = int(target_batch_np[target_idx])
-                                aid = target_agent_ids[target_idx]
-                                agent_key = (bid, aid)
-                                if agent_key in accumulated_displacements:
-                                    # Check if we found start position
-                                    has_start = False
-                                    for si in range(len(start_agent_ids)):
-                                        if si < len(start_batch_np):
-                                            if int(start_batch_np[si]) == bid and start_agent_ids[si] == aid:
-                                                if si < start_graph.pos.shape[0]:
-                                                    has_start = True
-                                                break
-                                    if has_start:
-                                        computed_agent_keys.append(agent_key)
+                        # Build start lookup using vectorized operations
+                        start_valid = np.arange(min(len(start_agent_ids), len(start_batch_np), start_graph.pos.shape[0]))
+                        start_bids_np = start_batch_np[start_valid].astype(int)
+                        start_aids = [start_agent_ids[i] for i in start_valid]
+                        start_keys = {(bid, aid) for bid, aid in zip(start_bids_np, start_aids)}
+                        
+                        # Vectorized agent key collection
+                        valid_target_indices = np.arange(min(len(target_agent_ids), len(target_batch_np), target_graph.pos.shape[0]))
+                        target_bids = target_batch_np[valid_target_indices].astype(int)
+                        target_aids = [target_agent_ids[idx] for idx in valid_target_indices]
+                        
+                        for bid, aid in zip(target_bids, target_aids):
+                            agent_key = (bid, aid)
+                            if agent_key in accumulated_displacements and agent_key in start_keys:
+                                computed_agent_keys.append(agent_key)
                     
                     # Now store errors with correct agent keys
                     for i, error_val in enumerate(step_errors_list):
