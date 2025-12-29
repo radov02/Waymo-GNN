@@ -187,7 +187,7 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             # Use T//3 for warmup to match finetuning validation approach
             start_t = T // 3
             print(f"Scenario {scenario_count+1} ({scenario_ids[0] if scenario_ids else 'unknown'}): "
-                  f"Warming up GRU with {start_t} steps, then rolling out {num_rollout_steps} steps...")
+                  f"Warming up GRU with {start_t} steps, then rolling out {actual_rollout} steps...")
             
             # WARM UP GRU: Run through timesteps 0 to start_t to build temporal context
             # This matches training/finetuning which processes sequences from t=0
@@ -216,6 +216,11 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
                     ground_truths.append(gt_graph.y.cpu())
                 else:
                     break
+            
+            # Debug: Check if we have enough rollout steps
+            if len(predictions) < min(horizons):
+                print(f"  WARNING: Only {len(predictions)} predictions (need {min(horizons)} for shortest horizon)")
+                print(f"           T={T}, start_t={start_t}, actual_rollout={actual_rollout}")
             
             scenario_metrics = {}
             for horizon in horizons:
@@ -301,9 +306,12 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
     return results
 
 
-def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
+def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device, num_rollout_steps=None):
     """Visualize predictions vs ground truth for a test scenario."""
     os.makedirs(save_dir, exist_ok=True)
+    
+    if num_rollout_steps is None:
+        num_rollout_steps = test_num_rollout_steps
     
     batched_graph_sequence = batch_dict["batch"]
     T = batch_dict["T"]
@@ -316,8 +324,8 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         try:
             scenario = load_scenario_by_id(
                 scenario_ids[0],
-                tfrecord_dir='./data/scenario/testing',
-                max_files=max_scenario_files_for_viz
+                scenario_dirs=['./data/scenario/testing'],
+                max_files_for_index=max_scenario_files_for_viz
             )
             if scenario is not None:
                 print(f"  Loaded scenario {scenario_ids[0]} for map visualization")
@@ -400,7 +408,8 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     
     # Run autoregressive prediction with proper warmup (matching finetuning validation)
     start_t = T // 3
-    num_rollout_steps = min(T - start_t - 1, 20)
+    # Use the test_num_rollout_steps from config (default 50) capped by available timesteps
+    num_rollout_steps = min(test_num_rollout_steps, T - start_t - 1)
     
     if num_rollout_steps <= 0:
         print(f"  Not enough timesteps for visualization")
@@ -713,7 +722,7 @@ def run_testing(test_dataset_path=test_hdf5_path,
             if viz_count >= visualize_max:
                 break
             
-            ade = visualize_test_scenario(model, batch_dict, batch_idx, gat_viz_dir_testing, device)
+            ade = visualize_test_scenario(model, batch_dict, batch_idx, gat_viz_dir_testing, device, num_rollout_steps=effective_rollout)
             if ade is not None:
                 total_ade += ade
                 viz_count += 1
