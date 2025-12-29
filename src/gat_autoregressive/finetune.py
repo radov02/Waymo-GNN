@@ -2,6 +2,9 @@
 
 import sys
 import os
+# Set CUDA memory allocation config BEFORE importing PyTorch
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 # Add parent directory (src/) to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import matplotlib
