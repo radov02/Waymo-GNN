@@ -35,7 +35,8 @@ from config import (device, batch_size, gat_num_workers, num_layers, num_gru_lay
                     use_gradient_checkpointing, POSITION_SCALE,
                     gat_checkpoint_dir, gat_checkpoint_dir_autoreg, gat_viz_dir_testing,
                     test_hdf5_path, test_num_rollout_steps, test_max_scenarios,
-                    test_visualize, test_visualize_max, test_use_wandb, test_horizons)
+                    test_visualize, test_visualize_max, test_use_wandb, test_horizons,
+                    autoreg_skip_map_features, max_scenario_files_for_viz)
 from torch.utils.data import DataLoader
 from helper_functions.graph_creation_functions import collate_graph_sequences_to_batch
 from helper_functions.helpers import compute_metrics
@@ -309,6 +310,21 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     scenario_ids = batch_dict.get("scenario_ids", [])
     scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{scenario_idx}"
     
+    # Load scenario for map features (matching finetuning approach)
+    scenario = None
+    if not autoreg_skip_map_features and scenario_ids and scenario_ids[0] and scenario_ids[0] != "unknown":
+        try:
+            scenario = load_scenario_by_id(
+                scenario_ids[0],
+                tfrecord_dir='./data/scenario/testing',
+                max_files=max_scenario_files_for_viz
+            )
+            if scenario is not None:
+                print(f"  Loaded scenario {scenario_ids[0]} for map visualization")
+        except Exception as e:
+            print(f"  Warning: Could not load scenario for map features: {e}")
+            scenario = None
+    
     for t in range(T):
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
     
@@ -331,7 +347,15 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         device=device
     )
     
-    # Find persistent agents
+    # Find SDC (ego vehicle) for priority visualization
+    sdc_id = None
+    if scenario is not None:
+        for track in scenario.tracks:
+            if track.object_type == 3:  # TYPE_EGO_VEHICLE = 3
+                sdc_id = track.id
+                break
+    
+    # Find persistent agents (present throughout sequence)
     # Use agent_id if available, otherwise use node indices
     has_agent_ids = hasattr(batched_graph_sequence[0], 'agent_id') and batched_graph_sequence[0].agent_id is not None
     
@@ -349,7 +373,7 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     else:
         # Use node indices as agent IDs
         num_agents = batched_graph_sequence[0].num_nodes
-        persistent_agent_ids = list(range(min(num_agents, 20)))  # Limit to 20 agents for visualization
+        persistent_agent_ids = list(range(num_agents))
     
     if len(persistent_agent_ids) == 0:
         print(f"  No persistent agents found, skipping visualization")
@@ -439,18 +463,57 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
                     error_meters = np.linalg.norm(current_pos - gt_pos)
                     agent_errors[agent_id].append(error_meters)
     
-    # Create visualization
+    # Select agents to visualize (matching finetuning approach)
+    # Prioritize: 1) SDC (ego), 2) Most active agents (by movement)
+    max_agents_viz = 10
+    agent_movements = {}
+    
+    for agent_id in persistent_agent_ids:
+        if agent_id not in gt_positions or len(gt_positions[agent_id]) < 2:
+            continue
+        # Compute total movement (sum of distances between consecutive positions)
+        positions = np.array(gt_positions[agent_id])
+        total_movement = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
+        agent_movements[agent_id] = total_movement
+    
+    # Select agents: SDC first, then by movement
+    selected_agent_ids = []
+    if sdc_id is not None and sdc_id in agent_movements:
+        selected_agent_ids.append(sdc_id)
+    
+    # Add most active agents (excluding SDC if already added)
+    other_agents = [aid for aid in agent_movements.keys() if aid != sdc_id]
+    other_agents_sorted = sorted(other_agents, key=lambda aid: agent_movements[aid], reverse=True)
+    remaining_slots = max_agents_viz - len(selected_agent_ids)
+    selected_agent_ids.extend(other_agents_sorted[:remaining_slots])
+    
+    if len(selected_agent_ids) == 0:
+        print(f"  No agents with sufficient movement, skipping visualization")
+        return
+    
+    # Create visualization with map features (matching finetuning)
     fig, ax = plt.subplots(figsize=(14, 11))
     
-    colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(persistent_agent_ids))))
-    agent_colors = {agent_id: colors[i % len(colors)] for i, agent_id in enumerate(persistent_agent_ids)}
+    # Draw map features if available (roads, lanes, etc.)
+    if scenario is not None:
+        draw_map_features(ax, scenario)
+    
+    # Assign colors (SDC gets special color, others get vibrant colors)
+    agent_colors = {}
+    color_idx = 0
+    for agent_id in selected_agent_ids:
+        if agent_id == sdc_id:
+            agent_colors[agent_id] = SDC_COLOR
+        else:
+            agent_colors[agent_id] = VIBRANT_COLORS[color_idx % len(VIBRANT_COLORS)]
+            color_idx += 1
     
     # Compute metrics across all agents
     all_ades = []
     all_fdes = []
     num_agents_plotted = 0
     
-    for agent_id in persistent_agent_ids:
+    for agent_id in selected_agent_ids:
         gt_traj = np.array(gt_positions[agent_id])
         pred_traj = np.array(pred_positions[agent_id])
         
@@ -459,13 +522,19 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         
         color = agent_colors[agent_id]
         
+        # Create label with agent ID and type (SDC if applicable)
+        if agent_id == sdc_id:
+            label_prefix = f'SDC (ID {agent_id})'
+        else:
+            label_prefix = f'Agent {agent_id}'
+        
         # Plot ground truth trajectory
-        ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color=color, linewidth=1.5, alpha=0.8,
-                label=f'Agent {agent_id} GT' if num_agents_plotted < 5 else None)
+        ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color=color, linewidth=2.0, alpha=0.8,
+                label=f'{label_prefix} GT' if num_agents_plotted < 5 else None)
         
         # Plot predicted trajectory
-        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, linewidth=1.5, alpha=0.8,
-                label=f'Agent {agent_id} Pred' if num_agents_plotted < 5 else None)
+        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, linewidth=2.0, alpha=0.8,
+                label=f'{label_prefix} Pred' if num_agents_plotted < 5 else None)
         
         # Mark start point (circle)
         ax.scatter(gt_traj[0, 0], gt_traj[0, 1], color=color, marker='o', s=50, 
