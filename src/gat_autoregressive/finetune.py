@@ -227,35 +227,46 @@ def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmu
 def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     """Curriculum learning: gradually increase rollout length.
     
-    IMPROVED: Start with moderate rollouts and increase faster.
-    The model needs to experience trajectory divergence early to learn
-    how to correct it. Starting too short means the model never sees
-    the accumulated error problem until late in training.
+    IMPROVED v2: Start with SHORT rollouts so model masters basics first.
+    The model needs to learn accurate single-step predictions before
+    it can handle long trajectory rollouts. Starting too long leads to
+    compounding errors the model can't learn to correct.
     
     Args:
         epoch: Current epoch (0-indexed)
-        max_rollout_steps: Maximum rollout steps (e.g., 89)
+        max_rollout_steps: Maximum rollout steps (e.g., 50)
         total_epochs: Total training epochs
     
     Returns:
         Number of rollout steps to use this epoch
     """
-    # Start with 20 steps (2 seconds) - enough to see trajectory divergence
-    # Increase faster: reach max at 60% of training, not 100%
-    min_steps = 20
+    # Start with 5 steps (0.5 seconds) - model must master basics first
+    # Gradually increase: reach max at 70% of training, maintain for final 30%
+    min_steps = 5
     
-    # Use 60% of epochs to reach max, then maintain max for remaining 40%
-    ramp_epochs = int(total_epochs * 0.6)
+    # Use 70% of epochs to reach max, then maintain max for remaining 30%
+    ramp_epochs = int(total_epochs * 0.7)
     if epoch >= ramp_epochs:
         return max_rollout_steps
     
+    # Quadratic ramp: slower start, faster increase later
     progress = epoch / max(1, ramp_epochs - 1)
-    steps = int(min_steps + (max_rollout_steps - min_steps) * progress)
+    progress_curved = progress ** 1.5  # Slower initial ramp
+    steps = int(min_steps + (max_rollout_steps - min_steps) * progress_curved)
     return min(steps, max_rollout_steps)
 
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
                                      is_parallel, save_dir=None, total_epochs=40, model_type=None):
     """Visualize autoregressive rollout predictions vs ground truth.
+    
+    NOTE: This visualization runs in FULL AUTOREGRESSIVE MODE (100% model predictions)
+    regardless of the training sampling probability! This is intentional - we want to see
+    how the model performs at inference time, not during training.
+    
+    At epoch 1, expect poor results because the base model was trained with pure teacher
+    forcing (always GT inputs) and has never seen its own errors. The scheduled sampling
+    fine-tuning will gradually improve this over epochs as the model learns to correct
+    for its own prediction errors.
     
     Model predicts displacement → updates positions → derives all 15-dim node features.
     
@@ -281,6 +292,14 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
             save_dir = gcn_viz_dir_autoreg
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
+    
+    # Clarify that visualization runs full autoregressive (not scheduled sampling)
+    if epoch == 0:
+        train_sampling_prob = scheduled_sampling_probability(0, total_epochs, strategy='linear')
+        print(f"\n  [VIZ NOTE] Visualization runs FULL AUTOREGRESSIVE (100% model predictions)!")
+        print(f"  [VIZ NOTE] Training uses {train_sampling_prob:.0%} model predictions at epoch 1.")
+        print(f"  [VIZ NOTE] Poor results at epoch 1 are EXPECTED - the base model was trained with")
+        print(f"  [VIZ NOTE] pure teacher forcing and hasn't learned to correct its own errors yet.\n")
     
     print(f"  [VIZ] Autoregressive rollout: model predicts displacement → derives features (epoch {epoch+1}/{total_epochs})")
     

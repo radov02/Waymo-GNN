@@ -26,9 +26,9 @@ use_edge_weights = False    # False to disable distance-based edge weights
 # ============== SpatioTemporalGNN model (GCN and GAT) ==============
 input_dim = 15      # 11 properties (vx, vy, speed, heading, valid, ax, ay, rel_x_sdc, rel_y_sdc, dist_sdc, dist_nearest) + 4 one-hot object type
 output_dim = 2      # Predict displacement (dx_norm, dy_norm) - normalized displacement to next position
-hidden_channels = 128   # capacity for complex patterns
-num_layers = 3      # number of GCN layers for spatial encoding
-num_gru_layers = 1  # number of GRU layers for temporal encoding
+hidden_channels = 256   # INCREASED: more capacity for complex multi-agent patterns
+num_layers = 4      # INCREASED: deeper spatial encoding for better agent interactions
+num_gru_layers = 2  # INCREASED: more temporal capacity for trajectory modeling
 dropout = 0.1       # to prevent overfitting
 gcn_checkpoint_dir = 'checkpoints/gcn'
 gcn_checkpoint_dir_autoreg = 'checkpoints/gcn/autoregressive'
@@ -68,7 +68,7 @@ gat_loss_delta = 0.15   # cosine similarity - balanced with angle
 visualize_every_n_epochs = 5
 visualize_final_epoch = True        # Always visualize the final epoch regardless of visualize_every_n_epochs
 visualize_first_batch_only = False
-max_nodes_per_graph_viz = 9  # max nodes to show per graph in visualization
+max_nodes_per_graph_viz = 12  # max nodes to show per graph in visualization
 show_timesteps_viz = 9      # show show_timesteps_viz evenly-spaced timesteps out of all scenario timespan
 viz_vehicles_only = True    # only show vehicles (not pedestrians/cyclists) in training visualization
 max_scenario_files_for_viz = 2  # index first n tfrecord files for faster scenario loading for visualization of map features
@@ -76,11 +76,11 @@ max_scenario_files_for_viz = 2  # index first n tfrecord files for faster scenar
 # CURRICULUM LEARNING: Training starts with 10 steps and gradually increases
 # to max_rollout_steps over training. This helps model learn progressively.
 autoreg_num_rollout_steps = 50       # Max rollout steps (50 = 5.0s horizon) - curriculum starts at 10
-autoreg_num_epochs = 10              # More epochs for slower sampling schedule
-autoreg_sampling_strategy = 'exponential'  # 'exponential' ramps slower than 'linear'
-autoreg_visualize_every_n_epochs = 1
+autoreg_num_epochs = 20              # INCREASED: more epochs for better convergence
+autoreg_sampling_strategy = 'linear'  # CHANGED: linear ramps faster for quicker autoregressive exposure
+autoreg_visualize_every_n_epochs = 2
 autoreg_skip_map_features = False
-autoreg_learning_rate = 0.0001        # lower LR for finetuning stability
+autoreg_learning_rate = 0.0005        # INCREASED: 5x higher LR for faster adaptation
 
 
 # ============== VectorNet model ==============

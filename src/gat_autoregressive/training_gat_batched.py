@@ -102,15 +102,20 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                                 visualize_callback=None):
     """Train for one epoch with BATCHED scenario processing.
     
-    Key difference from original: Processes B scenarios in parallel per batch.
+    Optimized for GPU utilization:
+    - Accumulates metrics on GPU tensors to reduce CPU-GPU sync
+    - Batches data transfer with non_blocking=True
+    - Minimizes .item() calls (only at batch end)
+    - Uses fused operations where possible
     """
     model.train()
     total_loss_epoch = 0.0
     steps = 0
     
-    total_cosine_sim = 0.0
-    total_mse = 0.0
-    total_angular = 0.0
+    # Use GPU tensors for metric accumulation (avoid per-timestep CPU sync)
+    total_cosine_sim = torch.tensor(0.0, device=device)
+    total_mse = torch.tensor(0.0, device=device)
+    total_angular = torch.tensor(0.0, device=device)
     metric_count = 0
     
     last_batch_dict = None
@@ -129,10 +134,10 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
         total_edges = batched_graph_sequence[0].edge_index.size(1)
         
         if batch_idx % log_every_n_batches == 0:
-            # Compute running averages for display
-            avg_mse_so_far = total_mse / max(1, metric_count)
-            avg_cos_so_far = total_cosine_sim / max(1, metric_count)
-            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0  # Convert normalized to meters
+            # Sync metrics only for logging (reduces sync frequency)
+            avg_mse_so_far = (total_mse / max(1, metric_count)).item() if metric_count > 0 else 0.0
+            avg_cos_so_far = (total_cosine_sim / max(1, metric_count)).item() if metric_count > 0 else 0.0
+            rmse_meters = (avg_mse_so_far ** 0.5) * 100.0
             
             if torch.cuda.is_available():
                 print(f"\n[Epoch {epoch+1}] Batch {batch_idx}/{total_batches} | "
@@ -145,23 +150,39 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                 if metric_count > 0:
                     print(f"  MSE={avg_mse_so_far:.6f} | RMSE={rmse_meters:.2f}m | CosSim={avg_cos_so_far:.4f}")
 
-        # Move all timesteps to device
+        # Move all timesteps to device in batch (non-blocking for async transfer)
         for t in range(T):
             batched_graph_sequence[t] = batched_graph_sequence[t].to(device, non_blocking=True)
+        
+        # Sync point to ensure all data is on GPU before processing
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
 
         # Reset GRU hidden states for this batch of scenarios
-        # The model internally handles per-scenario hidden states
         base_model = get_module(model)
         base_model.gru_hidden = None  # Reset for new batch
         
         optimizer.zero_grad(set_to_none=True)
-        accumulated_loss = 0.0
-        valid_timesteps = 0  # Track valid timesteps for averaging
+        
+        # Use GPU tensor for loss accumulation
+        accumulated_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        valid_timesteps = 0
+        
+        # Batch-level metric accumulators (GPU tensors)
+        batch_mse = torch.tensor(0.0, device=device)
+        batch_cos = torch.tensor(0.0, device=device)
+        batch_angular = torch.tensor(0.0, device=device)
+        batch_metric_count = 0
         
         for t, batched_graph in enumerate(batched_graph_sequence):
-            if batched_graph.y is None or torch.all(batched_graph.y == 0):
+            # Fast validity check using tensor ops
+            if batched_graph.y is None:
+                continue
+            y_sum = batched_graph.y.abs().sum()
+            if y_sum == 0:
                 continue
             
+            # Check for NaN using efficient tensor op
             if torch.isnan(batched_graph.x).any() or torch.isnan(batched_graph.y).any():
                 print(f"  Warning: NaN in input at batch {batch_idx}, t={t}, skipping...")
                 continue
@@ -171,27 +192,28 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                 out_predictions = model(
                     batched_graph.x, 
                     batched_graph.edge_index,
-                    batch=batched_graph.batch,  # Which scenario each node belongs to
-                    batch_size=B,  # Number of scenarios
+                    batch=batched_graph.batch,
+                    batch_size=B,
                     batch_num=batch_idx, 
                     timestep=t
                 )
                 
+                # Fast NaN check
                 if torch.isnan(out_predictions).any():
                     print(f"  Warning: NaN in predictions at batch {batch_idx}, t={t}, skipping...")
                     continue
                 
-                # Model predicts displacement directly (same as GCN)
-                # No conversion needed - out_predictions is [N, 2] displacement
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
+                target_y = batched_graph.y.to(out_predictions.dtype)
+                loss_t = loss_fn(out_predictions, target_y, 
                                 batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                 gamma=loss_gamma, delta=loss_delta)
                 
                 if torch.isnan(loss_t):
                     print(f"  Warning: NaN loss at batch {batch_idx}, t={t}, skipping...")
                     continue
-                    
-            accumulated_loss += loss_t
+            
+            # Accumulate loss (gradient flows through)
+            accumulated_loss = accumulated_loss + loss_t
             valid_timesteps += 1
             
             # Detailed loss debugging every 100 batches on first timestep
@@ -203,40 +225,43 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
                     cos_loss_val = _compute_cosine_loss(out_predictions, batched_graph.y)
                     print(f"  [Loss Debug] angle={angle_loss_val:.4f}, mse={mse_val:.4f}, cos={cos_loss_val:.4f}, total={loss_t.item():.4f}")
             
+            # Compute metrics efficiently on GPU (no .item() calls in loop)
             with torch.no_grad():
-                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                # MSE - direct computation
+                mse = F.mse_loss(out_predictions, target_y)
                 
+                # Cosine similarity - fused operation
+                cos_sim = F.cosine_similarity(out_predictions, target_y, dim=1).mean()
+                
+                # Angular error - vectorized with efficient wrap
                 pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
-                target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
-                angle_diff = torch.atan2(torch.sin(pred_angle - target_angle), 
-                                        torch.cos(pred_angle - target_angle))
-                mean_angle_error = torch.abs(angle_diff).mean()
+                target_angle = torch.atan2(target_y[:, 1], target_y[:, 0])
+                angle_diff = pred_angle - target_angle
+                # Wrap to [-pi, pi] using efficient formula
+                angle_diff = torch.remainder(angle_diff + 3.141592653589793, 6.283185307179586) - 3.141592653589793
+                mean_angle_error = angle_diff.abs().mean()
                 
-                # Only accumulate if values are valid (not NaN)
+                # Accumulate on GPU (no sync)
                 if not torch.isnan(mse):
-                    total_mse += mse.item()
+                    batch_mse = batch_mse + mse
                 if not torch.isnan(cos_sim):
-                    total_cosine_sim += cos_sim.item()
+                    batch_cos = batch_cos + cos_sim
                 if not torch.isnan(mean_angle_error):
-                    total_angular += mean_angle_error.item()
-                metric_count += 1
+                    batch_angular = batch_angular + mean_angle_error
+                batch_metric_count += 1
         
-        if accumulated_loss == 0.0:
+        # Skip if no valid timesteps
+        if valid_timesteps == 0:
             print(f"  Warning: No valid loss at batch {batch_idx}, skipping backward")
             continue
-            
-        if isinstance(accumulated_loss, torch.Tensor) and torch.isnan(accumulated_loss):
+        
+        # Check for NaN in accumulated loss
+        if torch.isnan(accumulated_loss):
             print(f"  Warning: NaN accumulated loss at batch {batch_idx}, skipping")
             continue
         
-        # CRITICAL FIX: Average loss across timesteps instead of raw sum
-        # Previously accumulated_loss was sum over ~89 timesteps, causing loss values ~18-19
-        # Now we average to get per-timestep loss for proper learning signal
-        if valid_timesteps > 0:
-            accumulated_loss = accumulated_loss / valid_timesteps
+        # Average loss across timesteps for proper learning signal
+        accumulated_loss = accumulated_loss / valid_timesteps
         
         # Backward pass
         if scaler is not None:
@@ -249,7 +274,14 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             accumulated_loss.backward()
             clip_grad_norm_(model.parameters(), gradient_clip_value)
             optimizer.step()
-            
+        
+        # Accumulate epoch metrics (still on GPU)
+        total_mse = total_mse + batch_mse
+        total_cosine_sim = total_cosine_sim + batch_cos
+        total_angular = total_angular + batch_angular
+        metric_count += batch_metric_count
+        
+        # Single .item() call per batch for loss tracking
         total_loss_epoch += accumulated_loss.item()
         steps += 1
         
@@ -265,9 +297,10 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
             torch.cuda.empty_cache()
 
     avg_loss_epoch = total_loss_epoch / max(1, steps)
-    avg_cosine_sim = total_cosine_sim / max(1, metric_count)
-    avg_mse = total_mse / max(1, metric_count)
-    avg_angle_error = total_angular / max(1, metric_count)
+    # Final sync: convert GPU tensors to Python floats for return
+    avg_cosine_sim = (total_cosine_sim / max(1, metric_count)).item()
+    avg_mse = (total_mse / max(1, metric_count)).item()
+    avg_angle_error = (total_angular / max(1, metric_count)).item()
     
     # Print epoch summary with RMSE in meters
     rmse_meters = (avg_mse ** 0.5) * 100.0
@@ -287,14 +320,18 @@ def train_single_epoch_batched(model, dataloader, optimizer, loss_fn,
 
 def validate_single_epoch_batched(model, dataloader, loss_fn, 
                                    loss_alpha, loss_beta, loss_gamma, loss_delta, device):
-    """Run batched validation loop."""
+    """Run batched validation loop.
+    
+    Optimized for GPU utilization with batched metric computation.
+    """
     model.eval()
-    total_loss = 0.0
+    total_loss = torch.tensor(0.0, device=device)
     steps = 0
     
-    total_cosine_sim = 0.0
-    total_mse = 0.0
-    total_angular = 0.0
+    # GPU tensors for metric accumulation
+    total_cosine_sim = torch.tensor(0.0, device=device)
+    total_mse = torch.tensor(0.0, device=device)
+    total_angular = torch.tensor(0.0, device=device)
     metric_count = 0
     
     total_batches = len(dataloader)
@@ -309,18 +346,28 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
             B = batch_dict["B"]
             T = batch_dict["T"]
 
+            # Batch transfer to GPU
             for t in range(T):
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device, non_blocking=True)
+            
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
 
             # Reset GRU for this validation batch
             base_model = get_module(model)
             base_model.gru_hidden = None
             
-            accumulated_loss = 0.0
-            valid_timesteps = 0  # Track valid timesteps for averaging
+            batch_loss = torch.tensor(0.0, device=device)
+            batch_mse = torch.tensor(0.0, device=device)
+            batch_cos = torch.tensor(0.0, device=device)
+            batch_angular = torch.tensor(0.0, device=device)
+            batch_count = 0
+            valid_timesteps = 0
             
             for t, batched_graph in enumerate(batched_graph_sequence):
-                if batched_graph.y is None or torch.all(batched_graph.y == 0):
+                if batched_graph.y is None:
+                    continue
+                if batched_graph.y.abs().sum() == 0:
                     continue
                 
                 out_predictions = model(
@@ -332,40 +379,45 @@ def validate_single_epoch_batched(model, dataloader, loss_fn,
                     timestep=t
                 )
                 
-                # Model predicts displacement directly (same as GCN)
-                loss_t = loss_fn(out_predictions, batched_graph.y.to(out_predictions.dtype), 
+                target_y = batched_graph.y.to(out_predictions.dtype)
+                loss_t = loss_fn(out_predictions, target_y, 
                                 batched_graph.x, alpha=loss_alpha, beta=loss_beta, 
                                 gamma=loss_gamma, delta=loss_delta)
-                accumulated_loss += loss_t
+                batch_loss = batch_loss + loss_t
                 valid_timesteps += 1
                 
-                mse = F.mse_loss(out_predictions, batched_graph.y.to(out_predictions.dtype))
-                pred_norm = F.normalize(out_predictions, p=2, dim=1, eps=1e-6)
-                target_norm = F.normalize(batched_graph.y.to(out_predictions.dtype), p=2, dim=1, eps=1e-6)
-                cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1).mean()
+                # Efficient metric computation
+                mse = F.mse_loss(out_predictions, target_y)
+                cos_sim = F.cosine_similarity(out_predictions, target_y, dim=1).mean()
                 
                 pred_angle = torch.atan2(out_predictions[:, 1], out_predictions[:, 0])
-                target_angle = torch.atan2(batched_graph.y[:, 1], batched_graph.y[:, 0])
-                angle_diff = torch.atan2(torch.sin(pred_angle - target_angle),
-                                        torch.cos(pred_angle - target_angle))
-                mean_angle_error = torch.abs(angle_diff).mean()
+                target_angle = torch.atan2(target_y[:, 1], target_y[:, 0])
+                angle_diff = pred_angle - target_angle
+                angle_diff = torch.remainder(angle_diff + 3.141592653589793, 6.283185307179586) - 3.141592653589793
+                mean_angle_error = angle_diff.abs().mean()
                 
-                total_mse += mse.item()
-                total_cosine_sim += cos_sim.item()
-                total_angular += mean_angle_error.item()
-                metric_count += 1
+                batch_mse = batch_mse + mse
+                batch_cos = batch_cos + cos_sim
+                batch_angular = batch_angular + mean_angle_error
+                batch_count += 1
             
             # Average loss across timesteps
             if valid_timesteps > 0:
-                accumulated_loss = accumulated_loss / valid_timesteps
+                batch_loss = batch_loss / valid_timesteps
             
-            total_loss += accumulated_loss.item()
+            # Accumulate batch results
+            total_loss = total_loss + batch_loss
+            total_mse = total_mse + batch_mse
+            total_cosine_sim = total_cosine_sim + batch_cos
+            total_angular = total_angular + batch_angular
+            metric_count += batch_count
             steps += 1
 
-    avg_loss = total_loss / max(1, steps)
-    avg_cosine_sim = total_cosine_sim / max(1, metric_count)
-    avg_mse = total_mse / max(1, metric_count)
-    avg_angle_error = total_angular / max(1, metric_count)
+    # Final sync: convert GPU tensors to Python floats
+    avg_loss = (total_loss / max(1, steps)).item()
+    avg_cosine_sim = (total_cosine_sim / max(1, metric_count)).item()
+    avg_mse = (total_mse / max(1, metric_count)).item()
+    avg_angle_error = (total_angular / max(1, metric_count)).item()
     
     # Print validation summary with RMSE in meters
     rmse_meters = (avg_mse ** 0.5) * 100.0
