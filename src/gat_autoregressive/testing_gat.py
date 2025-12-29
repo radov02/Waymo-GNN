@@ -332,16 +332,25 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     )
     
     # Find persistent agents
-    persistent_agent_ids = None
-    for t in range(T):
-        graph = batched_graph_sequence[t]
-        current_ids = set(graph.agent_id.cpu().numpy())
-        if persistent_agent_ids is None:
-            persistent_agent_ids = current_ids
-        else:
-            persistent_agent_ids = persistent_agent_ids & current_ids
+    # Use agent_id if available, otherwise use node indices
+    has_agent_ids = hasattr(batched_graph_sequence[0], 'agent_id') and batched_graph_sequence[0].agent_id is not None
     
-    persistent_agent_ids = sorted(list(persistent_agent_ids))
+    if has_agent_ids:
+        persistent_agent_ids = None
+        for t in range(T):
+            graph = batched_graph_sequence[t]
+            current_ids = set(graph.agent_id.cpu().numpy())
+            if persistent_agent_ids is None:
+                persistent_agent_ids = current_ids
+            else:
+                persistent_agent_ids = persistent_agent_ids & current_ids
+        
+        persistent_agent_ids = sorted(list(persistent_agent_ids))
+    else:
+        # Use node indices as agent IDs
+        num_agents = batched_graph_sequence[0].num_nodes
+        persistent_agent_ids = list(range(min(num_agents, 20)))  # Limit to 20 agents for visualization
+    
     if len(persistent_agent_ids) == 0:
         print(f"  No persistent agents found, skipping visualization")
         return
@@ -351,13 +360,19 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     
     for t in range(T):
         graph = batched_graph_sequence[t]
-        agent_ids_t = graph.agent_id.cpu().numpy()
         positions_t = graph.pos.cpu().numpy()
         
-        for agent_id in persistent_agent_ids:
-            idx = np.where(agent_ids_t == agent_id)[0]
-            if len(idx) > 0:
-                gt_positions[agent_id].append(positions_t[idx[0]])
+        if has_agent_ids:
+            agent_ids_t = graph.agent_id.cpu().numpy()
+            for agent_id in persistent_agent_ids:
+                idx = np.where(agent_ids_t == agent_id)[0]
+                if len(idx) > 0:
+                    gt_positions[agent_id].append(positions_t[idx[0]])
+        else:
+            # Use node indices directly
+            for agent_id in persistent_agent_ids:
+                if agent_id < len(positions_t):
+                    gt_positions[agent_id].append(positions_t[agent_id])
     
     # Run autoregressive prediction with proper warmup (matching finetuning validation)
     start_t = T // 3
@@ -378,8 +393,13 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     
     # Start rollout from start_t
     initial_graph = batched_graph_sequence[start_t]
-    agent_ids_init = initial_graph.agent_id.cpu().numpy()
     positions_init = initial_graph.pos.cpu().numpy()
+    
+    # Get agent mapping
+    if has_agent_ids:
+        agent_ids_init = initial_graph.agent_id.cpu().numpy()
+    else:
+        agent_ids_init = np.arange(len(positions_init))  # Use indices as IDs
     
     predictions, _ = autoregressive_rollout(model, initial_graph, num_rollout_steps, device, batch_size=B)
     
@@ -388,10 +408,16 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
     agent_errors = {agent_id: [] for agent_id in persistent_agent_ids}  # Per-timestep errors
     
     for agent_id in persistent_agent_ids:
-        idx = np.where(agent_ids_init == agent_id)[0]
-        if len(idx) == 0:
-            continue
-        idx = idx[0]
+        if has_agent_ids:
+            idx = np.where(agent_ids_init == agent_id)[0]
+            if len(idx) == 0:
+                continue
+            idx = idx[0]
+        else:
+            # Use agent_id as direct index
+            idx = agent_id
+            if idx >= len(positions_init):
+                continue
         
         current_pos = positions_init[idx].copy()
         pred_positions[agent_id].append(current_pos.copy())
