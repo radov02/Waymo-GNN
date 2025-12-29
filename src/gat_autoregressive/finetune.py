@@ -40,6 +40,27 @@ from autoregressive_predictions.SpatioTemporalGNN_batched import SpatioTemporalG
 AUTOREG_REBUILD_EDGES = True  # when enabled, edges are recomputed at each autoregressive step based on updated positions, which captures new spatial relationships as agents move (e.g., agents coming within/out of radius) - more accurate for long rollouts where agents move significantly
 _size_mismatch_warned = False
 
+# ============ FEATURE NOISE INJECTION ============
+# During teacher forcing, inject noise into derived features (velocity, acceleration)
+# to simulate the distribution shift that occurs during autoregressive rollout.
+# This helps the model learn to be robust to noisy features from its own predictions.
+FEATURE_NOISE_INJECTION = True
+FEATURE_NOISE_VELOCITY_STD = 0.05  # Normalized velocity noise std (10% of MAX_SPEED range)
+FEATURE_NOISE_ACCEL_STD = 0.08     # Normalized acceleration noise std (higher because accel is noisier)
+FEATURE_NOISE_HEADING_STD = 0.03  # Heading noise in normalized units (radians/pi)
+
+# ============ VELOCITY CONSISTENCY LOSS ============
+# Add loss to ensure predicted displacement is kinematically consistent
+# with the velocity/heading features the model is using as input.
+VELOCITY_CONSISTENCY_LOSS = True
+VELOCITY_CONSISTENCY_WEIGHT = 0.15  # Weight for velocity consistency loss
+
+# ============ FEATURE SMOOTHING DURING AUTOREG ============
+# Use exponential moving average for derived features during autoregressive rollout
+# This reduces noise from accumulated prediction errors
+AUTOREG_FEATURE_EMA = True
+AUTOREG_FEATURE_EMA_ALPHA = 0.3  # Higher = more smoothing (0.3 = 70% previous, 30% new)
+
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
 
 def load_pretrained_model(checkpoint_path, device, model_type="gat"):
@@ -183,6 +204,111 @@ def load_pretrained_model(checkpoint_path, device, model_type="gat"):
     load_model_state(model, checkpoint['model_state_dict'], is_parallel)
     
     return model, is_parallel, checkpoint
+
+def inject_feature_noise(graph, epoch, total_epochs, device):
+    """Inject noise into derived features during teacher forcing.
+    
+    This simulates the distribution shift the model will experience during
+    autoregressive rollout, where derived features (velocity, acceleration, heading)
+    become noisy due to accumulated prediction errors.
+    
+    CURRICULUM: Noise decreases as training progresses, since the model's predictions
+    improve and derived features become more accurate.
+    
+    Args:
+        graph: PyG Data object with node features [N, 15]
+        epoch: Current epoch (0-indexed)
+        total_epochs: Total epochs for training
+        device: Torch device
+    
+    Returns:
+        Graph with noise-injected features (same object, modified in-place clone)
+    """
+    if not FEATURE_NOISE_INJECTION:
+        return graph
+    
+    # Clone to avoid modifying original
+    noisy_graph = graph.clone()
+    
+    # Curriculum: noise starts high and decreases
+    # At epoch 0: 100% noise, at final epoch: 20% noise
+    progress = epoch / max(1, total_epochs - 1)
+    noise_scale = 1.0 - 0.8 * progress  # 1.0 -> 0.2
+    
+    N = noisy_graph.x.shape[0]
+    
+    # Inject noise into velocity features [0-1]
+    vel_noise = torch.randn(N, 2, device=device) * FEATURE_NOISE_VELOCITY_STD * noise_scale
+    noisy_graph.x[:, 0:2] = noisy_graph.x[:, 0:2] + vel_noise
+    
+    # Update speed [2] to be consistent with noisy velocity
+    noisy_vx = noisy_graph.x[:, 0] * MAX_SPEED
+    noisy_vy = noisy_graph.x[:, 1] * MAX_SPEED
+    noisy_speed = torch.sqrt(noisy_vx**2 + noisy_vy**2)
+    noisy_graph.x[:, 2] = noisy_speed / MAX_SPEED
+    
+    # Inject noise into heading [3]
+    heading_noise = torch.randn(N, device=device) * FEATURE_NOISE_HEADING_STD * noise_scale
+    noisy_graph.x[:, 3] = torch.clamp(noisy_graph.x[:, 3] + heading_noise, -1, 1)
+    
+    # Inject noise into acceleration features [5-6]
+    accel_noise = torch.randn(N, 2, device=device) * FEATURE_NOISE_ACCEL_STD * noise_scale
+    noisy_graph.x[:, 5:7] = noisy_graph.x[:, 5:7] + accel_noise
+    
+    return noisy_graph
+
+
+def compute_velocity_consistency_loss(pred_displacement, graph, device):
+    """Compute loss for kinematic consistency between displacement and velocity.
+    
+    The predicted displacement should be roughly consistent with the velocity
+    features in the input graph. This teaches the model to USE the velocity
+    information rather than ignoring it.
+    
+    Loss = ||pred_displacement - expected_displacement_from_velocity||^2
+    
+    Args:
+        pred_displacement: Predicted normalized displacement [N, 2]
+        graph: Input graph with velocity features
+        device: Torch device
+    
+    Returns:
+        Velocity consistency loss (scalar tensor)
+    """
+    if not VELOCITY_CONSISTENCY_LOSS:
+        return torch.tensor(0.0, device=device)
+    
+    dt = 0.1  # timestep
+    
+    # Get velocity from input features [0-1] (normalized by MAX_SPEED)
+    input_vx = graph.x[:, 0] * MAX_SPEED  # m/s
+    input_vy = graph.x[:, 1] * MAX_SPEED  # m/s
+    
+    # Expected displacement from velocity: d = v * dt
+    expected_dx = input_vx * dt  # meters
+    expected_dy = input_vy * dt  # meters
+    
+    # Normalize to match prediction scale
+    expected_displacement = torch.stack([expected_dx, expected_dy], dim=1) / POSITION_SCALE
+    
+    # Only compute for valid agents with significant velocity
+    # (stationary agents have noisy velocity features)
+    speed = torch.sqrt(input_vx**2 + input_vy**2)
+    moving_mask = speed > 0.5  # > 0.5 m/s
+    
+    if moving_mask.sum() < 2:
+        return torch.tensor(0.0, device=device)
+    
+    # L2 loss on moving agents
+    pred_aligned = pred_displacement[:expected_displacement.shape[0]]
+    if pred_aligned.shape[0] != expected_displacement.shape[0]:
+        return torch.tensor(0.0, device=device)
+    
+    diff = pred_aligned[moving_mask] - expected_displacement[moving_mask]
+    consistency_loss = (diff ** 2).mean()
+    
+    return consistency_loss
+
 
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=0):
     """Calculate probability of using model's own prediction vs ground truth.
@@ -829,6 +955,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_magnitude_ratio = 0.0  # Track magnitude ratio loss
     total_overshoot = 0.0  # Track overshoot penalty
     total_trajectory = 0.0  # Track trajectory loss
+    total_vel_consistency = 0.0  # Track velocity consistency loss
     steps = 0
     count = 0
     
@@ -1002,6 +1129,13 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
             if torch.isnan(graph_for_prediction.x).any():
                 print(f"  [ERROR] NaN in input features at batch {batch_idx}, t={t}, step={step}! Skipping rollout.")
                 break
+            
+            # ============ FEATURE NOISE INJECTION ============
+            # During teacher forcing (using GT graph), inject noise into derived features
+            # to simulate the distribution shift during autoregressive rollout.
+            # This helps the model learn to be robust to noisy features.
+            if not is_using_predicted_positions and FEATURE_NOISE_INJECTION:
+                graph_for_prediction = inject_feature_noise(graph_for_prediction, epoch, total_epochs, device)
             
             # Forward pass with optional AMP and agent_ids for per-agent GRU tracking
             # Both GAT and GCN now support per-agent hidden state tracking
@@ -1284,34 +1418,36 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         # This is the most important loss for trajectory following
                         trajectory_loss = (traj_error_tensor / POSITION_SCALE).mean()
             
-            # ========== IMPROVED LOSS FUNCTION v2 - Magnitude Control & Trajectory Focus ==========
+            # ========== IMPROVED LOSS FUNCTION v3 - Feature Utilization & Trajectory Focus ==========
             # 
-            # KEY INSIGHT from visualizations (Epoch 1 & 5):
-            # - Predictions have correct general direction but WRONG MAGNITUDE
-            # - Agents are predicted to move too far (overshoot) or in slightly wrong directions
-            # - This causes trajectory drift that accumulates over 50 steps
+            # KEY INSIGHTS from visualizations:
+            # 1. Model doesn't learn to use derived features (velocity, heading) during autoreg
+            # 2. Predictions have correct general direction but WRONG MAGNITUDE
+            # 3. Trajectory drift accumulates over 50 steps
             #
-            # SOLUTION: Increase weight on magnitude-related losses and add explicit overshoot penalty
+            # SOLUTION: Add velocity consistency loss to force model to USE the velocity features
             #
             # Loss components:
-            # - huber_loss (0.20): Robust displacement loss - reduced to give room for specialized losses
-            # - cosine_loss (0.15): Direction alignment - kept for direction accuracy
-            # - magnitude_loss (0.15): Displacement magnitude MSE
-            # - magnitude_ratio_loss (0.15): NEW - log-ratio penalty for scale errors
-            # - overshoot_penalty (0.10): NEW - asymmetric penalty for overshooting
+            # - huber_loss (0.15): Robust displacement loss
+            # - cosine_loss (0.15): Direction alignment
+            # - magnitude_loss (0.10): Displacement magnitude MSE
+            # - magnitude_ratio_loss (0.10): Log-ratio penalty for scale errors
+            # - overshoot_penalty (0.10): Asymmetric penalty for overshooting
             # - trajectory_loss (0.25): Accumulated position error - critical for long rollouts
-            #
-            # Total magnitude-related: 0.40 (was 0.15)
-            # Total trajectory-related: 0.25 (was 0.30)
-            # Total direction-related: 0.15 (was 0.25)
-            # Total displacement: 0.20 (was 0.30)
+            # - velocity_consistency_loss (0.15): NEW - force model to use velocity features
             
-            disp_loss = (0.20 * huber_loss + 
+            # Compute velocity consistency loss
+            velocity_consistency_loss = compute_velocity_consistency_loss(
+                pred_aligned, graph_for_prediction, device
+            )
+            
+            disp_loss = (0.15 * huber_loss + 
                         0.15 * cosine_loss + 
-                        0.15 * magnitude_loss + 
-                        0.15 * magnitude_ratio_loss +
+                        0.10 * magnitude_loss + 
+                        0.10 * magnitude_ratio_loss +
                         0.10 * overshoot_penalty +
-                        0.25 * trajectory_loss)
+                        0.25 * trajectory_loss +
+                        VELOCITY_CONSISTENCY_WEIGHT * velocity_consistency_loss)
             
             # Final NaN check
             if torch.isnan(disp_loss):
@@ -1336,6 +1472,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 total_magnitude_ratio += magnitude_ratio_loss.item()
                 total_overshoot += overshoot_penalty.item() if isinstance(overshoot_penalty, torch.Tensor) else overshoot_penalty
                 total_trajectory += trajectory_loss.item() if isinstance(trajectory_loss, torch.Tensor) else trajectory_loss
+                total_vel_consistency += velocity_consistency_loss.item() if isinstance(velocity_consistency_loss, torch.Tensor) else velocity_consistency_loss
                 count += 1
                 
                 # Track per-agent POSITION errors for ADE/FDE computation (not displacement errors!)
@@ -1522,6 +1659,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     final_magnitude_ratio = total_magnitude_ratio / max(1, count)
     final_overshoot = total_overshoot / max(1, count)
     final_trajectory = total_trajectory / max(1, count)
+    final_vel_consistency = total_vel_consistency / max(1, count)
     
     # Compute ADE and FDE from accumulated agent errors
     train_ade = 0.0
@@ -1541,6 +1679,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     print(f"\n[TRAIN EPOCH SUMMARY]")
     print(f"  Loss: {final_loss:.6f} | Avg per-step MSE: {final_mse:.6f} | Avg per-step RMSE: {final_rmse:.2f}m | CosSim: {final_cosine:.4f}")
     print(f"  Magnitude Losses: ratio_loss={final_magnitude_ratio:.6f} | overshoot={final_overshoot:.6f} | trajectory={final_trajectory:.6f}")
+    print(f"  Velocity Consistency Loss: {final_vel_consistency:.6f}")
     print(f"  ADE: {train_ade:.2f}m | FDE: {train_fde:.2f}m (across {total_train_agents} agent rollouts)")
     print(f"  Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
@@ -1554,6 +1693,7 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         'magnitude_ratio_loss': final_magnitude_ratio,
         'overshoot_loss': final_overshoot,
         'trajectory_loss': final_trajectory,
+        'velocity_consistency_loss': final_vel_consistency,
         'ade': train_ade,
         'fde': train_fde
     }
@@ -2416,12 +2556,26 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_vx = displacement_meters[:, 0] / dt  # m/s
     pred_vy = displacement_meters[:, 1] / dt  # m/s
     
-    # Velocity smoothing: blend predicted velocity with previous to prevent jumps
-    # FURTHER REDUCED from 0.3 to 0.1 - allow model to fully express trajectory changes
-    # The model must be able to represent turns, lane changes, and accelerations
-    # Too much smoothing was preventing learning of trajectory changes!
-    velocity_smoothing = 0.1  # 10% previous, 90% predicted - near-zero smoothing
-    if hasattr(updated_graph, 'x') and updated_graph.x is not None:
+    # ============ IMPROVED FEATURE SMOOTHING WITH EMA ============
+    # Use Exponential Moving Average when AUTOREG_FEATURE_EMA is enabled.
+    # This reduces noise accumulation during autoregressive rollout while still
+    # allowing the model to express trajectory changes.
+    #
+    # Key insight: The problem is that small prediction errors compound when deriving
+    # velocity from displacement. A small position error (1cm) becomes a 10x larger
+    # velocity error (10cm/s) and a 100x larger acceleration error.
+    # EMA smoothing reduces this noise propagation.
+    if AUTOREG_FEATURE_EMA and hasattr(updated_graph, 'x') and updated_graph.x is not None:
+        # EMA: new = alpha * previous + (1 - alpha) * current
+        # Higher alpha = more smoothing (more weight on previous)
+        alpha = AUTOREG_FEATURE_EMA_ALPHA
+        prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
+        prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
+        pred_vx = alpha * prev_vx + (1 - alpha) * pred_vx
+        pred_vy = alpha * prev_vy + (1 - alpha) * pred_vy
+    elif hasattr(updated_graph, 'x') and updated_graph.x is not None:
+        # Legacy smoothing (minimal)
+        velocity_smoothing = 0.1  # 10% previous, 90% predicted
         prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
         prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
         pred_vx = (1 - velocity_smoothing) * pred_vx + velocity_smoothing * prev_vx
@@ -2438,32 +2592,52 @@ def update_graph_with_prediction(graph, pred_displacement, device):
     pred_speed = torch.sqrt(pred_vx[:num_nodes]**2 + pred_vy[:num_nodes]**2)
     new_features[:, 2] = pred_speed / MAX_SPEED
     
-    # [3] Heading direction (normalized) - directly from velocity, minimal smoothing
-    # The heading should accurately reflect the predicted direction of travel
-    # Too much smoothing here prevented the model from learning turns!
+    # [3] Heading direction (normalized) - from velocity with EMA smoothing
+    # Heading reflects direction of travel. Use EMA to reduce noise while
+    # still allowing turns and direction changes.
     pred_heading = torch.atan2(pred_vy[:num_nodes], pred_vx[:num_nodes]) / np.pi  # [-1, 1]
     if hasattr(updated_graph, 'x') and updated_graph.x is not None:
         prev_heading = updated_graph.x[:num_nodes, 3]
-        # REDUCED heading smoothing from 0.2 to 0.05 - almost direct heading update
-        heading_smoothing = 0.05
-        # Handle wraparound at +/- pi
+        # Use EMA for heading smoothing if enabled
+        if AUTOREG_FEATURE_EMA:
+            # Same alpha as velocity for consistency
+            heading_alpha = AUTOREG_FEATURE_EMA_ALPHA * 0.5  # Less smoothing for heading (important for turns)
+        else:
+            heading_alpha = 0.05  # Legacy minimal smoothing
+        # Handle wraparound at +/- pi using circular mean
         heading_diff = pred_heading - prev_heading
         heading_diff = torch.where(heading_diff > 1, heading_diff - 2, heading_diff)
         heading_diff = torch.where(heading_diff < -1, heading_diff + 2, heading_diff)
-        pred_heading = prev_heading + (1 - heading_smoothing) * heading_diff
+        pred_heading = prev_heading + (1 - heading_alpha) * heading_diff
         pred_heading = torch.clamp(pred_heading, -1, 1)
     new_features[:, 3] = pred_heading
     
     # [4] Valid - keep from previous graph (doesn't change)
     new_features[:, 4] = updated_graph.x[:num_nodes, 4]
     
-    # [5-6] Acceleration (normalized) - use smoothed velocities to compute
-    # Note: We already computed prev_vx/prev_vy above for smoothing, reuse that calculation
+    # [5-6] Acceleration (normalized) - use EMA-smoothed velocities
+    # Acceleration is the noisiest derived feature (derivative of derivative).
+    # Apply additional smoothing to reduce noise while still capturing accelerations.
     if hasattr(updated_graph, 'x') and updated_graph.x is not None:
         orig_prev_vx = updated_graph.x[:num_nodes, 0] * MAX_SPEED
         orig_prev_vy = updated_graph.x[:num_nodes, 1] * MAX_SPEED
-        ax = (pred_vx[:num_nodes] - orig_prev_vx) / dt  # m/s²
-        ay = (pred_vy[:num_nodes] - orig_prev_vy) / dt
+        
+        # Calculate raw acceleration
+        raw_ax = (pred_vx[:num_nodes] - orig_prev_vx) / dt  # m/s²
+        raw_ay = (pred_vy[:num_nodes] - orig_prev_vy) / dt
+        
+        # Apply EMA to acceleration if enabled (with higher smoothing)
+        if AUTOREG_FEATURE_EMA:
+            prev_ax = updated_graph.x[:num_nodes, 5] * MAX_ACCEL
+            prev_ay = updated_graph.x[:num_nodes, 6] * MAX_ACCEL
+            # Higher alpha for acceleration (more smoothing because more noise)
+            accel_alpha = min(AUTOREG_FEATURE_EMA_ALPHA * 1.5, 0.6)
+            ax = accel_alpha * prev_ax + (1 - accel_alpha) * raw_ax
+            ay = accel_alpha * prev_ay + (1 - accel_alpha) * raw_ay
+        else:
+            ax = raw_ax
+            ay = raw_ay
+        
         new_features[:, 5] = ax / MAX_ACCEL
         new_features[:, 6] = ay / MAX_ACCEL
     else:
