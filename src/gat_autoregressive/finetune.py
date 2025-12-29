@@ -274,7 +274,6 @@ def inject_feature_noise(graph, epoch, total_epochs, device):
     
     return noisy_graph
 
-
 def compute_velocity_consistency_loss(pred_displacement, graph, device):
     """Compute loss for kinematic consistency between displacement and velocity.
     
@@ -325,7 +324,6 @@ def compute_velocity_consistency_loss(pred_displacement, graph, device):
     consistency_loss = (diff ** 2).mean()
     
     return consistency_loss
-
 
 def compute_motion_aware_weights(target, device):
     """Compute per-agent loss weights based on ground truth displacement magnitude.
@@ -383,7 +381,6 @@ def compute_motion_aware_weights(target, device):
     }
     
     return weights, motion_info
-
 
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=0):
     """Calculate probability of using model's own prediction vs ground truth.
@@ -2237,14 +2234,18 @@ def run_autoregressive_finetuning(
     
     if model_type == "gat":
         checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
+        checkpoint_filename2 = f'final_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{gat_learning_rate:.0e}_heads{gat_num_heads}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gat_checkpoint_dir, checkpoint_filename)
+        pretrained_checkpoint_batched2 = os.path.join(gat_checkpoint_dir, checkpoint_filename2)
         # Ensure parent directories exist first
         os.makedirs(gat_checkpoint_dir, exist_ok=True)
         os.makedirs(gat_checkpoint_dir_autoreg, exist_ok=True)
         os.makedirs(gat_viz_dir_autoreg, exist_ok=True)
     elif model_type == "gcn":
         checkpoint_filename = f'best_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
+        checkpoint_filename2 = f'final_{model_type}_batched_B{batch_size}_h{hidden_channels}_lr{learning_rate:.0e}_L{num_layers}x{num_gru_layers}_E{epochs}.pt'
         pretrained_checkpoint_batched = os.path.join(gcn_checkpoint_dir, checkpoint_filename)
+        pretrained_checkpoint_batched2 = os.path.join(gcn_checkpoint_dir, checkpoint_filename2)
         # Ensure parent directories exist first
         os.makedirs(gcn_checkpoint_dir, exist_ok=True)
         os.makedirs(gcn_checkpoint_dir_autoreg, exist_ok=True)
@@ -2258,6 +2259,10 @@ def run_autoregressive_finetuning(
         print(f"Found batched checkpoint: {pretrained_checkpoint_batched}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched, device, model_type=model_type)
         pretrained_checkpoint = pretrained_checkpoint_batched
+    elif os.path.exists(pretrained_checkpoint_batched2):
+        print(f"Found batched checkpoint: {pretrained_checkpoint_batched2}")
+        model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint_batched2, device, model_type=model_type)
+        pretrained_checkpoint = pretrained_checkpoint_batched2
     elif pretrained_checkpoint is not None and os.path.exists(pretrained_checkpoint):
         print(f"Found checkpoint: {pretrained_checkpoint}")
         model, is_parallel, checkpoint = load_pretrained_model(pretrained_checkpoint, device, model_type=model_type)
