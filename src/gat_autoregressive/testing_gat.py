@@ -26,7 +26,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import wandb
-from SpatioTemporalGAT_batched import SpatioTemporalGATBatched
+from gat_autoregressive.SpatioTemporalGAT_batched import SpatioTemporalGATBatched
 from dataset import HDF5ScenarioDataset
 from config import (device, batch_size, gat_num_workers, num_layers, num_gru_layers,
                     radius, input_dim, output_dim, sequence_length, hidden_channels,
@@ -42,6 +42,9 @@ from helper_functions.helpers import compute_metrics
 from helper_functions.visualization_functions import (load_scenario_by_id, draw_map_features,
                                                        MAP_FEATURE_GRAY, VIBRANT_COLORS, SDC_COLOR)
 import matplotlib.pyplot as plt
+
+# Import the update function from finetuning to ensure consistency
+from gat_autoregressive.finetune import update_graph_with_prediction
 
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/testing_gat.py
 
@@ -79,53 +82,43 @@ def load_trained_model(checkpoint_path, device):
     return model, checkpoint
 
 
-def predict_single_step(model, graph, device):
-    """Predict one timestep ahead for all agents in a graph."""
+def get_base_model(model):
+    """Get the base model (unwrap DataParallel if needed)."""
+    if hasattr(model, 'module'):
+        return model.module
+    return model
+
+
+def predict_single_step(model, graph, device, batch_size=1, timestep=0):
+    """Predict one timestep ahead for all agents in a graph.
+    
+    Uses the same forward pass as training/finetuning code.
+    """
     graph = graph.to(device)
     
     with torch.no_grad():
-        # GAT doesn't use edge weights
+        # Get agent IDs if available
+        agent_ids = getattr(graph, 'agent_ids', None)
+        
+        # Forward pass matching training/finetuning code
         predictions = model(
             graph.x, 
             graph.edge_index,
             batch=graph.batch,
-            batch_size=1,
+            batch_size=batch_size,
             batch_num=0,
-            timestep=0
+            timestep=timestep,
+            agent_ids=agent_ids
         )
     
     return predictions
 
 
-def update_graph_features(graph, pred_displacement, device):
-    """Update node features based on predicted displacement."""
-    updated_graph = graph.clone()
-    
-    if hasattr(updated_graph, 'pos'):
-        updated_graph.pos = updated_graph.pos + pred_displacement * 100.0
-    
-    dt = 0.1
-    
-    new_vx = pred_displacement[:, 0] / dt
-    new_vy = pred_displacement[:, 1] / dt
-    
-    old_vx = updated_graph.x[:, 0]
-    old_vy = updated_graph.x[:, 1]
-    ax = (new_vx - old_vx) / dt / 10.0
-    ay = (new_vy - old_vy) / dt / 10.0
-    
-    updated_graph.x[:, 0] = new_vx
-    updated_graph.x[:, 1] = new_vy
-    updated_graph.x[:, 2] = torch.sqrt(new_vx**2 + new_vy**2)
-    updated_graph.x[:, 3] = torch.atan2(new_vy, new_vx) / np.pi
-    updated_graph.x[:, 5] = ax
-    updated_graph.x[:, 6] = ay
-    
-    return updated_graph
+# Removed - using update_graph_with_prediction from finetune.py instead
 
 
-def autoregressive_rollout(model, initial_graph, num_steps, device):
-    """Autoregressive multi-step prediction."""
+def autoregressive_rollout(model, initial_graph, num_steps, device, batch_size=1):
+    """Autoregressive multi-step prediction using same logic as finetuning."""
     model.eval()
     current_graph = initial_graph.clone().to(device)
     
@@ -133,9 +126,11 @@ def autoregressive_rollout(model, initial_graph, num_steps, device):
     updated_graphs = [current_graph.cpu()]
     
     for step in range(num_steps):
-        pred_displacement = predict_single_step(model, current_graph, device)
+        pred_displacement = predict_single_step(model, current_graph, device, 
+                                               batch_size=batch_size, timestep=step)
         all_predictions.append(pred_displacement.cpu())
-        current_graph = update_graph_features(current_graph, pred_displacement, device)
+        # Use the same update function as finetuning for consistency
+        current_graph = update_graph_with_prediction(current_graph, pred_displacement, device)
         updated_graphs.append(current_graph.cpu())
     
     return all_predictions, updated_graphs
@@ -171,28 +166,52 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
                 batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
             
             num_nodes = batched_graph_sequence[0].num_nodes
-            model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
             
-            warmup_steps = T // 2
+            # Compute agents per scenario for proper GRU sizing (matching finetuning)
+            base_model = get_base_model(model)
+            first_graph = batched_graph_sequence[0]
+            if hasattr(first_graph, 'batch') and first_graph.batch is not None:
+                batch_counts = torch.bincount(first_graph.batch, minlength=B)
+                agents_per_scenario = batch_counts.tolist()
+            else:
+                agents_per_scenario = [num_nodes]
+            
+            # Reset GRU with proper batch info
+            base_model.reset_gru_hidden_states(
+                batch_size=B,
+                agents_per_scenario=agents_per_scenario,
+                device=device
+            )
+            
+            # Use T//3 for warmup to match finetuning validation approach
+            start_t = T // 3
             print(f"Scenario {scenario_count+1} ({scenario_ids[0] if scenario_ids else 'unknown'}): "
-                  f"Warming up with {warmup_steps} steps, then rolling out {num_rollout_steps} steps...")
+                  f"Warming up GRU with {start_t} steps, then rolling out {num_rollout_steps} steps...")
             
-            for t in range(warmup_steps):
-                graph = batched_graph_sequence[t]
-                _ = predict_single_step(model, graph, device)
+            # WARM UP GRU: Run through timesteps 0 to start_t to build temporal context
+            # This matches training/finetuning which processes sequences from t=0
+            for warm_t in range(start_t):
+                warm_graph = batched_graph_sequence[warm_t]
+                if warm_graph.x is not None:
+                    agent_ids_warm = getattr(warm_graph, 'agent_ids', None)
+                    _ = model(warm_graph.x, warm_graph.edge_index,
+                             batch=warm_graph.batch, batch_size=B, batch_num=0, timestep=warm_t,
+                             agent_ids=agent_ids_warm)
             
-            actual_rollout = min(num_rollout_steps, T - warmup_steps - 1)
+            actual_rollout = min(num_rollout_steps, T - start_t - 1)
             if actual_rollout <= 0:
                 print(f"  Skipping: not enough timesteps for rollout")
                 continue
             
-            initial_graph = batched_graph_sequence[warmup_steps]
-            predictions, _ = autoregressive_rollout(model, initial_graph, actual_rollout, device)
+            # Start rollout from start_t (after warmup)
+            initial_graph = batched_graph_sequence[start_t]
+            predictions, _ = autoregressive_rollout(model, initial_graph, actual_rollout, device, batch_size=B)
             
+            # Collect ground truth displacements for comparison
             ground_truths = []
             for step in range(1, actual_rollout + 1):
-                if warmup_steps + step < T:
-                    gt_graph = batched_graph_sequence[warmup_steps + step]
+                if start_t + step < T:
+                    gt_graph = batched_graph_sequence[start_t + step]
                     ground_truths.append(gt_graph.y.cpu())
                 else:
                     break
@@ -294,7 +313,23 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         batched_graph_sequence[t] = batched_graph_sequence[t].to(device)
     
     num_nodes = batched_graph_sequence[0].num_nodes
-    model.reset_gru_hidden_states(num_agents=num_nodes, device=device)
+    B = batch_dict["B"]
+    
+    # Compute agents per scenario for proper GRU sizing
+    base_model = get_base_model(model)
+    first_graph = batched_graph_sequence[0]
+    if hasattr(first_graph, 'batch') and first_graph.batch is not None:
+        batch_counts = torch.bincount(first_graph.batch, minlength=B)
+        agents_per_scenario = batch_counts.tolist()
+    else:
+        agents_per_scenario = [num_nodes]
+    
+    # Reset GRU with proper batch info
+    base_model.reset_gru_hidden_states(
+        batch_size=B,
+        agents_per_scenario=agents_per_scenario,
+        device=device
+    )
     
     # Find persistent agents
     persistent_agent_ids = None
@@ -324,26 +359,33 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
             if len(idx) > 0:
                 gt_positions[agent_id].append(positions_t[idx[0]])
     
-    # Run autoregressive prediction
-    warmup_steps = T // 2
-    num_rollout_steps = min(T - warmup_steps - 1, 20)
+    # Run autoregressive prediction with proper warmup (matching finetuning validation)
+    start_t = T // 3
+    num_rollout_steps = min(T - start_t - 1, 20)
     
     if num_rollout_steps <= 0:
         print(f"  Not enough timesteps for visualization")
         return
     
-    for t in range(warmup_steps):
-        graph = batched_graph_sequence[t]
-        _ = predict_single_step(model, graph, device)
+    # WARM UP GRU: Run through timesteps 0 to start_t
+    for warm_t in range(start_t):
+        warm_graph = batched_graph_sequence[warm_t]
+        if warm_graph.x is not None:
+            agent_ids_warm = getattr(warm_graph, 'agent_ids', None)
+            _ = model(warm_graph.x, warm_graph.edge_index,
+                     batch=warm_graph.batch, batch_size=B, batch_num=0, timestep=warm_t,
+                     agent_ids=agent_ids_warm)
     
-    initial_graph = batched_graph_sequence[warmup_steps]
+    # Start rollout from start_t
+    initial_graph = batched_graph_sequence[start_t]
     agent_ids_init = initial_graph.agent_id.cpu().numpy()
     positions_init = initial_graph.pos.cpu().numpy()
     
-    predictions, _ = autoregressive_rollout(model, initial_graph, num_rollout_steps, device)
+    predictions, _ = autoregressive_rollout(model, initial_graph, num_rollout_steps, device, batch_size=B)
     
-    # Build predicted trajectories
+    # Build predicted trajectories and compute errors per agent
     pred_positions = {agent_id: [] for agent_id in persistent_agent_ids}
+    agent_errors = {agent_id: [] for agent_id in persistent_agent_ids}  # Per-timestep errors
     
     for agent_id in persistent_agent_ids:
         idx = np.where(agent_ids_init == agent_id)[0]
@@ -354,7 +396,8 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         current_pos = positions_init[idx].copy()
         pred_positions[agent_id].append(current_pos.copy())
         
-        for step_pred in predictions:
+        # Compute errors against ground truth at each timestep
+        for step_idx, step_pred in enumerate(predictions):
             pred_np = step_pred.cpu().numpy()
             if idx < len(pred_np):
                 # Model outputs NORMALIZED displacement, multiply by POSITION_SCALE to get meters
@@ -362,14 +405,23 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
                 displacement_meters = displacement_normalized * POSITION_SCALE
                 current_pos = current_pos + displacement_meters
                 pred_positions[agent_id].append(current_pos.copy())
+                
+                # Get ground truth position at this timestep
+                gt_timestep = start_t + step_idx + 1
+                if gt_timestep < len(gt_positions[agent_id]):
+                    gt_pos = gt_positions[agent_id][gt_timestep]
+                    error_meters = np.linalg.norm(current_pos - gt_pos)
+                    agent_errors[agent_id].append(error_meters)
     
     # Create visualization
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(14, 11))
     
     colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(persistent_agent_ids))))
     agent_colors = {agent_id: colors[i % len(colors)] for i, agent_id in enumerate(persistent_agent_ids)}
     
-    total_error = 0
+    # Compute metrics across all agents
+    all_ades = []
+    all_fdes = []
     num_agents_plotted = 0
     
     for agent_id in persistent_agent_ids:
@@ -381,45 +433,56 @@ def visualize_test_scenario(model, batch_dict, scenario_idx, save_dir, device):
         
         color = agent_colors[agent_id]
         
-        ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color=color, linewidth=1.5,
+        # Plot ground truth trajectory
+        ax.plot(gt_traj[:, 0], gt_traj[:, 1], '-', color=color, linewidth=1.5, alpha=0.8,
                 label=f'Agent {agent_id} GT' if num_agents_plotted < 5 else None)
         
-        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, linewidth=1.5,
+        # Plot predicted trajectory
+        ax.plot(pred_traj[:, 0], pred_traj[:, 1], '--', color=color, linewidth=1.5, alpha=0.8,
                 label=f'Agent {agent_id} Pred' if num_agents_plotted < 5 else None)
         
-        # Mark start and end points of ground truth
-        ax.scatter(gt_traj[0, 0], gt_traj[0, 1], color=color, marker='o', s=30, zorder=5)
-        ax.scatter(gt_traj[-1, 0], gt_traj[-1, 1], color=color, marker='x', s=30, zorder=5)
+        # Mark start point (circle)
+        ax.scatter(gt_traj[0, 0], gt_traj[0, 1], color=color, marker='o', s=50, 
+                   edgecolors='white', linewidths=1, zorder=5)
         
-        # Mark predicted trajectory endpoint (same color as prediction, square marker)
-        ax.scatter(pred_traj[-1, 0], pred_traj[-1, 1], color=color, marker='s', s=40, 
-                   edgecolors='black', linewidths=0.5, zorder=6)
+        # Mark GT end point (X)
+        ax.scatter(gt_traj[-1, 0], gt_traj[-1, 1], color=color, marker='x', s=80, 
+                   linewidths=2, zorder=5)
         
-        gt_segment = np.array(gt_positions[agent_id][warmup_steps:warmup_steps+len(pred_traj)])
-        if len(gt_segment) > 0 and len(pred_traj) > 0:
-            min_len = min(len(gt_segment), len(pred_traj))
-            errors = np.linalg.norm(gt_segment[:min_len] - pred_traj[:min_len], axis=1)
-            agent_ade = np.mean(errors)
-            total_error += agent_ade
-            num_agents_plotted += 1
+        # Mark predicted endpoint (square)
+        ax.scatter(pred_traj[-1, 0], pred_traj[-1, 1], color=color, marker='s', s=60, 
+                   edgecolors='black', linewidths=1, zorder=6)
+        
+        # Compute ADE and FDE for this agent
+        if agent_id in agent_errors and len(agent_errors[agent_id]) > 0:
+            agent_ade = np.mean(agent_errors[agent_id])
+            agent_fde = agent_errors[agent_id][-1]  # Final displacement error
+            all_ades.append(agent_ade)
+            all_fdes.append(agent_fde)
+        
+        num_agents_plotted += 1
     
-    avg_error = total_error / max(1, num_agents_plotted)
+    # Compute overall metrics
+    overall_ade = np.mean(all_ades) if all_ades else 0.0
+    overall_fde = np.mean(all_fdes) if all_fdes else 0.0
+    horizon_time = num_rollout_steps * 0.1  # Convert timesteps to seconds
     
-    ax.set_xlabel('X (meters)')
-    ax.set_ylabel('Y (meters)')
+    ax.set_xlabel('X (meters)', fontsize=11)
+    ax.set_ylabel('Y (meters)', fontsize=11)
     ax.set_title(f'GAT Test Scenario {scenario_id}\n'
-                 f'{num_agents_plotted} agents, {num_rollout_steps} rollout steps\n'
-                 f'Average Displacement Error: {avg_error:.2f}m')
-    ax.legend(loc='upper left', fontsize=8)
+                 f'{num_agents_plotted} agents | Horizon: {num_rollout_steps} steps ({horizon_time:.1f}s)\n'
+                 f'ADE: {overall_ade:.2f}m | FDE: {overall_fde:.2f}m | Start from t={start_t}',
+                 fontsize=12, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
     ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, linestyle='--')
     
     save_path = os.path.join(save_dir, f'gat_test_scenario_{scenario_idx:04d}_{scenario_id}.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     
-    print(f"  Saved: {save_path} (ADE: {avg_error:.2f}m)")
-    return avg_error
+    print(f"  Saved: {save_path} | ADE: {overall_ade:.2f}m | FDE: {overall_fde:.2f}m | Horizon: {horizon_time:.1f}s")
+    return overall_ade
 
 
 def run_testing(test_dataset_path=test_hdf5_path,
