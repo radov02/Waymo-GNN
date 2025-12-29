@@ -1045,26 +1045,27 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                         
                         if (source_agent_ids is not None and source_batch is not None and
                             len(source_agent_ids) == source_gt_graph.y.shape[0]):
-                            # Build mapping for source graph (minimal CPU operation)
-                            source_batch_np = source_batch.cpu().numpy()
-                            source_id_to_idx = {(int(source_batch_np[i]), source_agent_ids[i]): i 
-                                               for i in range(len(source_agent_ids))}
+                            # GPU-ACCELERATED AGENT MATCHING
+                            # Convert agent IDs to tensors for GPU operations
+                            source_agent_ids_tensor = torch.tensor(source_agent_ids, device=device, dtype=torch.long)
+                            source_batch_tensor = source_batch.to(device)
                             
-                            # Get pred info once
-                            pred_batch_np = pred_batch.cpu().numpy()
+                            # Get pred batch and agent IDs for aligned agents
+                            pred_batch_aligned = pred_batch[pred_indices].to(device)  # [num_aligned]
+                            pred_agent_ids_aligned = torch.tensor([pred_agent_ids[idx.item()] if idx.item() < len(pred_agent_ids) else -1 
+                                                                   for idx in pred_indices], device=device, dtype=torch.long)  # [num_aligned]
                             
-                            # Build list of source indices for each pred index
-                            source_indices_list = []
-                            for idx in pred_indices.cpu().numpy():
-                                if idx < len(pred_agent_ids):
-                                    gid = (int(pred_batch_np[idx]), pred_agent_ids[idx])
-                                    source_idx = source_id_to_idx.get(gid, -1)
-                                    source_indices_list.append(source_idx)
-                                else:
-                                    source_indices_list.append(-1)
+                            # Vectorized matching: find source index for each pred agent
+                            # For each pred agent (batch_id, agent_id), find matching source agent
+                            # Use broadcasting: [num_aligned, 1] vs [1, num_source]
+                            batch_match = (pred_batch_aligned.unsqueeze(1) == source_batch_tensor.unsqueeze(0))  # [num_aligned, num_source]
+                            agent_match = (pred_agent_ids_aligned.unsqueeze(1) == source_agent_ids_tensor.unsqueeze(0))  # [num_aligned, num_source]
+                            full_match = batch_match & agent_match & (pred_agent_ids_aligned.unsqueeze(1) != -1)  # [num_aligned, num_source]
                             
-                            # GPU-accelerated target gathering using torch.where and indexing
-                            source_indices_tensor = torch.tensor(source_indices_list, device=device, dtype=torch.long)
+                            # Get first matching index for each pred agent (or -1 if no match)
+                            # Using argmax on boolean tensor gives first True index (0 if all False, so we need to check any())
+                            has_match = full_match.any(dim=1)  # [num_aligned]
+                            source_indices_tensor = torch.where(has_match, full_match.int().argmax(dim=1), torch.tensor(-1, device=device, dtype=torch.long))
                             valid_mask = source_indices_tensor >= 0
                             
                             if valid_mask.any():
