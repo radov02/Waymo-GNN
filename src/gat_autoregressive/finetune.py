@@ -61,6 +61,23 @@ VELOCITY_CONSISTENCY_WEIGHT = 0.15  # Weight for velocity consistency loss
 AUTOREG_FEATURE_EMA = True
 AUTOREG_FEATURE_EMA_ALPHA = 0.3  # Higher = more smoothing (0.3 = 70% previous, 30% new)
 
+# ============ MOTION-AWARE LOSS WEIGHTING ============
+# Weight agents based on their ground truth displacement magnitude.
+# This prevents stationary agents (which are easy to predict) from dominating
+# the loss, forcing the model to focus on moving agents which are harder.
+#
+# Problem: Metrics look good but visualizations show poor predictions for moving agents.
+# This happens because many stationary agents have near-zero errors, pulling down averages.
+# Solution: Weight each agent's loss by its GT displacement magnitude (+ baseline).
+#
+# Weight formula: w_i = baseline + motion_scale * ||gt_displacement_i||
+# - baseline: minimum weight for all agents (prevents zero weight for stationary)
+# - motion_scale: how much extra weight for each meter of GT displacement
+MOTION_AWARE_WEIGHTING = True
+MOTION_WEIGHT_BASELINE = 0.2      # Minimum weight for stationary agents
+MOTION_WEIGHT_SCALE = 2.0         # Weight per meter of GT displacement (normalized)
+MOTION_WEIGHT_MAX = 5.0           # Cap maximum weight to prevent extreme values
+
 # PS:>> $env:PYTHONWARNINGS="ignore"; $env:TF_CPP_MIN_LOG_LEVEL="3"; python ./src/gat_autoregressive/finetune.py
 
 def load_pretrained_model(checkpoint_path, device, model_type="gat"):
@@ -308,6 +325,64 @@ def compute_velocity_consistency_loss(pred_displacement, graph, device):
     consistency_loss = (diff ** 2).mean()
     
     return consistency_loss
+
+
+def compute_motion_aware_weights(target, device):
+    """Compute per-agent loss weights based on ground truth displacement magnitude.
+    
+    The key insight is that stationary agents (zero displacement) are trivially easy
+    to predict correctly, which inflates metrics. Moving agents with significant
+    displacement are much harder to predict accurately, especially over long horizons.
+    
+    By weighting the loss by GT displacement magnitude, we force the model to
+    focus more on getting moving agents right, even if there are many stationary
+    agents in the batch.
+    
+    Args:
+        target: Ground truth displacement [N, 2] (normalized)
+        device: Torch device
+    
+    Returns:
+        weights: Per-agent weights [N] 
+        motion_info: Dict with statistics for logging
+    """
+    if not MOTION_AWARE_WEIGHTING:
+        # Return uniform weights
+        N = target.shape[0]
+        return torch.ones(N, device=device), {'enabled': False}
+    
+    # Compute GT displacement magnitude (normalized units)
+    gt_magnitude = torch.norm(target, dim=1)  # [N]
+    
+    # Convert to meters for interpretable scaling
+    gt_magnitude_meters = gt_magnitude * POSITION_SCALE  # [N] in meters
+    
+    # Weight formula: w = baseline + scale * magnitude
+    # - Stationary agents (mag ~ 0): weight = baseline (e.g., 0.2)
+    # - Agent moving 1m: weight = baseline + scale * 1 (e.g., 0.2 + 2.0 = 2.2)
+    # - Agent moving 2m: weight = baseline + scale * 2 (e.g., 0.2 + 4.0 = 4.2)
+    weights = MOTION_WEIGHT_BASELINE + MOTION_WEIGHT_SCALE * gt_magnitude_meters
+    
+    # Cap maximum weight to prevent extreme gradients
+    weights = torch.clamp(weights, max=MOTION_WEIGHT_MAX)
+    
+    # Normalize weights so mean weight = 1.0
+    # This ensures total loss magnitude stays similar with/without weighting
+    weights = weights / (weights.mean() + 1e-6)
+    
+    # Compute statistics for logging
+    moving_mask = gt_magnitude_meters > 0.1  # > 10cm displacement
+    motion_info = {
+        'enabled': True,
+        'num_moving': moving_mask.sum().item(),
+        'num_stationary': (~moving_mask).sum().item(),
+        'mean_gt_disp_m': gt_magnitude_meters.mean().item(),
+        'max_gt_disp_m': gt_magnitude_meters.max().item(),
+        'mean_weight_moving': weights[moving_mask].mean().item() if moving_mask.any() else 0.0,
+        'mean_weight_stationary': weights[~moving_mask].mean().item() if (~moving_mask).any() else 0.0,
+    }
+    
+    return weights, motion_info
 
 
 def scheduled_sampling_probability(epoch, total_epochs, strategy='linear', warmup_epochs=0):
@@ -953,6 +1028,8 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     total_mse = 0.0
     total_cosine = 0.0
     total_magnitude_ratio = 0.0  # Track magnitude ratio loss
+    total_moving_agents = 0      # Track motion-aware weighting stats
+    total_stationary_agents = 0  # Track motion-aware weighting stats
     total_overshoot = 0.0  # Track overshoot penalty
     total_trajectory = 0.0  # Track trajectory loss
     total_vel_consistency = 0.0  # Track velocity consistency loss
@@ -1262,16 +1339,30 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 print(f"  [ERROR] NaN detected in predictions or targets at step {step}! Skipping this step.")
                 continue
             
+            # ========== MOTION-AWARE WEIGHTING ==========
+            # Compute per-agent weights based on GT displacement magnitude
+            # This prevents stationary agents from dominating the loss
+            motion_weights, motion_info = compute_motion_aware_weights(target, device)
+            
             # Displacement loss components (model predicts displacement directly)
-            mse_loss = F.mse_loss(pred_aligned, target)
-            huber_loss = F.smooth_l1_loss(pred_aligned, target)
+            # Use per-element losses with motion-aware weighting
+            mse_per_agent = ((pred_aligned - target) ** 2).mean(dim=1)  # [N]
+            huber_per_agent = F.smooth_l1_loss(pred_aligned, target, reduction='none').mean(dim=1)  # [N]
+            
+            # Apply motion weights and compute weighted mean
+            mse_loss = (mse_per_agent * motion_weights).mean()
+            huber_loss = (huber_per_agent * motion_weights).mean()
+            
             pred_norm = F.normalize(pred_aligned, p=2, dim=1, eps=1e-6)
             target_norm = F.normalize(target, p=2, dim=1, eps=1e-6)
             cos_sim = F.cosine_similarity(pred_norm, target_norm, dim=1)
-            cosine_loss = (1 - cos_sim).mean()
+            cosine_loss_per_agent = 1 - cos_sim  # [N]
+            cosine_loss = (cosine_loss_per_agent * motion_weights).mean()
+            
             pred_magnitude = torch.norm(pred_aligned, dim=1)
             target_magnitude = torch.norm(target, dim=1)
-            magnitude_loss = F.mse_loss(pred_magnitude, target_magnitude)
+            magnitude_loss_per_agent = (pred_magnitude - target_magnitude) ** 2  # [N]
+            magnitude_loss = (magnitude_loss_per_agent * motion_weights).mean()
             
             # HEADING-AWARE LOSS: Penalize predictions that don't align with agent's heading
             # The heading feature (index 3) tells us where the agent is facing
@@ -1301,28 +1392,34 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                     heading_loss = ((1 - heading_alignment) ** 2).mean()
             
             # ANGLE LOSS: Explicit angle difference penalty (more sensitive to direction errors)
+            # Apply motion weighting - angle errors matter more for moving agents
             pred_angle = torch.atan2(pred_aligned[:, 1], pred_aligned[:, 0])
             target_angle = torch.atan2(target[:, 1], target[:, 0])
             angle_diff = pred_angle - target_angle
             # Wrap to [-pi, pi]
             angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
-            angle_loss = (angle_diff ** 2).mean()
+            angle_loss_per_agent = angle_diff ** 2  # [N]
+            angle_loss = (angle_loss_per_agent * motion_weights).mean()
             
             # MAGNITUDE RATIO LOSS: Penalize when predicted magnitude differs from GT magnitude
             # This is critical for preventing overshoot/undershoot issues seen in visualizations
             # Use log ratio to make it symmetric and scale-invariant
+            # Apply motion weighting
             eps = 1e-6
             magnitude_ratio = (pred_magnitude + eps) / (target_magnitude + eps)
             # Log ratio: log(pred/target) = 0 when perfect, positive when overshoot, negative when undershoot
             log_ratio = torch.log(magnitude_ratio + eps)
-            magnitude_ratio_loss = (log_ratio ** 2).mean()
+            magnitude_ratio_loss_per_agent = log_ratio ** 2  # [N]
+            magnitude_ratio_loss = (magnitude_ratio_loss_per_agent * motion_weights).mean()
             
             # OVERSHOOT PENALTY: Extra penalty when prediction magnitude exceeds GT magnitude
             # This is asymmetric because overshooting causes more visible trajectory divergence
+            # Apply motion weighting
             overshoot_mask = pred_magnitude > target_magnitude
             if overshoot_mask.any():
-                overshoot_amount = (pred_magnitude[overshoot_mask] - target_magnitude[overshoot_mask])
-                overshoot_penalty = (overshoot_amount ** 2).mean()
+                overshoot_amount_sq = (pred_magnitude[overshoot_mask] - target_magnitude[overshoot_mask]) ** 2
+                overshoot_weights = motion_weights[overshoot_mask]
+                overshoot_penalty = (overshoot_amount_sq * overshoot_weights).sum() / (overshoot_weights.sum() + 1e-6)
             else:
                 overshoot_penalty = torch.tensor(0.0, device=pred.device)
             
@@ -1473,6 +1570,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
                 total_overshoot += overshoot_penalty.item() if isinstance(overshoot_penalty, torch.Tensor) else overshoot_penalty
                 total_trajectory += trajectory_loss.item() if isinstance(trajectory_loss, torch.Tensor) else trajectory_loss
                 total_vel_consistency += velocity_consistency_loss.item() if isinstance(velocity_consistency_loss, torch.Tensor) else velocity_consistency_loss
+                
+                # Track motion-aware weighting statistics
+                if motion_info.get('enabled', False):
+                    total_moving_agents += motion_info.get('num_moving', 0)
+                    total_stationary_agents += motion_info.get('num_stationary', 0)
+                
                 count += 1
                 
                 # Track per-agent POSITION errors for ADE/FDE computation (not displacement errors!)
@@ -1680,6 +1783,12 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
     print(f"  Loss: {final_loss:.6f} | Avg per-step MSE: {final_mse:.6f} | Avg per-step RMSE: {final_rmse:.2f}m | CosSim: {final_cosine:.4f}")
     print(f"  Magnitude Losses: ratio_loss={final_magnitude_ratio:.6f} | overshoot={final_overshoot:.6f} | trajectory={final_trajectory:.6f}")
     print(f"  Velocity Consistency Loss: {final_vel_consistency:.6f}")
+    
+    # Log motion-aware weighting stats
+    if MOTION_AWARE_WEIGHTING and (total_moving_agents + total_stationary_agents) > 0:
+        pct_moving = 100.0 * total_moving_agents / (total_moving_agents + total_stationary_agents)
+        print(f"  [MOTION WEIGHTING] Moving: {total_moving_agents} ({pct_moving:.1f}%) | Stationary: {total_stationary_agents} ({100-pct_moving:.1f}%)")
+    
     print(f"  ADE: {train_ade:.2f}m | FDE: {train_fde:.2f}m (across {total_train_agents} agent rollouts)")
     print(f"  Training uses sampling_prob={sampling_prob:.2f} (0=teacher forcing, 1=autoregressive)")
     
@@ -1695,7 +1804,9 @@ def train_epoch_autoregressive(model, dataloader, optimizer, device,
         'trajectory_loss': final_trajectory,
         'velocity_consistency_loss': final_vel_consistency,
         'ade': train_ade,
-        'fde': train_fde
+        'fde': train_fde,
+        'moving_agents': total_moving_agents,
+        'stationary_agents': total_stationary_agents
     }
 
 def evaluate_autoregressive(model, dataloader, device, num_rollout_steps, is_parallel, epoch=0, total_epochs=40):
