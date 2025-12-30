@@ -789,14 +789,15 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
     dataset_type = "validation" if "validation" in test_dataset_path else "test"
     print(f"Loaded {dataset_type} dataset: {len(test_dataset)} scenarios (seq_len={sequence_length})")
     
-    num_workers = model_config['num_workers']
+    # Use num_workers=0 for testing to avoid "Too many open files" errors with HDF5
+    # Testing is sequential anyway and doesn't benefit much from multiprocessing
     viz_dir_testing = model_config['viz_dir_testing']
     
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,  # Avoid file descriptor exhaustion during testing
         collate_fn=collate_graph_sequences_to_batch,
         drop_last=False
     )
