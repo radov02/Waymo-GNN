@@ -828,7 +828,8 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
                 break
             
             # Use finetuning's visualization function for proper trajectory tracking
-            final_error = visualize_autoregressive_rollout(
+            # Returns (filepath, final_horizon_error) tuple
+            viz_result = visualize_autoregressive_rollout(
                 model=model,
                 batch_dict=batch_dict,
                 epoch=0,  # Treat as epoch 0 for naming
@@ -840,19 +841,15 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
                 model_type=model_type
             )
             
-            if final_error is not None:
+            if viz_result is not None:
+                viz_filepath, final_error = viz_result
                 viz_count += 1
                 
                 # Log visualization to wandb
-                if use_wandb:
+                if use_wandb and viz_filepath and os.path.exists(viz_filepath):
                     scenario_ids = batch_dict.get("scenario_ids", [])
                     scenario_id = scenario_ids[0] if scenario_ids else f"scenario_{batch_idx}"
-                    # Find the most recent visualization file
-                    pattern = os.path.join(viz_dir_testing, f'{model_type}_autoreg_epoch001_{scenario_id}_*.png')
-                    matches = glob.glob(pattern)
-                    if matches:
-                        latest_viz = max(matches, key=os.path.getmtime)
-                        viz_images.append(wandb.Image(latest_viz, caption=f"Scenario {scenario_id} (Error: {final_error:.2f}m)"))
+                    viz_images.append(wandb.Image(viz_filepath, caption=f"Scenario {scenario_id} (Error: {final_error:.2f}m)"))
         
         if viz_count > 0:
             print(f"\nVisualization Summary:")
