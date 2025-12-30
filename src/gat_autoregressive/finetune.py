@@ -457,8 +457,14 @@ def curriculum_rollout_steps(epoch, max_rollout_steps, total_epochs):
     return min(steps, max_rollout_steps)
 
 def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps, device, 
-                                     is_parallel, save_dir=None, total_epochs=40, model_type=None):
+                                     is_parallel, save_dir=None, total_epochs=40, model_type=None,
+                                     avg_metrics=None):
     """Visualize autoregressive rollout predictions vs ground truth.
+    
+    Args:
+        avg_metrics: Optional dict with average metrics across all scenarios:
+                     {'avg_loss': float, 'avg_mse': float, 'avg_fde': float, 'avg_ade': float}
+                     If provided, these are displayed instead of epoch info.
     
     NOTE: This visualization runs in FULL AUTOREGRESSIVE MODE (100% model predictions)
     regardless of the training sampling probability! This is intentional - we want to see
@@ -983,8 +989,21 @@ def visualize_autoregressive_rollout(model, batch_dict, epoch, num_rollout_steps
     
     ax1.set_xlabel('X position (meters)', fontsize=11)
     ax1.set_ylabel('Y position (meters)', fontsize=11)
-    ax1.set_title(f'{"GAT" if model_type == "gat" else "GCN"} Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)\n'
-                  f'Epoch {epoch+1}', fontsize=12, fontweight='bold')
+    
+    # Build title with either average metrics (testing) or epoch info (training)
+    model_name = "GAT" if model_type == "gat" else "GCN"
+    title_line1 = f'{model_name} Autoregressive Rollout: {actual_rollout_steps} steps ({actual_rollout_steps * 0.1:.1f}s)'
+    if avg_metrics is not None:
+        # Testing mode: show average metrics across all scenarios
+        avg_loss = avg_metrics.get('avg_loss', 0.0)
+        avg_mse = avg_metrics.get('avg_mse', 0.0)
+        avg_fde = avg_metrics.get('avg_fde', 0.0)
+        avg_ade = avg_metrics.get('avg_ade', 0.0)
+        title_line2 = f'Avg Loss: {avg_loss:.4f} | Avg MSE: {avg_mse:.4f} | Avg ADE: {avg_ade:.2f}m | Avg FDE: {avg_fde:.2f}m'
+    else:
+        # Training mode: show epoch info
+        title_line2 = f'Epoch {epoch+1}'
+    ax1.set_title(f'{title_line1}\n{title_line2}', fontsize=12, fontweight='bold')
     
     all_legend_elements = agent_legend_elements + line_legend_elements
     ax1.legend(handles=all_legend_elements, loc='upper left', fontsize=7, framealpha=0.9, ncol=2)
