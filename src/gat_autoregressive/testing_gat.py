@@ -191,9 +191,6 @@ def predict_single_step(model, graph, device, batch_size=1, timestep=0):
     return predictions
 
 
-# Removed - using update_graph_with_prediction from finetune.py instead
-
-
 def autoregressive_rollout(model, initial_graph, num_steps, device, batch_size=1):
     """Autoregressive multi-step prediction using same logic as finetuning."""
     model.eval()
@@ -828,31 +825,67 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
     # Create visualization directory
     os.makedirs(viz_dir_testing, exist_ok=True)
     
-    # Run evaluation with visualization using finetuning's visualization function
-    # This ensures consistent visualization with proper trajectory tracking
-    viz_images = []
     is_parallel = hasattr(model, 'module')
     
+    # Run full evaluation FIRST to get average metrics across all scenarios
+    # These metrics will be displayed on visualization images
+    results = evaluate_autoregressive(
+        model, test_dataloader, effective_rollout, device, max_scenarios, model_type=model_type
+    )
+    
+    # Compute average metrics from results for visualization display
+    avg_metrics = None
+    if results and results.get('horizons'):
+        # Use the longest horizon available for display (typically 5.0s if available)
+        available_horizons = sorted(results['horizons'].keys(), key=lambda x: float(x.replace('s', '')), reverse=True)
+        if available_horizons:
+            best_horizon = available_horizons[0]
+            horizon_data = results['horizons'][best_horizon]
+            avg_metrics = {
+                'avg_loss': 0.0,  # Loss is computed during training, set to 0 for testing
+                'avg_mse': horizon_data.get('ade_mean', 0.0) ** 2,  # Approximate MSE from ADE
+                'avg_fde': horizon_data.get('fde_mean', 0.0),
+                'avg_ade': horizon_data.get('ade_mean', 0.0)
+            }
+            print(f"\nAverage metrics for visualization (using {best_horizon} horizon):")
+            print(f"  Avg ADE: {avg_metrics['avg_ade']:.2f}m")
+            print(f"  Avg FDE: {avg_metrics['avg_fde']:.2f}m")
+            print(f"  Avg MSE: {avg_metrics['avg_mse']:.4f}")
+    
+    # Generate visualizations with average metrics displayed
+    viz_images = []
+    
     if visualize:
-        print(f"\nGenerating visualizations using finetuning's visualization (max {visualize_max} scenarios)...")
+        print(f"\nGenerating visualizations with average metrics (max {visualize_max} scenarios)...")
         viz_count = 0
         
-        for batch_idx, batch_dict in enumerate(test_dataloader):
+        # Need to reload dataloader since we already iterated through it
+        test_dataloader_viz = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_graph_sequences_to_batch,
+            drop_last=False
+        )
+        
+        for batch_idx, batch_dict in enumerate(test_dataloader_viz):
             if viz_count >= visualize_max:
                 break
             
             # Use finetuning's visualization function for proper trajectory tracking
-            # Returns (filepath, final_horizon_error) tuple
+            # Now includes avg_metrics to display on the plot instead of epoch info
             viz_result = visualize_autoregressive_rollout(
                 model=model,
                 batch_dict=batch_dict,
-                epoch=0,  # Treat as epoch 0 for naming
+                epoch=0,  # Not used when avg_metrics is provided
                 num_rollout_steps=effective_rollout,
                 device=device,
                 is_parallel=is_parallel,
                 save_dir=viz_dir_testing,
                 total_epochs=1,
-                model_type=model_type
+                model_type=model_type,
+                avg_metrics=avg_metrics  # Pass average metrics for display
             )
             
             if viz_result is not None:
@@ -872,11 +905,6 @@ def run_testing(test_dataset_path=val_hdf5_path,  # Use validation dataset (has 
             
             if use_wandb and viz_images:
                 wandb.log({"test_visualizations": viz_images})
-    
-    # Run full evaluation
-    results = evaluate_autoregressive(
-        model, test_dataloader, effective_rollout, device, max_scenarios, model_type=model_type
-    )
     
     # Log results to wandb
     if use_wandb and results:
