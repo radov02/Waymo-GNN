@@ -314,24 +314,38 @@ def evaluate_autoregressive(model, dataloader, num_rollout_steps, device, max_sc
             for horizon in horizons:
                 if horizon <= len(predictions) and horizon <= len(ground_truths):
                     ade = 0.0
+                    valid_steps = 0
                     for step in range(horizon):
                         pred = predictions[step] * 100.0
                         gt = ground_truths[step] * 100.0
-                        displacement_error = torch.norm(pred - gt, dim=1).mean()
-                        ade += displacement_error.item()
-                    ade /= horizon
+                        # Handle size mismatch (agents appearing/disappearing between timesteps)
+                        min_agents = min(pred.size(0), gt.size(0))
+                        if min_agents > 0:
+                            displacement_error = torch.norm(pred[:min_agents] - gt[:min_agents], dim=1).mean()
+                            ade += displacement_error.item()
+                            valid_steps += 1
+                    if valid_steps > 0:
+                        ade /= valid_steps
+                    else:
+                        continue  # Skip this horizon if no valid steps
                     
                     pred_final = predictions[horizon-1] * 100.0
                     gt_final = ground_truths[horizon-1] * 100.0
-                    fde = torch.norm(pred_final - gt_final, dim=1).mean().item()
+                    # Handle size mismatch for final displacement error
+                    min_agents = min(pred_final.size(0), gt_final.size(0))
+                    if min_agents == 0:
+                        continue
+                    fde = torch.norm(pred_final[:min_agents] - gt_final[:min_agents], dim=1).mean().item()
                     
-                    pred_angle = torch.atan2(predictions[horizon-1][:, 1], predictions[horizon-1][:, 0])
-                    gt_angle = torch.atan2(ground_truths[horizon-1][:, 1], ground_truths[horizon-1][:, 0])
+                    pred_h = predictions[horizon-1][:min_agents]
+                    gt_h = ground_truths[horizon-1][:min_agents]
+                    pred_angle = torch.atan2(pred_h[:, 1], pred_h[:, 0])
+                    gt_angle = torch.atan2(gt_h[:, 1], gt_h[:, 0])
                     angle_diff = torch.atan2(torch.sin(pred_angle - gt_angle), torch.cos(pred_angle - gt_angle))
                     angle_error = torch.abs(angle_diff).mean().item() * 180 / np.pi
                     
-                    pred_norm = F.normalize(predictions[horizon-1], p=2, dim=1, eps=1e-6)
-                    gt_norm = F.normalize(ground_truths[horizon-1], p=2, dim=1, eps=1e-6)
+                    pred_norm = F.normalize(pred_h, p=2, dim=1, eps=1e-6)
+                    gt_norm = F.normalize(gt_h, p=2, dim=1, eps=1e-6)
                     cosine_sim = F.cosine_similarity(pred_norm, gt_norm, dim=1).mean().item()
                     
                     horizon_metrics[horizon]['ade'].append(ade)
